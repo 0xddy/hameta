@@ -3,8 +3,10 @@ set -u
 
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:${PATH:-}"
 
+REPO="${HAMETA_REPO:-0xddy/hameta}"
 INSTALL_DIR="/opt/hameta"
 BIN="${INSTALL_DIR}/hameta"
+CTL_PATH="${INSTALL_DIR}/hameta-ctl.sh"
 ENV_FILE="${INSTALL_DIR}/hameta.env"
 PID_FILE="${INSTALL_DIR}/run/hameta.pid"
 
@@ -455,6 +457,297 @@ action_view_admin_info() {
     pause_return
 }
 
+detect_arch() {
+    local machine
+    machine=$(uname -m)
+    case "$machine" in
+        x86_64|amd64) echo "amd64" ;;
+        aarch64|arm64) echo "arm64" ;;
+        *) return 1 ;;
+    esac
+}
+
+download_file() {
+    local url="$1"
+    local dest="$2"
+    if command -v curl >/dev/null 2>&1; then
+        curl -fsSL --retry 2 --connect-timeout 15 -o "$dest" "$url"
+    elif command -v wget >/dev/null 2>&1; then
+        wget -q --timeout=15 -O "$dest" "$url"
+    else
+        return 1
+    fi
+}
+
+fetch_latest_release_tag() {
+    if [ -n "${HAMETA_LATEST_TAG:-}" ]; then
+        echo "$HAMETA_LATEST_TAG"
+        return 0
+    fi
+    local api_url="https://api.github.com/repos/${REPO}/releases/latest"
+    local body=""
+    if command -v curl >/dev/null 2>&1; then
+        body=$(curl -fsSL --max-time 8 "$api_url" 2>/dev/null || true)
+    elif command -v wget >/dev/null 2>&1; then
+        body=$(wget -qO- --timeout=8 "$api_url" 2>/dev/null || true)
+    fi
+    [ -n "$body" ] || return 1
+    local tag
+    tag=$(extract_json_string "$body" "tag_name")
+    [ -n "$tag" ] || return 1
+    echo "$tag"
+}
+
+verify_sha256_if_present() {
+    local archive_path="$1"
+    local archive_name="$2"
+    local sums_file="$3"
+    [ -f "$sums_file" ] || return 0
+
+    local expected
+    expected=$(awk -v name="$archive_name" '$2 == name || $2 == ("*" name) {print $1; exit}' "$sums_file")
+    [ -n "$expected" ] || return 0
+
+    local actual=""
+    if command -v sha256sum >/dev/null 2>&1; then
+        actual=$(sha256sum "$archive_path" | awk '{print $1}')
+    elif command -v shasum >/dev/null 2>&1; then
+        actual=$(shasum -a 256 "$archive_path" | awk '{print $1}')
+    else
+        echo "${C_YELLOW}未找到 sha256sum，跳过摘要校验${C_RESET}"
+        return 0
+    fi
+
+    if [ "$actual" != "$expected" ]; then
+        echo "${C_RED}SHA256 校验失败: ${archive_name} (期望 ${expected}, 实际 ${actual})${C_RESET}"
+        return 1
+    fi
+    echo "${C_GREEN}SHA256 校验通过: ${archive_name}${C_RESET}"
+    return 0
+}
+
+action_update_version() {
+    echo ""
+    echo "${C_BOLD}=== 更新 Hameta 版本 ===${C_RESET}"
+
+    if [ "$(id -u)" -ne 0 ]; then
+        echo "${C_RED}错误: 更新版本需要 root 权限写入 ${INSTALL_DIR}，请执行 sudo hameta${C_RESET}"
+        pause_return
+        return
+    fi
+
+    if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then
+        echo "${C_RED}错误: 缺少 curl 或 wget，无法下载更新包${C_RESET}"
+        pause_return
+        return
+    fi
+
+    if ! command -v tar >/dev/null 2>&1; then
+        echo "${C_RED}错误: 缺少 tar，无法解压更新包${C_RESET}"
+        pause_return
+        return
+    fi
+
+    local arch
+    if ! arch=$(detect_arch); then
+        echo "${C_RED}错误: 暂不支持的 CPU 架构 $(uname -m)${C_RESET}"
+        pause_return
+        return
+    fi
+
+    local cur_ver="unknown"
+    if [ -x "$BIN" ]; then
+        cur_ver=$("$BIN" --version 2>/dev/null | awk '{print $NF}' || true)
+        [ -n "$cur_ver" ] || cur_ver="unknown"
+    fi
+    local cur_tag="unknown"
+    [ "$cur_ver" != "unknown" ] && cur_tag="v${cur_ver#v}"
+
+    echo "当前已安装版本: ${C_CYAN}${cur_tag}${C_RESET} (架构: linux/${arch})"
+    printf "正在查询 GitHub Release 最新版本..."
+    local latest_tag=""
+    latest_tag=$(fetch_latest_release_tag || true)
+    if [ -n "$latest_tag" ]; then
+        echo " ${C_GREEN}${latest_tag}${C_RESET}"
+    else
+        echo " ${C_YELLOW}未获取到标签，将使用 latest 重定向下载${C_RESET}"
+    fi
+
+    local default_target="${latest_tag:-latest}"
+    local input_tag=""
+    printf "请输入目标版本号 [直接回车更新至 %s，输入 n 取消]: " "$default_target"
+    read -r input_tag || return 0
+    input_tag=$(echo "$input_tag" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+
+    case "$input_tag" in
+        n|N|q|Q|cancel)
+            echo "已取消更新。"
+            pause_return
+            return
+            ;;
+    esac
+
+    local target_tag="${input_tag:-$default_target}"
+    if [ "$target_tag" != "latest" ]; then
+        case "$target_tag" in
+            v*|V*) target_tag="v${target_tag#[vV]}" ;;
+            *) target_tag="v${target_tag}" ;;
+        esac
+    fi
+
+    if [ "$cur_tag" != "unknown" ] && [ "$target_tag" = "$cur_tag" ]; then
+        local confirm=""
+        printf "当前已是 %s，是否仍要强制覆盖重装？[y/N]: " "$cur_tag"
+        read -r confirm || return 0
+        case "$confirm" in
+            y|Y|yes|YES) ;;
+            *)
+                echo "已取消更新。"
+                pause_return
+                return
+                ;;
+        esac
+    fi
+
+    local tmp_dir
+    tmp_dir=$(mktemp -d /tmp/hameta-upgrade.XXXXXX)
+
+    local base_url
+    if [ -n "${HAMETA_RELEASE_BASE_URL:-}" ]; then
+        base_url="${HAMETA_RELEASE_BASE_URL%/}"
+    elif [ "$target_tag" = "latest" ]; then
+        base_url="https://github.com/${REPO}/releases/latest/download"
+    else
+        base_url="https://github.com/${REPO}/releases/download/${target_tag}"
+    fi
+
+    local sums_file="${tmp_dir}/SHA256SUMS.txt"
+    download_file "${base_url}/SHA256SUMS.txt" "$sums_file" 2>/dev/null || rm -f "$sums_file"
+
+    local selected_dir=""
+    local selected_variant=""
+    local variant archive_name archive_path extract_dir
+    for variant in "hameta-linux-${arch}" "hameta-linux-${arch}-musl"; do
+        archive_name="${variant}.tar.gz"
+        archive_path="${tmp_dir}/${archive_name}"
+        extract_dir="${tmp_dir}/${variant}"
+
+        echo "正在下载 ${archive_name} (${target_tag})..."
+        if ! download_file "${base_url}/${archive_name}" "$archive_path" 2>/dev/null; then
+            echo "${C_YELLOW}未获取到 ${archive_name}${C_RESET}"
+            continue
+        fi
+
+        if ! verify_sha256_if_present "$archive_path" "$archive_name" "$sums_file"; then
+            continue
+        fi
+
+        rm -rf "$extract_dir"
+        mkdir -p "$extract_dir"
+        if ! tar -xzf "$archive_path" -C "$extract_dir"; then
+            echo "${C_YELLOW}解压 ${archive_name} 失败${C_RESET}"
+            continue
+        fi
+
+        if [ ! -f "${extract_dir}/hameta" ]; then
+            echo "${C_YELLOW}${archive_name} 中缺少 hameta 二进制${C_RESET}"
+            continue
+        fi
+
+        chmod 0755 "${extract_dir}/hameta"
+        if ! "${extract_dir}/hameta" --version >/dev/null 2>&1; then
+            echo "${C_YELLOW}${archive_name} 与当前系统 libc 不兼容，尝试回退包...${C_RESET}"
+            continue
+        fi
+
+        selected_dir="$extract_dir"
+        selected_variant="$variant"
+        break
+    done
+
+    if [ -z "$selected_dir" ]; then
+        rm -rf "$tmp_dir"
+        echo "${C_RED}下载或校验目标版本 (${target_tag}) 失败，当前运行服务未受影响。${C_RESET}"
+        pause_return
+        return
+    fi
+
+    local new_ver=""
+    new_ver=$("${selected_dir}/hameta" --version 2>/dev/null | awk '{print $NF}' || true)
+    local new_tag="v${new_ver#v}"
+
+    local was_running=0
+    if find_panel_pid >/dev/null 2>&1; then
+        was_running=1
+        echo "${C_YELLOW}正在停止运行中的 Hameta 服务以执行覆盖更新...${C_RESET}"
+        if ! run_service stop; then
+            rm -rf "$tmp_dir"
+            echo "${C_RED}停止服务失败，已中止覆盖升级。${C_RESET}"
+            pause_return
+            return
+        fi
+    fi
+
+    if [ -f "$BIN" ]; then
+        cp -f "$BIN" "${BIN}.bak"
+    fi
+
+    mkdir -p "$INSTALL_DIR" "${INSTALL_DIR}/data" "${INSTALL_DIR}/logs" "${INSTALL_DIR}/run"
+    install -m 0755 "${selected_dir}/hameta" "$BIN"
+
+    local ctl_updated=0
+    if [ -f "${selected_dir}/deploy/hameta-ctl.sh" ]; then
+        install -m 0755 "${selected_dir}/deploy/hameta-ctl.sh" "${CTL_PATH}.new"
+        mv -f "${CTL_PATH}.new" "$CTL_PATH"
+        ln -sfn "$CTL_PATH" /usr/local/bin/hameta
+        ctl_updated=1
+    fi
+    if [ -f "${selected_dir}/deploy/hameta.init" ]; then
+        install -m 0755 "${selected_dir}/deploy/hameta.init" /etc/init.d/hameta
+    fi
+    if is_systemd && [ -f "${selected_dir}/deploy/hameta.service" ]; then
+        install -m 0644 "${selected_dir}/deploy/hameta.service" /etc/systemd/system/hameta.service
+        systemctl daemon-reload >/dev/null 2>&1 || true
+    fi
+    if [ -f "${selected_dir}/scripts/install.sh" ]; then
+        install -m 0755 "${selected_dir}/scripts/install.sh" "${INSTALL_DIR}/install.sh"
+    fi
+
+    if [ "$was_running" -eq 1 ]; then
+        echo "${C_YELLOW}正在重新启动 Hameta 服务...${C_RESET}"
+        local started_ok=0
+        if run_service start; then
+            sleep 1
+            if find_panel_pid >/dev/null 2>&1; then
+                started_ok=1
+            fi
+        fi
+
+        if [ "$started_ok" -ne 1 ]; then
+            echo "${C_RED}新版本启动失败！正在自动回滚至原二进制...${C_RESET}"
+            if [ -f "${BIN}.bak" ]; then
+                mv -f "${BIN}.bak" "$BIN"
+                chmod 0755 "$BIN"
+                run_service start || true
+            fi
+            rm -rf "$tmp_dir"
+            echo "${C_YELLOW}已回滚，请查看日志: ${HAMETA_LOG_FILE}${C_RESET}"
+            pause_return
+            return
+        fi
+    fi
+
+    rm -f "${BIN}.bak"
+    rm -rf "$tmp_dir"
+    echo "${C_GREEN}更新成功！(${selected_variant}: ${cur_tag} -> ${new_tag})${C_RESET}"
+    echo "数据目录 (${HAMETA_DATA_DIR}) 与环境配置 (${ENV_FILE}) 均已完整保留。"
+    pause_return
+
+    if [ "$ctl_updated" -eq 1 ] && [ -t 0 ] && [ -x "$CTL_PATH" ]; then
+        exec "$CTL_PATH"
+    fi
+}
+
 main_loop() {
     while true; do
         if [ -t 1 ]; then
@@ -473,9 +766,10 @@ main_loop() {
         echo "  2、重启程序"
         echo "  3、重置管理员密码"
         echo "  4、查看管理信息"
+        echo "  5、更新版本"
         echo "  0、退出菜单        [直接回车刷新状态]"
         echo ""
-        printf "请输入操作编号 [0-4]: "
+        printf "请输入操作编号 [0-5]: "
 
         local choice=""
         if ! read -r choice; then
@@ -496,6 +790,9 @@ main_loop() {
             4)
                 action_view_admin_info
                 ;;
+            5)
+                action_update_version
+                ;;
             0|q|Q|exit)
                 echo "已退出。"
                 break
@@ -503,7 +800,7 @@ main_loop() {
             "")
                 ;;
             *)
-                echo "${C_RED}无效选项: ${choice}，请输入 0-4${C_RESET}"
+                echo "${C_RED}无效选项: ${choice}，请输入 0-5${C_RESET}"
                 sleep 1
                 ;;
         esac

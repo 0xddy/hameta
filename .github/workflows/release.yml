@@ -6,9 +6,20 @@ on:
       - "v*"
   workflow_dispatch:
     inputs:
-      tag:
-        description: "Release tag (e.g. v0.1.0)"
+      version:
+        description: "发布版本号（例如 v0.2.0 或 0.2.0）"
         required: true
+        type: string
+      prerelease:
+        description: "标记为预发布版本 (Pre-release)"
+        required: false
+        default: false
+        type: boolean
+      release_notes:
+        description: "自定义发布说明（留空则自动生成变更日志）"
+        required: false
+        default: ""
+        type: string
 
 permissions:
   contents: write
@@ -17,7 +28,40 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  prepare:
+    runs-on: ubuntu-22.04
+    outputs:
+      tag_name: ${{ steps.meta.outputs.tag_name }}
+      semver: ${{ steps.meta.outputs.semver }}
+      prerelease: ${{ steps.meta.outputs.prerelease }}
+      release_notes: ${{ steps.meta.outputs.release_notes }}
+    steps:
+      - name: Normalize and validate version
+        id: meta
+        env:
+          RAW_VERSION: ${{ inputs.version || github.ref_name }}
+          IS_PRERELEASE: ${{ inputs.prerelease || false }}
+          RAW_NOTES: ${{ inputs.release_notes || '' }}
+        run: |
+          raw=$(echo "$RAW_VERSION" | tr -d '[:space:]')
+          semver="${raw#[vV]}"
+          if ! echo "$semver" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'; then
+            echo "::error::无效版本号 '${RAW_VERSION}'，示例: v0.2.0 或 0.2.0"
+            exit 1
+          fi
+          tag_name="v${semver}"
+          echo "semver=${semver}" >> "$GITHUB_OUTPUT"
+          echo "tag_name=${tag_name}" >> "$GITHUB_OUTPUT"
+          echo "prerelease=${IS_PRERELEASE}" >> "$GITHUB_OUTPUT"
+          {
+            echo "release_notes<<__HAMETA_NOTES_EOF__"
+            printf "%s\n" "$RAW_NOTES"
+            echo "__HAMETA_NOTES_EOF__"
+          } >> "$GITHUB_OUTPUT"
+          echo "Prepared release: tag=${tag_name}, semver=${semver}, prerelease=${IS_PRERELEASE}"
+
   build-web:
+    needs: prepare
     runs-on: ubuntu-22.04
     steps:
       - name: Checkout repository
@@ -47,8 +91,8 @@ jobs:
           path: web/dist
           if-no-files-found: error
 
-  build-linux:
-    needs: build-web
+  build:
+    needs: [prepare, build-web]
     strategy:
       fail-fast: false
       matrix:
@@ -56,23 +100,52 @@ jobs:
           - runner: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
             artifact_name: hameta-linux-amd64
+            archive_ext: tar.gz
             features: "--features mimalloc"
+            os: linux
             is_musl: false
           - runner: ubuntu-22.04
             target: x86_64-unknown-linux-musl
             artifact_name: hameta-linux-amd64-musl
+            archive_ext: tar.gz
             features: ""
+            os: linux
             is_musl: true
           - runner: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
             artifact_name: hameta-linux-arm64
+            archive_ext: tar.gz
             features: "--features mimalloc"
+            os: linux
             is_musl: false
           - runner: ubuntu-24.04-arm
             target: aarch64-unknown-linux-musl
             artifact_name: hameta-linux-arm64-musl
+            archive_ext: tar.gz
             features: ""
+            os: linux
             is_musl: true
+          - runner: macos-14
+            target: aarch64-apple-darwin
+            artifact_name: hameta-darwin-arm64
+            archive_ext: tar.gz
+            features: "--features mimalloc"
+            os: darwin
+            is_musl: false
+          - runner: macos-14
+            target: x86_64-apple-darwin
+            artifact_name: hameta-darwin-amd64
+            archive_ext: tar.gz
+            features: "--features mimalloc"
+            os: darwin
+            is_musl: false
+          - runner: windows-latest
+            target: x86_64-pc-windows-msvc
+            artifact_name: hameta-windows-amd64
+            archive_ext: zip
+            features: "--features mimalloc"
+            os: windows
+            is_musl: false
     runs-on: ${{ matrix.runner }}
     steps:
       - name: Checkout repository
@@ -84,8 +157,36 @@ jobs:
           name: web-dist
           path: web/dist
 
+      - name: Patch workspace version to ${{ needs.prepare.outputs.semver }}
+        shell: bash
+        env:
+          RELEASE_SEMVER: ${{ needs.prepare.outputs.semver }}
+        run: |
+          if command -v python3 >/dev/null 2>&1; then
+            PY=python3
+          else
+            PY=python
+          fi
+          "$PY" - <<'PYCODE'
+          import os, re, pathlib
+          semver = os.environ["RELEASE_SEMVER"]
+          p = pathlib.Path("Cargo.toml")
+          content = p.read_text(encoding="utf-8")
+          updated, count = re.subn(
+              r'(\[workspace\.package\][^\[]*?version\s*=\s*")[^"]+(")',
+              rf'\g<1>{semver}\g<2>',
+              content,
+              count=1,
+              flags=re.DOTALL,
+          )
+          assert count == 1, "Failed to update [workspace.package].version in Cargo.toml"
+          p.write_text(updated, encoding="utf-8")
+          print(f"Patched Cargo.toml version -> {semver}")
+          PYCODE
+
       - name: Install musl tools if needed
         if: matrix.is_musl
+        shell: bash
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq musl-tools
@@ -101,35 +202,45 @@ jobs:
           key: ${{ matrix.target }}
 
       - name: Build release binary
+        shell: bash
         env:
           CC_x86_64_unknown_linux_musl: musl-gcc
           CC_aarch64_unknown_linux_musl: musl-gcc
         run: |
           cargo build --release -p hameta-cli --target "${{ matrix.target }}" ${{ matrix.features }}
 
-      - name: Package release tarball
+      - name: Package release archive
+        shell: bash
         run: |
           PKG_DIR="pkg/${{ matrix.artifact_name }}"
-          mkdir -p "${PKG_DIR}/deploy" "${PKG_DIR}/scripts"
-          cp "target/${{ matrix.target }}/release/hameta" "${PKG_DIR}/hameta"
-          chmod 0755 "${PKG_DIR}/hameta"
-          cp deploy/hameta-ctl.sh deploy/hameta.init deploy/hameta.service "${PKG_DIR}/deploy/"
-          chmod 0755 "${PKG_DIR}/deploy/hameta-ctl.sh" "${PKG_DIR}/deploy/hameta.init"
-          cp scripts/install.sh "${PKG_DIR}/scripts/"
-          chmod 0755 "${PKG_DIR}/scripts/install.sh"
-          cp LICENSE README.md "${PKG_DIR}/"
-          mkdir -p dist
-          tar -czf "dist/${{ matrix.artifact_name }}.tar.gz" -C "${PKG_DIR}" .
+          mkdir -p "${PKG_DIR}" dist
+          if [ "${{ matrix.os }}" = "windows" ]; then
+            cp "target/${{ matrix.target }}/release/hameta.exe" "${PKG_DIR}/hameta.exe"
+            cp LICENSE README.md "${PKG_DIR}/"
+            powershell.exe -NoProfile -Command "Compress-Archive -Path '${PKG_DIR}/*' -DestinationPath 'dist/${{ matrix.artifact_name }}.zip' -Force"
+          else
+            cp "target/${{ matrix.target }}/release/hameta" "${PKG_DIR}/hameta"
+            chmod 0755 "${PKG_DIR}/hameta"
+            cp LICENSE README.md "${PKG_DIR}/"
+            if [ "${{ matrix.os }}" = "linux" ]; then
+              mkdir -p "${PKG_DIR}/deploy" "${PKG_DIR}/scripts"
+              cp deploy/hameta-ctl.sh deploy/hameta.init deploy/hameta.service "${PKG_DIR}/deploy/"
+              chmod 0755 "${PKG_DIR}/deploy/hameta-ctl.sh" "${PKG_DIR}/deploy/hameta.init"
+              cp scripts/install.sh "${PKG_DIR}/scripts/"
+              chmod 0755 "${PKG_DIR}/scripts/install.sh"
+            fi
+            tar -czf "dist/${{ matrix.artifact_name }}.tar.gz" -C "${PKG_DIR}" .
+          fi
 
       - name: Upload package artifact
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact_name }}
-          path: dist/${{ matrix.artifact_name }}.tar.gz
+          path: dist/${{ matrix.artifact_name }}.${{ matrix.archive_ext }}
           if-no-files-found: error
 
   release:
-    needs: build-linux
+    needs: [prepare, build]
     runs-on: ubuntu-22.04
     steps:
       - name: Download all release packages
@@ -140,20 +251,45 @@ jobs:
       - name: Collect archives and generate SHA256SUMS
         run: |
           mkdir -p release-files
-          find artifacts -type f -name '*.tar.gz' -exec cp {} release-files/ \;
-          (cd release-files && sha256sum *.tar.gz > SHA256SUMS.txt)
+          find artifacts -type f \( -name '*.tar.gz' -o -name '*.zip' \) -exec cp {} release-files/ \;
+          (cd release-files && sha256sum *.tar.gz *.zip > SHA256SUMS.txt)
+          ls -lh release-files
           cat release-files/SHA256SUMS.txt
 
       - name: Publish GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAG_NAME: ${{ inputs.tag || github.ref_name }}
+          TAG_NAME: ${{ needs.prepare.outputs.tag_name }}
+          IS_PRERELEASE: ${{ needs.prepare.outputs.prerelease }}
+          RELEASE_NOTES: ${{ needs.prepare.outputs.release_notes }}
         run: |
+          flags=()
+          if [ "$IS_PRERELEASE" = "true" ]; then
+            flags+=(--prerelease)
+          fi
+
+          trimmed_notes=$(printf "%s" "$RELEASE_NOTES" | sed '/^[[:space:]]*$/d')
           if gh release view "$TAG_NAME" --repo "${{ github.repository }}" >/dev/null 2>&1; then
             gh release upload "$TAG_NAME" release-files/* --clobber --repo "${{ github.repository }}"
+            if [ -n "$trimmed_notes" ]; then
+              gh release edit "$TAG_NAME" --repo "${{ github.repository }}" --notes "$RELEASE_NOTES" "${flags[@]}"
+            elif [ "$IS_PRERELEASE" = "true" ]; then
+              gh release edit "$TAG_NAME" --repo "${{ github.repository }}" --prerelease
+            fi
           else
-            gh release create "$TAG_NAME" release-files/* \
-              --repo "${{ github.repository }}" \
-              --title "Hameta ${TAG_NAME}" \
-              --generate-notes
+            if [ -n "$trimmed_notes" ]; then
+              gh release create "$TAG_NAME" release-files/* \
+                --repo "${{ github.repository }}" \
+                --target "${{ github.sha }}" \
+                --title "Hameta ${TAG_NAME}" \
+                --notes "$RELEASE_NOTES" \
+                "${flags[@]}"
+            else
+              gh release create "$TAG_NAME" release-files/* \
+                --repo "${{ github.repository }}" \
+                --target "${{ github.sha }}" \
+                --title "Hameta ${TAG_NAME}" \
+                --generate-notes \
+                "${flags[@]}"
+            fi
           fi

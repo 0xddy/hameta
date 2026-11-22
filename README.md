@@ -45,6 +45,7 @@ hameta
 2. **重启程序**（调用 `service hameta restart`）
 3. **重置管理员密码**（自动回填当前管理员，支持随机生成强密码或手动输入）
 4. **查看管理信息**（面板访问地址、初始化状态、管理员信息、Redis/Manticore 端点与日志路径）
+5. **更新版本**（自动检测并下载 GitHub Release 对应架构升级包，校对 SHA256 后停服覆盖升级并自动拉起，保留 `/opt/hameta/data` 与 `hameta.env`）
 
 常用 `service` 命令与 CLI 透传：
 
@@ -86,6 +87,16 @@ cargo build --release -p hameta-cli --features mimalloc
 # 3. 本地开发运行
 ./target/release/hameta panel --bind 0.0.0.0:8080 --data-dir ./data
 ```
+
+## GitHub Actions 多平台发布
+
+仓库内置 `.github/workflows/release.yml`，支持推送 `v*` 标签或手动运行工作流填写版本号编译全部 7 个目标并上传至 GitHub Release：
+
+- `linux/amd64`（gnu + musl）、`linux/arm64`（gnu + musl）
+- `darwin/arm64`（Apple Silicon）、`darwin/amd64`（Intel）
+- `windows/amd64`
+
+在 GitHub 仓库页面进入 **Actions -> Release -> Run workflow**，输入版本号（例如 `v0.2.0` 或 `0.2.0`）即可自动构建并生成对应 Release 与 `SHA256SUMS.txt`。
 
 ## 关联文档
 
