@@ -1,0 +1,19 @@
+[Unit]
+Description=Hameta DHT Crawler & Indexer Web Panel
+Documentation=https://github.com/0xddy/hameta
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/hameta
+EnvironmentFile=-/opt/hameta/hameta.env
+ExecStart=/opt/hameta/hameta panel
+Restart=on-failure
+RestartSec=5s
+LimitNOFILE=262144
+TimeoutStopSec=30s
+KillMode=mixed
+
+[Install]
+WantedBy=multi-user.target

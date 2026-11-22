@@ -1,0 +1,67 @@
+[workspace]
+members = [
+    "crates/hameta-common",
+    "crates/hameta-filter",
+    "crates/hameta-storage",
+    "crates/hameta-crawler",
+    "crates/hameta-indexer",
+    "crates/hameta-panel",
+    "crates/hameta-cli",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+[workspace.dependencies]
+dht-crawler = { git = "https://github.com/0xddy/dht-crawler.git", branch = "master", features = ["metrics"] }
+
+hameta-common = { path = "crates/hameta-common" }
+hameta-filter = { path = "crates/hameta-filter" }
+hameta-storage = { path = "crates/hameta-storage" }
+hameta-crawler = { path = "crates/hameta-crawler" }
+hameta-indexer = { path = "crates/hameta-indexer" }
+hameta-panel = { path = "crates/hameta-panel" }
+
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "net", "sync", "time", "process", "io-util", "fs"] }
+tokio-util = "0.7"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
+anyhow = "1"
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4", features = ["derive", "env"] }
+axum = { version = "0.8", features = ["http1", "json", "query", "tokio"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["trace", "compression-gzip", "limit"] }
+rust-embed = "8"
+mime_guess = "2"
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite", "macros", "migrate", "chrono", "json"] }
+sha2 = "0.10"
+rand = "0.8"
+hex = "0.4"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+tracing-appender = "0.2"
+mimalloc = "0.1"
+arc-swap = "1.7"
+regex = "1.10"
+unicode-normalization = "0.1"
+redis = { version = "0.26", features = ["tokio-comp", "connection-manager"] }
+deadpool-redis = "0.17"
+moka = { version = "0.12", features = ["future", "sync"] }
+async-channel = "2.5"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "gzip"] }
+base64 = "0.22"
+futures = "0.3"
+libc = "0.2"
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Security", "Win32_System_JobObjects", "Win32_System_Threading"] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+strip = true

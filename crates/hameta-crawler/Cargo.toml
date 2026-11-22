@@ -1,0 +1,31 @@
+[package]
+name = "hameta-crawler"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+async-channel = { workspace = true }
+axum = { workspace = true }
+chrono = { workspace = true }
+deadpool-redis = { workspace = true }
+dht-crawler = { workspace = true }
+hameta-common = { workspace = true }
+moka = { workspace = true }
+rand = { workspace = true }
+redis = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+tracing = { workspace = true }
+tracing-appender = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = { workspace = true }
+
+[dev-dependencies]
+tower = { workspace = true, features = ["util"] }

@@ -1,0 +1,13 @@
+/target
+/data
+/dev-data
+/logs
+/scratch
+*.db
+*.db-wal
+*.db-shm
+.env
+.DS_Store
+web/node_modules
+web/dist/*
+!web/dist/.gitkeep

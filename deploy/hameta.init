@@ -1,0 +1,173 @@
+#!/usr/bin/env bash
+### BEGIN INIT INFO
+# Provides:          hameta
+# Required-Start:    $local_fs $network $remote_fs
+# Required-Stop:     $local_fs $network $remote_fs
+# Default-Start:     2 3 4 5
+# Default-Stop:      0 1 6
+# Short-Description: Hameta DHT Crawler & Indexer Web Panel
+# Description:       Single-binary DHT crawler, Redis Streams & Manticore indexer, and Web management panel
+### END INIT INFO
+# chkconfig: 2345 80 20
+# description: Hameta DHT Crawler & Indexer Web Panel
+
+set -u
+
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:${PATH:-}"
+
+INSTALL_DIR="/opt/hameta"
+BIN="${INSTALL_DIR}/hameta"
+ENV_FILE="${INSTALL_DIR}/hameta.env"
+PID_DIR="${INSTALL_DIR}/run"
+PID_FILE="${PID_DIR}/hameta.pid"
+
+if [ -f "$ENV_FILE" ]; then
+    set -a
+    # shellcheck disable=SC1090
+    . "$ENV_FILE"
+    set +a
+fi
+
+HAMETA_BIND="${HAMETA_BIND:-0.0.0.0:8080}"
+HAMETA_DATA_DIR="${HAMETA_DATA_DIR:-${INSTALL_DIR}/data}"
+HAMETA_LOG_FILE="${HAMETA_LOG_FILE:-${INSTALL_DIR}/logs/hameta.log}"
+RUST_LOG="${RUST_LOG:-info}"
+export HAMETA_BIND HAMETA_DATA_DIR RUST_LOG
+
+is_hameta_panel_pid() {
+    local pid="$1"
+    [ -n "$pid" ] || return 1
+    kill -0 "$pid" 2>/dev/null || return 1
+
+    if [ -r "/proc/${pid}/cmdline" ]; then
+        local cmdline
+        cmdline=$(tr '\0' ' ' <"/proc/${pid}/cmdline" 2>/dev/null || true)
+        case "$cmdline" in
+            *hameta*panel*) return 0 ;;
+            *) return 1 ;;
+        esac
+    fi
+
+    local args
+    args=$(ps -p "$pid" -o args= 2>/dev/null || true)
+    case "$args" in
+        *hameta*panel*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+get_running_pid() {
+    if [ -f "$PID_FILE" ]; then
+        local pid
+        pid=$(tr -dc '0-9' <"$PID_FILE" 2>/dev/null || true)
+        if is_hameta_panel_pid "$pid"; then
+            echo "$pid"
+            return 0
+        fi
+        rm -f "$PID_FILE"
+    fi
+
+    if command -v pgrep >/dev/null 2>&1; then
+        local found
+        found=$(pgrep -f "^${BIN} panel" 2>/dev/null | head -n 1 || true)
+        if is_hameta_panel_pid "$found"; then
+            echo "$found"
+            return 0
+        fi
+    fi
+
+    return 1
+}
+
+do_start() {
+    if [ ! -x "$BIN" ]; then
+        echo "错误: 未找到可执行文件 $BIN" >&2
+        return 5
+    fi
+
+    local pid
+    if pid=$(get_running_pid); then
+        echo "hameta 已在运行 (PID: ${pid})"
+        return 0
+    fi
+
+    mkdir -p "$HAMETA_DATA_DIR" "$(dirname "$HAMETA_LOG_FILE")" "$PID_DIR"
+    chmod 700 "$HAMETA_DATA_DIR" 2>/dev/null || true
+    ulimit -n 262144 2>/dev/null || ulimit -n 65535 2>/dev/null || true
+
+    cd "$INSTALL_DIR" || return 1
+    nohup "$BIN" panel --bind "$HAMETA_BIND" --data-dir "$HAMETA_DATA_DIR" >>"$HAMETA_LOG_FILE" 2>&1 </dev/null &
+    local new_pid=$!
+    echo "$new_pid" >"$PID_FILE"
+
+    sleep 1
+    if kill -0 "$new_pid" 2>/dev/null; then
+        echo "hameta 启动成功 (PID: ${new_pid}, 监听: ${HAMETA_BIND})"
+        return 0
+    fi
+
+    rm -f "$PID_FILE"
+    echo "错误: hameta 启动失败，最近日志：" >&2
+    tail -n 20 "$HAMETA_LOG_FILE" >&2 || true
+    return 1
+}
+
+do_stop() {
+    local pid
+    if ! pid=$(get_running_pid); then
+        rm -f "$PID_FILE"
+        echo "hameta 未运行"
+        return 0
+    fi
+
+    printf "正在停止 hameta (PID: %s)..." "$pid"
+    kill -TERM "$pid" 2>/dev/null || true
+
+    local i=0
+    while [ "$i" -lt 60 ]; do
+        if ! kill -0 "$pid" 2>/dev/null; then
+            rm -f "$PID_FILE"
+            echo " 已停止"
+            return 0
+        fi
+        sleep 0.5
+        i=$((i + 1))
+    done
+
+    echo -n " 超时，强制终止..."
+    kill -KILL "$pid" 2>/dev/null || true
+    sleep 0.5
+    rm -f "$PID_FILE"
+    echo " 已停止"
+    return 0
+}
+
+do_status() {
+    local pid
+    if pid=$(get_running_pid); then
+        echo "hameta 正在运行 (PID: ${pid}, 监听: ${HAMETA_BIND})"
+        return 0
+    fi
+    echo "hameta 已停止"
+    return 3
+}
+
+case "${1:-}" in
+    start)
+        do_start
+        ;;
+    stop)
+        do_stop
+        ;;
+    restart|force-reload)
+        do_stop
+        do_start
+        ;;
+    status)
+        do_status
+        ;;
+    *)
+        echo "用法: $0 {start|stop|restart|force-reload|status}" >&2
+        exit 2
+        ;;
+esac

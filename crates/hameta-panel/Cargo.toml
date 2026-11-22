@@ -1,0 +1,39 @@
+[package]
+name = "hameta-panel"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+axum = { workspace = true }
+chrono = { workspace = true }
+deadpool-redis = { workspace = true }
+futures = { workspace = true }
+hameta-common = { workspace = true }
+hameta-filter = { workspace = true }
+hameta-indexer = { path = "../hameta-indexer" }
+hameta-storage = { workspace = true }
+mime_guess = { workspace = true }
+redis = { workspace = true }
+reqwest = { workspace = true }
+rust-embed = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+tower = { workspace = true }
+tower-http = { workspace = true }
+tracing = { workspace = true }
+tracing-appender = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true }
+
+[dev-dependencies]
+dht-crawler = { workspace = true }
+hameta-crawler = { path = "../hameta-crawler" }
+tower = { version = "0.5", features = ["util"] }
