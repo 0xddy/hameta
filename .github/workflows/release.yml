@@ -65,15 +65,15 @@ jobs:
     runs-on: ubuntu-22.04
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Setup pnpm
-        uses: pnpm/action-setup@v4
+        uses: pnpm/action-setup@v6
         with:
           version: 10
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version: 24
           cache: pnpm
@@ -85,7 +85,7 @@ jobs:
           pnpm --dir web build
 
       - name: Upload web dist
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: web-dist
           path: web/dist
@@ -125,14 +125,14 @@ jobs:
             features: ""
             os: linux
             is_musl: true
-          - runner: macos-14
+          - runner: macos-latest
             target: aarch64-apple-darwin
             artifact_name: hameta-darwin-arm64
             archive_ext: tar.gz
             features: "--features mimalloc"
             os: darwin
             is_musl: false
-          - runner: macos-14
+          - runner: macos-latest
             target: x86_64-apple-darwin
             artifact_name: hameta-darwin-amd64
             archive_ext: tar.gz
@@ -149,10 +149,10 @@ jobs:
     runs-on: ${{ matrix.runner }}
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Download built web dist
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: web-dist
           path: web/dist
@@ -233,7 +233,7 @@ jobs:
           fi
 
       - name: Upload package artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.artifact_name }}
           path: dist/${{ matrix.artifact_name }}.${{ matrix.archive_ext }}
@@ -244,7 +244,7 @@ jobs:
     runs-on: ubuntu-22.04
     steps:
       - name: Download all release packages
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: artifacts
 
