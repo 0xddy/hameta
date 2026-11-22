@@ -162,7 +162,6 @@ mod tests {
 
     #[test]
     fn job_guard_initializes_cleanly() {
-        let guard = ChildJobGuard::new().unwrap();
-        drop(guard);
+        let _guard = ChildJobGuard::new().unwrap();
     }
 }
