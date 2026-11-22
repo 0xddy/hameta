@@ -98,7 +98,7 @@ pub fn info_hash_cache_key(info_hash: &str) -> Vec<u8> {
     let encoded = info_hash.as_bytes();
     if encoded.len().is_multiple_of(2) {
         let mut decoded = Vec::with_capacity(encoded.len() / 2);
-        for pair in encoded.chunks_exact(2) {
+        for pair in encoded.as_chunks::<2>().0 {
             let Some(high) = hex_nibble(pair[0]) else {
                 return encoded.to_vec();
             };

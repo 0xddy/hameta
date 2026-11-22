@@ -935,7 +935,7 @@ pub async fn playground_sample_handler(
                     raw_samples.extend(snap.recent_rejected);
                 }
             }
-            raw_samples.sort_by(|a, b| b.rejected_at_unix.cmp(&a.rejected_at_unix));
+            raw_samples.sort_by_key(|a| std::cmp::Reverse(a.rejected_at_unix));
 
             let samples: Vec<PlaygroundInput> = raw_samples
                 .into_iter()

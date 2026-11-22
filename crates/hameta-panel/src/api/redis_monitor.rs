@@ -214,7 +214,7 @@ fn redis_val_to_map(val: &RedisValue) -> HashMap<String, RedisValue> {
             }
         }
         RedisValue::Array(items) => {
-            for pair in items.chunks_exact(2) {
+            for pair in items.as_chunks::<2>().0 {
                 if let Some(ks) = redis_val_to_str(&pair[0]) {
                     map.insert(ks, pair[1].clone());
                 }
