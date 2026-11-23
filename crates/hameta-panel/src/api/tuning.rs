@@ -315,7 +315,10 @@ pub async fn apply_worker_tuning_handler(
         });
         if active {
             match state.supervisor.restart_worker(&id, 15).await {
-                Ok(()) => (true, None),
+                Ok(()) => {
+                    state.tuning_advisor.reset_worker_rolling(&id).await;
+                    (true, None)
+                }
                 Err(err) => (false, Some(err.to_string())),
             }
         } else {

@@ -889,6 +889,12 @@ impl TuningAdvisor {
         guard.sessions.remove(worker_id).is_some()
     }
 
+    /// 配置应用并重启 Worker 后立即清空该实例的旧滚存样本，避免拿新配置对比重启前旧样本产生误报。
+    pub async fn reset_worker_rolling(&self, worker_id: &str) {
+        let mut guard = self.inner.write().await;
+        guard.rolling.remove(worker_id);
+    }
+
     pub async fn list_session_statuses(&self) -> Vec<TuningSessionStatusDto> {
         let now = Utc::now().timestamp();
         let guard = self.inner.read().await;
@@ -993,7 +999,14 @@ impl TuningAdvisor {
             .ok_or_else(|| format!("未找到 Worker {worker_id} 的激活配置"))?;
         let cfg: CrawlerWorkerConfig = serde_json::from_str(&cfg_row.config_json)
             .map_err(|e| format!("解析 Crawler 配置失败: {e}"))?;
-        let soft_nofile = current_soft_open_file_limit();
+        let worker_pid = self
+            .supervisor
+            .list_worker_statuses()
+            .await
+            .ok()
+            .and_then(|list| list.into_iter().find(|w| w.id == worker_id))
+            .and_then(|w| w.pid);
+        let soft_nofile = read_worker_soft_nofile(worker_pid);
         Ok(analyze_crawler_samples(
             worker_id,
             source,
@@ -1015,6 +1028,23 @@ impl TuningAdvisor {
             q.push_back(s);
         }
     }
+}
+
+/// 优先读取目标 Crawler 进程自身的软 RLIMIT_NOFILE（Linux `/proc/{pid}/limits`），
+/// 不可读或非 Linux 平台时回退到 Panel 当前进程软上限。
+fn read_worker_soft_nofile(pid: Option<u32>) -> Option<usize> {
+    #[cfg(target_os = "linux")]
+    if let Some(pid) = pid
+        && let Ok(raw) = std::fs::read_to_string(format!("/proc/{pid}/limits"))
+    {
+        let (soft, _) = crate::nofile::parse_proc_limits_nofile(&raw);
+        if let Some(v) = soft.and_then(|n| usize::try_from(n).ok()) {
+            return Some(v);
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = pid;
+    current_soft_open_file_limit()
 }
 
 /// 有效参数（将 L3/PeerLookup Optional 覆写与所属 `crawl_profile` 默认值合并后的真实生效值）。
@@ -1463,11 +1493,21 @@ pub fn analyze_crawler_samples(
     let udp_tx_mbps = udp_tx_bps * 8.0 / 1_000_000.0;
     let metadata_rx_mbps = metadata_rx_bps * 8.0 / 1_000_000.0;
 
+    let target_workers_for_fd = cfg.metadata.max_worker_count;
+    let needed_nofile = ((target_workers_for_fd.saturating_mul(12).saturating_add(132)) * 100)
+        .div_ceil(70)
+        .max(16_384);
     let effective_workers = last
         .map(|s| s.effective_metadata_workers)
         .filter(|&w| w > 0)
         .unwrap_or(cfg.metadata.max_worker_count);
-    let fd_clamped = effective_workers < cfg.metadata.max_worker_count;
+    let nofile_below_needed = system_soft_nofile.is_some_and(|cur| cur < needed_nofile);
+    let worker_count_lower_than_cfg = effective_workers < cfg.metadata.max_worker_count;
+    // 只有当进程/系统 NOFILE 确实低于安全阈值（或非 Linux 无法探测 NOFILE）且实际并发被收紧时，才判定为 NOFILE 硬瓶颈；
+    // 若 NOFILE 本身已充足但生效并发仍低于最新配置，则属于「新配置/热提额尚未重启生效」而非 NOFILE 受限。
+    let fd_clamped =
+        worker_count_lower_than_cfg && (nofile_below_needed || system_soft_nofile.is_none());
+    let config_restart_pending = worker_count_lower_than_cfg && !fd_clamped;
 
     let meta_queue_evict_pct = pct(d_q_evict, d_q_ins.max(1));
     let meta_queue_stale_pct = pct(d_q_stale, d_q_ins.saturating_add(d_q_stale).max(1));
@@ -1588,7 +1628,13 @@ pub fn analyze_crawler_samples(
         && !redis_sink_choked
         && !fd_clamped;
 
-    let (regime, regime_title, regime_summary) = if fd_clamped {
+    let (regime, regime_title, regime_summary) = if seg.len() < 2 {
+        (
+            OperatingRegime::BalancedHealthy,
+            "等待重启/新配置稳态样本".to_string(),
+            "当前连续采样段仅有 1 个基线点，需至少 2 个连续点（约 10 秒）才可计算真实速率并生成调优建议。".to_string(),
+        )
+    } else if fd_clamped {
         (
             OperatingRegime::NofileClamped,
             "文件描述符 (NOFILE) 硬瓶颈".to_string(),
@@ -1660,22 +1706,19 @@ pub fn analyze_crawler_samples(
         && !bw_saturated
         && constraints.goal != TuningGoal::LowResource;
 
-    // 4) 逐子系统产出因果清晰、互不冲突的调优建议
+    // 4) 逐子系统产出因果清晰、互不冲突的调优建议（若连续段不足 2 个点则跳过规则计算，防止全零增量误报）
     let mut recs: Vec<TuningRecommendation> = Vec::new();
     let mut score_penalty: f64 = 0.0;
 
-    // --- 规则 1: OS NOFILE 检查 ---
-    let target_workers_for_fd = cfg.metadata.max_worker_count;
-    let needed_nofile = ((target_workers_for_fd.saturating_mul(12).saturating_add(132)) * 100)
-        .div_ceil(70)
-        .max(16_384);
-    let rec_nofile = next_nofile_tier(needed_nofile);
-    if fd_clamped || system_soft_nofile.is_some_and(|cur| cur < needed_nofile) {
-        score_penalty += if fd_clamped { 22.0 } else { 10.0 };
-        let cur_fd = system_soft_nofile
-            .map(|v| v.to_string())
-            .unwrap_or_else(|| "未知".to_string());
-        recs.push(TuningRecommendation {
+    if seg.len() >= 2 {
+        // --- 规则 1: OS NOFILE 检查 & 配置重启生效检查 ---
+        let rec_nofile = next_nofile_tier(needed_nofile);
+        if fd_clamped || nofile_below_needed {
+            score_penalty += if fd_clamped { 22.0 } else { 10.0 };
+            let cur_fd = system_soft_nofile
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "未知".to_string());
+            recs.push(TuningRecommendation {
             id: "sys_nofile".to_string(),
             category: "system".to_string(),
             severity: if fd_clamped {
@@ -1698,15 +1741,38 @@ pub fn analyze_crawler_samples(
             reason: "请先在面板顶部「NOFILE LIMIT」或 Docker/systemd LimitNOFILE 提额，否则提高并发配置不会生效。".to_string(),
             apply_supported: false,
         });
-    }
+        } else if config_restart_pending {
+            let cur_fd = system_soft_nofile
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "充足".to_string());
+            recs.push(TuningRecommendation {
+            id: "sys_worker_restart_pending".to_string(),
+            category: "system".to_string(),
+            severity: RecommendationSeverity::Info,
+            action: RecommendationAction::System,
+            param_path: "worker.restart_required".to_string(),
+            param_label: "新并发配置待重启生效".to_string(),
+            current_display: format!("运行中 {effective_workers} 并发"),
+            recommended_display: format!("重启生效 {} 并发", cfg.metadata.max_worker_count),
+            current_value: Some(Value::from(effective_workers)),
+            recommended_value: Some(Value::from(cfg.metadata.max_worker_count)),
+            delta_pct: None,
+            evidence: format!(
+                "数据库最新配置 BEP-9 并发为 {}，但采样进程实际生效并发仍为 {}（当前 NOFILE 上限 {} 已高于所需 ≥ {}，并非文件描述符受限）",
+                cfg.metadata.max_worker_count, effective_workers, cur_fd, needed_nofile
+            ),
+            reason: "修改 max_worker_count 或热提升 NOFILE 后需重启对应 Crawler 实例，新并发数才会在进程启动时生效。".to_string(),
+            apply_supported: false,
+        });
+        }
 
-    // --- 规则 2: 下游 Redis / Push 并发检查 ---
-    if redis_sink_choked {
-        score_penalty += 18.0;
-        if sink_backpressure_time_pct >= 5.0 || d_sink_drop > 0 || d_hot_drop > 0 {
-            let next_push = (cfg.push_concurrency.saturating_mul(2)).clamp(16, 256);
-            if next_push > cfg.push_concurrency {
-                recs.push(make_num_rec(
+        // --- 规则 2: 下游 Redis / Push 并发检查 ---
+        if redis_sink_choked {
+            score_penalty += 18.0;
+            if sink_backpressure_time_pct >= 5.0 || d_sink_drop > 0 || d_hot_drop > 0 {
+                let next_push = (cfg.push_concurrency.saturating_mul(2)).clamp(16, 256);
+                if next_push > cfg.push_concurrency {
+                    recs.push(make_num_rec(
                     "inc_push_concurrency",
                     "memory_cache",
                     RecommendationSeverity::Critical,
@@ -1721,12 +1787,12 @@ pub fn analyze_crawler_samples(
                     ),
                     "下游推流反压会直接触发 admission_defer 阻塞整个 BEP-9 抓取链路，优先加宽推送协程数。",
                 ));
+                }
             }
-        }
-        if redis_pool_exhausted_time_pct >= 5.0 || d_redis_err >= 10 {
-            let cur_pool = last.map(|s| s.redis_pool_size).unwrap_or(100);
-            let rec_pool = (cur_pool.saturating_mul(2)).clamp(128, 512);
-            recs.push(TuningRecommendation {
+            if redis_pool_exhausted_time_pct >= 5.0 || d_redis_err >= 10 {
+                let cur_pool = last.map(|s| s.redis_pool_size).unwrap_or(100);
+                let rec_pool = (cur_pool.saturating_mul(2)).clamp(128, 512);
+                recs.push(TuningRecommendation {
                 id: "sys_redis_pool".to_string(),
                 category: "system".to_string(),
                 severity: RecommendationSeverity::Critical,
@@ -1747,23 +1813,23 @@ pub fn analyze_crawler_samples(
                         .to_string(),
                 apply_supported: false,
             });
+            }
         }
-    }
 
-    // --- 规则 3: UDP / CPU 饱和紧急降速 ---
-    let mut find_node_handled = false;
-    let mut worker_handled = false;
+        // --- 规则 3: UDP / CPU 饱和紧急降速 ---
+        let mut find_node_handled = false;
+        let mut worker_handled = false;
 
-    if udp_cpu_saturated {
-        score_penalty += 24.0;
-        let target_fn = snap_u32(
-            (actual_find_node_qps.max(f64::from(effective_find_node_p50)) * 0.72) as u32,
-            20,
-            20_000,
-        );
-        if target_fn < eff.find_node_qps {
-            find_node_handled = true;
-            recs.push(make_num_rec(
+        if udp_cpu_saturated {
+            score_penalty += 24.0;
+            let target_fn = snap_u32(
+                (actual_find_node_qps.max(f64::from(effective_find_node_p50)) * 0.72) as u32,
+                20,
+                20_000,
+            );
+            if target_fn < eff.find_node_qps {
+                find_node_handled = true;
+                recs.push(make_num_rec(
                 "dec_find_node_udp_sat",
                 "udp_crawl",
                 RecommendationSeverity::Critical,
@@ -1778,16 +1844,16 @@ pub fn analyze_crawler_samples(
                 ),
                 "UDP 收发通道已过载丢包，调低主动探测速率可同步降低 2–3 倍被动回包压力；并建议检查内核 net.core.rmem_max=33554432。",
             ));
-        }
-        if timeout_validation_share_pct >= 4.0 && cfg.metadata.max_worker_count > 64 {
-            worker_handled = true;
-            let next_w = snap_usize(
-                (cfg.metadata.max_worker_count as f64 * 0.75) as usize,
-                32,
-                4_500,
-            );
-            if next_w < cfg.metadata.max_worker_count {
-                recs.push(make_num_rec(
+            }
+            if timeout_validation_share_pct >= 4.0 && cfg.metadata.max_worker_count > 64 {
+                worker_handled = true;
+                let next_w = snap_usize(
+                    (cfg.metadata.max_worker_count as f64 * 0.75) as usize,
+                    32,
+                    4_500,
+                );
+                if next_w < cfg.metadata.max_worker_count {
+                    recs.push(make_num_rec(
                     "dec_workers_cpu_val",
                     "metadata",
                     RecommendationSeverity::Critical,
@@ -1802,40 +1868,42 @@ pub fn analyze_crawler_samples(
                     ),
                     "Tokio blocking 线程池已饱和，适当降低并发数可减少上下文切换并提升实际成功产率。",
                 ));
+                }
             }
         }
-    }
 
-    // --- 规则 4: 核心供需平衡 — 上游过载反压（精准治理 95% 降速 & 队列打满！）---
-    if overfed {
-        score_penalty += if severe_throttled_time_pct >= 30.0 || meta_queue_full_time_pct >= 40.0 {
-            24.0
-        } else {
-            14.0
-        };
+        // --- 规则 4: 核心供需平衡 — 上游过载反压（精准治理 95% 降速 & 队列打满！）---
+        if overfed {
+            score_penalty +=
+                if severe_throttled_time_pct >= 30.0 || meta_queue_full_time_pct >= 40.0 {
+                    24.0
+                } else {
+                    14.0
+                };
 
-        // 4A. 判断是否虚高配置了 max_find_node_rate_per_sec（典型案例：300,000 × 5% = 15,000）
-        let nominal_inflated = f64::from(eff.find_node_qps) > actual_find_node_qps.max(50.0) * 1.8
-            && throttled_time_pct >= 20.0;
-        if !find_node_handled
-            && (nominal_inflated || bw_saturated || fd_clamped || worker_util_p95_pct >= 88.0)
-        {
-            // 把名义 QPS 贴合到可持续实际速率的 0.85~0.95 倍，彻底消除锯齿震荡
-            let base_sustainable = actual_find_node_qps
-                .max(f64::from(effective_find_node_p50))
-                .max(40.0);
-            let factor = if bw_saturated || meta_queue_full_time_pct >= 50.0 {
-                0.85
-            } else {
-                0.92
-            };
-            let target_fn = snap_u32((base_sustainable * factor) as u32, 20, 20_000);
-            if target_fn < eff.find_node_qps
-                && (eff.find_node_qps - target_fn) as f64 / f64::from(eff.find_node_qps.max(1))
-                    >= 0.08
+            // 4A. 判断是否虚高配置了 max_find_node_rate_per_sec（典型案例：300,000 × 5% = 15,000）
+            let nominal_inflated = f64::from(eff.find_node_qps)
+                > actual_find_node_qps.max(50.0) * 1.8
+                && throttled_time_pct >= 20.0;
+            if !find_node_handled
+                && (nominal_inflated || bw_saturated || fd_clamped || worker_util_p95_pct >= 88.0)
             {
-                find_node_handled = true;
-                recs.push(make_num_rec(
+                // 把名义 QPS 贴合到可持续实际速率的 0.85~0.95 倍，彻底消除锯齿震荡
+                let base_sustainable = actual_find_node_qps
+                    .max(f64::from(effective_find_node_p50))
+                    .max(40.0);
+                let factor = if bw_saturated || meta_queue_full_time_pct >= 50.0 {
+                    0.85
+                } else {
+                    0.92
+                };
+                let target_fn = snap_u32((base_sustainable * factor) as u32, 20, 20_000);
+                if target_fn < eff.find_node_qps
+                    && (eff.find_node_qps - target_fn) as f64 / f64::from(eff.find_node_qps.max(1))
+                        >= 0.08
+                {
+                    find_node_handled = true;
+                    recs.push(make_num_rec(
                     "dec_find_node_backpressure",
                     "queue_balance",
                     if severe_throttled_time_pct >= 25.0 {
@@ -1859,10 +1927,10 @@ pub fn analyze_crawler_samples(
                     "名义速率远超下游消化能力会反复打满队列并触发剧烈降速，将上限收敛至稳态可持续区间可保持队列健康且不掉产率。",
                 ));
 
-                // 联动修正 max_new_destinations_per_minute（避免 1.44M/min 与实际 QPS 严重脱节）
-                let rec_new_dest = snap_u32(target_fn.saturating_mul(60), 3_000, 1_440_000);
-                if eff.max_new_dest_per_min > rec_new_dest.saturating_mul(13) / 10 {
-                    recs.push(make_num_rec(
+                    // 联动修正 max_new_destinations_per_minute（避免 1.44M/min 与实际 QPS 严重脱节）
+                    let rec_new_dest = snap_u32(target_fn.saturating_mul(60), 3_000, 1_440_000);
+                    if eff.max_new_dest_per_min > rec_new_dest.saturating_mul(13) / 10 {
+                        recs.push(make_num_rec(
                         "dec_max_new_dest",
                         "udp_crawl",
                         RecommendationSeverity::Info,
@@ -1877,13 +1945,13 @@ pub fn analyze_crawler_samples(
                         ),
                         "使每分钟新目标配额与 find_node 速率对齐，避免瞬时冷启动冲爆路由器或连接跟踪表。",
                     ));
+                    }
                 }
             }
-        }
 
-        // 4B. 极端低地板（如 5%）修复
-        if eff.metadata_pressure_floor_pct <= 12 && severe_throttled_time_pct >= 15.0 {
-            recs.push(make_num_rec(
+            // 4B. 极端低地板（如 5%）修复
+            if eff.metadata_pressure_floor_pct <= 12 && severe_throttled_time_pct >= 15.0 {
+                recs.push(make_num_rec(
                 "inc_pressure_floor",
                 "queue_balance",
                 RecommendationSeverity::Warning,
@@ -1898,30 +1966,31 @@ pub fn analyze_crawler_samples(
                 ),
                 "搭配合理的 max_find_node_rate_per_sec 将反压底线调回 25%，可让速率平滑回落而非断崖式骤降。",
             ));
-        }
+            }
 
-        // 4C. 如果还有带宽/FD/CPU 余量且 BEP-9 并发跑满，建议同步调高 max_worker_count 扩大消化口！
-        if !worker_handled
-            && allow_scale_up
-            && !fd_clamped
-            && worker_util_p95_pct >= 88.0
-            && cfg.metadata.max_worker_count < 4_500
-        {
-            let step = (0.20 + bw_headroom_ratio * 0.25).clamp(0.15, 0.35);
-            let candidate = snap_usize(
-                (cfg.metadata.max_worker_count as f64 * (1.0 + step)) as usize,
-                32,
-                4_500,
-            );
-            // 确保不超出当前系统 soft_nofile 安全容量
-            let fd_safe_max = system_soft_nofile
-                .map(|lim| ((lim * 70 / 100).saturating_sub(132)) / 12)
-                .unwrap_or(4_500)
-                .max(32);
-            let next_w = candidate.min(fd_safe_max);
-            if next_w > cfg.metadata.max_worker_count {
-                worker_handled = true;
-                recs.push(make_num_rec(
+            // 4C. 如果还有带宽/FD/CPU 余量且 BEP-9 并发跑满，建议同步调高 max_worker_count 扩大消化口！
+            if !worker_handled
+                && allow_scale_up
+                && !fd_clamped
+                && !config_restart_pending
+                && worker_util_p95_pct >= 88.0
+                && cfg.metadata.max_worker_count < 4_500
+            {
+                let step = (0.20 + bw_headroom_ratio * 0.25).clamp(0.15, 0.35);
+                let candidate = snap_usize(
+                    (cfg.metadata.max_worker_count as f64 * (1.0 + step)) as usize,
+                    32,
+                    4_500,
+                );
+                // 确保不超出当前系统 soft_nofile 安全容量
+                let fd_safe_max = system_soft_nofile
+                    .map(|lim| ((lim * 70 / 100).saturating_sub(132)) / 12)
+                    .unwrap_or(4_500)
+                    .max(32);
+                let next_w = candidate.min(fd_safe_max);
+                if next_w > cfg.metadata.max_worker_count {
+                    worker_handled = true;
+                    recs.push(make_num_rec(
                     "inc_workers_backpressure",
                     "metadata",
                     RecommendationSeverity::Warning,
@@ -1936,32 +2005,33 @@ pub fn analyze_crawler_samples(
                     ),
                     "增加元数据抓取并发槽位可直接提升队列消化速率、降低排队等待时长。",
                 ));
+                }
             }
-        }
 
-        // 4D. 队列满载时，Discovery（不受 metadata_pressure 降速！）若放行过快必须压低
-        if cfg.discovery.enabled && (meta_queue_full_time_pct >= 25.0 || throttled_time_pct >= 30.0)
-        {
-            let disc_total = cfg
-                .discovery
-                .get_peers_hashes_per_second
-                .saturating_add(cfg.discovery.sample_hashes_per_second);
-            if disc_total > 16
-                && (actual_drain_rate_per_sec <= 1.0
-                    || f64::from(disc_total) > actual_drain_rate_per_sec * 0.42)
+            // 4D. 队列满载时，Discovery（不受 metadata_pressure 降速！）若放行过快必须压低
+            if cfg.discovery.enabled
+                && (meta_queue_full_time_pct >= 25.0 || throttled_time_pct >= 30.0)
             {
-                let next_gp = snap_u32(
-                    (f64::from(cfg.discovery.get_peers_hashes_per_second) * 0.65) as u32,
-                    4,
-                    512,
-                );
-                let next_sm = snap_u32(
-                    (f64::from(cfg.discovery.sample_hashes_per_second) * 0.65) as u32,
-                    4,
-                    512,
-                );
-                if next_gp < cfg.discovery.get_peers_hashes_per_second {
-                    recs.push(make_num_rec(
+                let disc_total = cfg
+                    .discovery
+                    .get_peers_hashes_per_second
+                    .saturating_add(cfg.discovery.sample_hashes_per_second);
+                if disc_total > 16
+                    && (actual_drain_rate_per_sec <= 1.0
+                        || f64::from(disc_total) > actual_drain_rate_per_sec * 0.42)
+                {
+                    let next_gp = snap_u32(
+                        (f64::from(cfg.discovery.get_peers_hashes_per_second) * 0.65) as u32,
+                        4,
+                        512,
+                    );
+                    let next_sm = snap_u32(
+                        (f64::from(cfg.discovery.sample_hashes_per_second) * 0.65) as u32,
+                        4,
+                        512,
+                    );
+                    if next_gp < cfg.discovery.get_peers_hashes_per_second {
+                        recs.push(make_num_rec(
                         "dec_disc_get_peers",
                         "discovery",
                         RecommendationSeverity::Warning,
@@ -1978,9 +2048,9 @@ pub fn analyze_crawler_samples(
                         ),
                         "discovery 通道绕过 metadata_pressure 反压，适当调低纯 Hash 注入速率把队列留给命中率更高的 announce_peer。",
                     ));
-                }
-                if next_sm < cfg.discovery.sample_hashes_per_second {
-                    recs.push(make_num_rec(
+                    }
+                    if next_sm < cfg.discovery.sample_hashes_per_second {
+                        recs.push(make_num_rec(
                         "dec_disc_sample_hash",
                         "discovery",
                         RecommendationSeverity::Warning,
@@ -1995,26 +2065,26 @@ pub fn analyze_crawler_samples(
                         ),
                         "削减 BEP-51 采样入队速率可同时缓解 metadata_queue 堆积与 peer_lookup 抢占。",
                     ));
+                    }
                 }
             }
-        }
 
-        // 4E. 队列过大导致 Peer 陈旧（排队等待 P95 >= 15s）-> 适当收紧队列容量，保持新鲜度！
-        if let Some(qw_p95) = queue_wait_p95
-            && qw_p95 >= 15_000
-            && cfg.metadata.max_queue_size > 2_048
-        {
-            let fresh_cap = if actual_drain_rate_per_sec >= 20.0 {
-                snap_usize((actual_drain_rate_per_sec * 10.0) as usize, 1_024, 24_576)
-            } else {
-                snap_usize(
-                    (cfg.metadata.max_queue_size as f64 * 0.6) as usize,
-                    1_024,
-                    24_576,
-                )
-            };
-            if fresh_cap < cfg.metadata.max_queue_size {
-                recs.push(make_num_rec(
+            // 4E. 队列过大导致 Peer 陈旧（排队等待 P95 >= 15s）-> 适当收紧队列容量，保持新鲜度！
+            if let Some(qw_p95) = queue_wait_p95
+                && qw_p95 >= 15_000
+                && cfg.metadata.max_queue_size > 2_048
+            {
+                let fresh_cap = if actual_drain_rate_per_sec >= 20.0 {
+                    snap_usize((actual_drain_rate_per_sec * 10.0) as usize, 1_024, 24_576)
+                } else {
+                    snap_usize(
+                        (cfg.metadata.max_queue_size as f64 * 0.6) as usize,
+                        1_024,
+                        24_576,
+                    )
+                };
+                if fresh_cap < cfg.metadata.max_queue_size {
+                    recs.push(make_num_rec(
                     "dec_meta_queue_stale",
                     "queue_balance",
                     RecommendationSeverity::Warning,
@@ -2032,47 +2102,49 @@ pub fn analyze_crawler_samples(
                     ),
                     "过大的满载队列会让 Hash 在队中等待过久导致 Peer 下线，将容量收紧至约 10 秒消化量可显著提升抓取成功率。",
                 ));
+                }
+            }
+
+            // 4F. 队列反压下过高的失败重试次数 -> 缩减至 2 次
+            if cfg.metadata.retry_max_attempts >= 4
+                && (meta_queue_fill_p95_pct >= 75.0 || throttled_time_pct >= 20.0)
+            {
+                recs.push(make_num_rec(
+                    "dec_retry_attempts",
+                    "metadata",
+                    RecommendationSeverity::Opportunity,
+                    RecommendationAction::Decrease,
+                    "metadata.retry_max_attempts",
+                    "失败最大重试次数",
+                    cfg.metadata.retry_max_attempts as u64,
+                    2,
+                    format!(
+                        "当前失败重试 {} 次，队列 P95 {:.0}%、单次抓取成功率 {:.1}%",
+                        cfg.metadata.retry_max_attempts,
+                        meta_queue_fill_p95_pct,
+                        job_success_rate_pct
+                    ),
+                    "高负载下反复重试死种子会挤占队列和并发槽位，降至 2 次可把算力让给新鲜种子。",
+                ));
             }
         }
 
-        // 4F. 队列反压下过高的失败重试次数 -> 缩减至 2 次
-        if cfg.metadata.retry_max_attempts >= 4
-            && (meta_queue_fill_p95_pct >= 75.0 || throttled_time_pct >= 20.0)
-        {
-            recs.push(make_num_rec(
-                "dec_retry_attempts",
-                "metadata",
-                RecommendationSeverity::Opportunity,
-                RecommendationAction::Decrease,
-                "metadata.retry_max_attempts",
-                "失败最大重试次数",
-                cfg.metadata.retry_max_attempts as u64,
-                2,
-                format!(
-                    "当前失败重试 {} 次，队列 P95 {:.0}%、单次抓取成功率 {:.1}%",
-                    cfg.metadata.retry_max_attempts, meta_queue_fill_p95_pct, job_success_rate_pct
-                ),
-                "高负载下反复重试死种子会挤占队列和并发槽位，降至 2 次可把算力让给新鲜种子。",
-            ));
-        }
-    }
-
-    // --- 规则 5: 下游饥饿（有余量可大胆提速！）---
-    if underfed && allow_scale_up {
-        score_penalty += 8.0;
-        // 5A. find_node 已跑满配置上限但下游仍吃不饱 -> 调高 find_node
-        if !find_node_handled
-            && eff.find_node_qps < 20_000
-            && actual_find_node_qps >= f64::from(eff.find_node_qps) * 0.78
-        {
-            let step = (0.25 + bw_headroom_ratio * 0.35).clamp(0.20, 0.50);
-            let next_fn = snap_u32(
-                (f64::from(eff.find_node_qps) * (1.0 + step)) as u32,
-                40,
-                20_000,
-            );
-            if next_fn > eff.find_node_qps {
-                recs.push(make_num_rec(
+        // --- 规则 5: 下游饥饿（有余量可大胆提速！）---
+        if underfed && allow_scale_up {
+            score_penalty += 8.0;
+            // 5A. find_node 已跑满配置上限但下游仍吃不饱 -> 调高 find_node
+            if !find_node_handled
+                && eff.find_node_qps < 20_000
+                && actual_find_node_qps >= f64::from(eff.find_node_qps) * 0.78
+            {
+                let step = (0.25 + bw_headroom_ratio * 0.35).clamp(0.20, 0.50);
+                let next_fn = snap_u32(
+                    (f64::from(eff.find_node_qps) * (1.0 + step)) as u32,
+                    40,
+                    20_000,
+                );
+                if next_fn > eff.find_node_qps {
+                    recs.push(make_num_rec(
                     "inc_find_node_underfed",
                     "udp_crawl",
                     RecommendationSeverity::Opportunity,
@@ -2087,21 +2159,21 @@ pub fn analyze_crawler_samples(
                     ),
                     "下游抓取能力明显富余，提高主动探路速率可扩大 DHT 曝光并提升 announce_peer 产量。",
                 ));
+                }
             }
-        }
 
-        // 5B. Discovery 限流丢弃高 -> 调高 discovery 注入速率
-        if cfg.discovery.enabled
-            && discovery_get_peers_limited_pct >= 25.0
-            && cfg.discovery.get_peers_hashes_per_second < 512
-        {
-            let next_gp = snap_u32(
-                (f64::from(cfg.discovery.get_peers_hashes_per_second) * 1.5) as u32,
-                8,
-                512,
-            );
-            if next_gp > cfg.discovery.get_peers_hashes_per_second {
-                recs.push(make_num_rec(
+            // 5B. Discovery 限流丢弃高 -> 调高 discovery 注入速率
+            if cfg.discovery.enabled
+                && discovery_get_peers_limited_pct >= 25.0
+                && cfg.discovery.get_peers_hashes_per_second < 512
+            {
+                let next_gp = snap_u32(
+                    (f64::from(cfg.discovery.get_peers_hashes_per_second) * 1.5) as u32,
+                    8,
+                    512,
+                );
+                if next_gp > cfg.discovery.get_peers_hashes_per_second {
+                    recs.push(make_num_rec(
                     "inc_disc_get_peers",
                     "discovery",
                     RecommendationSeverity::Opportunity,
@@ -2116,19 +2188,19 @@ pub fn analyze_crawler_samples(
                     ),
                     "放宽被动 get_peers 入队限速几乎零额外 UDP 成本即可为闲置抓取并发提供新鲜 Hash。",
                 ));
+                }
             }
-        }
-        if cfg.discovery.enabled
-            && discovery_sample_hash_limited_pct >= 25.0
-            && cfg.discovery.sample_hashes_per_second < 512
-        {
-            let next_sm = snap_u32(
-                (f64::from(cfg.discovery.sample_hashes_per_second) * 1.5) as u32,
-                8,
-                512,
-            );
-            if next_sm > cfg.discovery.sample_hashes_per_second {
-                recs.push(make_num_rec(
+            if cfg.discovery.enabled
+                && discovery_sample_hash_limited_pct >= 25.0
+                && cfg.discovery.sample_hashes_per_second < 512
+            {
+                let next_sm = snap_u32(
+                    (f64::from(cfg.discovery.sample_hashes_per_second) * 1.5) as u32,
+                    8,
+                    512,
+                );
+                if next_sm > cfg.discovery.sample_hashes_per_second {
+                    recs.push(make_num_rec(
                     "inc_disc_sample_hash",
                     "discovery",
                     RecommendationSeverity::Opportunity,
@@ -2143,57 +2215,57 @@ pub fn analyze_crawler_samples(
                     ),
                     "提升 sample_hashes_per_second 可充分利用已回包的 BEP-51 采样结果，提升整体产出。",
                 ));
+                }
+            }
+
+            // 5C. 并发严重闲置（< 35%）且节能目标或配置极高 -> 建议适当调低省内存
+            if !worker_handled
+                && worker_util_p95_pct < 35.0
+                && cfg.metadata.max_worker_count >= 512
+                && (constraints.goal == TuningGoal::LowResource
+                    || actual_find_node_qps < f64::from(eff.find_node_qps) * 0.6)
+            {
+                let next_w = snap_usize(
+                    ((cfg.metadata.max_worker_count as f64 * (worker_util_p95_pct / 100.0) * 1.5)
+                        as usize)
+                        .max(128),
+                    32,
+                    4_500,
+                );
+                if next_w < cfg.metadata.max_worker_count {
+                    worker_handled = true;
+                    recs.push(make_num_rec(
+                        "dec_workers_idle",
+                        "metadata",
+                        RecommendationSeverity::Info,
+                        RecommendationAction::Decrease,
+                        "metadata.max_worker_count",
+                        "BEP-9 最大并发数",
+                        cfg.metadata.max_worker_count as u64,
+                        next_w as u64,
+                        format!(
+                            "窗口内 BEP-9 并发 P95 利用率仅 {:.1}%，当前配置 {} 远超实际需求",
+                            worker_util_p95_pct, cfg.metadata.max_worker_count
+                        ),
+                        "适当收敛闲置并发槽位可减少 FD 预留要求与内存占用。",
+                    ));
+                }
             }
         }
 
-        // 5C. 并发严重闲置（< 35%）且节能目标或配置极高 -> 建议适当调低省内存
-        if !worker_handled
-            && worker_util_p95_pct < 35.0
-            && cfg.metadata.max_worker_count >= 512
-            && (constraints.goal == TuningGoal::LowResource
-                || actual_find_node_qps < f64::from(eff.find_node_qps) * 0.6)
-        {
+        // --- 规则 6: 带宽超标护栏（当用户设置了上下行带宽上限）---
+        if rx_saturated && !worker_handled && cfg.metadata.max_worker_count > 32 {
+            score_penalty += 15.0;
+            let rx_cap = constraints.down_mbps.unwrap_or(est_wire_rx_mbps);
+            let ratio =
+                ((rx_cap * (bw_ceiling_pct / 100.0)) / est_wire_rx_mbps.max(0.1)).clamp(0.65, 0.90);
             let next_w = snap_usize(
-                ((cfg.metadata.max_worker_count as f64 * (worker_util_p95_pct / 100.0) * 1.5)
-                    as usize)
-                    .max(128),
-                32,
+                (cfg.metadata.max_worker_count as f64 * ratio) as usize,
+                16,
                 4_500,
             );
             if next_w < cfg.metadata.max_worker_count {
-                worker_handled = true;
                 recs.push(make_num_rec(
-                    "dec_workers_idle",
-                    "metadata",
-                    RecommendationSeverity::Info,
-                    RecommendationAction::Decrease,
-                    "metadata.max_worker_count",
-                    "BEP-9 最大并发数",
-                    cfg.metadata.max_worker_count as u64,
-                    next_w as u64,
-                    format!(
-                        "窗口内 BEP-9 并发 P95 利用率仅 {:.1}%，当前配置 {} 远超实际需求",
-                        worker_util_p95_pct, cfg.metadata.max_worker_count
-                    ),
-                    "适当收敛闲置并发槽位可减少 FD 预留要求与内存占用。",
-                ));
-            }
-        }
-    }
-
-    // --- 规则 6: 带宽超标护栏（当用户设置了上下行带宽上限）---
-    if rx_saturated && !worker_handled && cfg.metadata.max_worker_count > 32 {
-        score_penalty += 15.0;
-        let rx_cap = constraints.down_mbps.unwrap_or(est_wire_rx_mbps);
-        let ratio =
-            ((rx_cap * (bw_ceiling_pct / 100.0)) / est_wire_rx_mbps.max(0.1)).clamp(0.65, 0.90);
-        let next_w = snap_usize(
-            (cfg.metadata.max_worker_count as f64 * ratio) as usize,
-            16,
-            4_500,
-        );
-        if next_w < cfg.metadata.max_worker_count {
-            recs.push(make_num_rec(
                 "dec_workers_rx_bw",
                 "metadata",
                 RecommendationSeverity::Warning,
@@ -2210,49 +2282,51 @@ pub fn analyze_crawler_samples(
                 ),
                 "下行打满会导致 TCP 重传激增与超时率飙升，小幅下调并发可在更低丢包下获得更高有效产率。",
             ));
+            }
         }
-    }
 
-    if let Some(up_cap) = constraints.up_mbps
-        && up_cap > 0.0
-    {
-        let up_cap_bytes = (up_cap * 1_000_000.0 / 8.0) as u64;
-        // 若 max_response_bytes_per_sec 比整机上行物理带宽还高，说明完全没有护栏！
-        if eff.max_response_bytes > up_cap_bytes {
-            let safe_resp_bytes = snap_u64(
-                (up_cap_bytes as f64 * 0.65) as u64,
-                256 * 1024,
-                96 * 1024 * 1024,
-            );
-            recs.push(make_num_rec(
-                "dec_resp_bytes_unguarded",
-                "udp_crawl",
-                RecommendationSeverity::Warning,
-                RecommendationAction::Decrease,
-                "crawl.rate_limit.max_response_bytes_per_sec",
-                "UDP 回包字节上限 (B/s)",
-                eff.max_response_bytes,
-                safe_resp_bytes,
-                format!(
-                    "当前回包字节上限 {:.1} MiB/s 已超出服务器物理上行 {:.0} Mbps ({:.1} MiB/s)",
-                    eff.max_response_bytes as f64 / (1024.0 * 1024.0),
-                    up_cap,
-                    up_cap_bytes as f64 / (1024.0 * 1024.0)
-                ),
-                "在遇到 DHT 突发反射查询时缺少上行硬护栏会打断 SSH 与 TCP 握手，建议收敛至上行带宽 65% 以内。",
-            ));
-        }
-    }
-
-    // --- 规则 7: 精细超时校准（基于真实增量分阶段超时 + 耗时直方图！）---
-    if total_stage_to >= 40 {
-        // 7A. 传输分片阶段被截断过多 -> 延长 timeout_secs
-        if timeout_piece_recv_share_pct >= 38.0
-            && cfg.metadata.timeout_secs < 8
-            && fetch_dur_p95.is_none_or(|ms| ms >= cfg.metadata.timeout_secs * 850)
+        if let Some(up_cap) = constraints.up_mbps
+            && up_cap > 0.0
         {
-            let next_to = (cfg.metadata.timeout_secs + 2).min(8);
-            recs.push(make_num_rec(
+            let up_cap_bytes = (up_cap * 1_000_000.0 / 8.0) as u64;
+            // 若 max_response_bytes_per_sec 比整机上行物理带宽还高，说明完全没有护栏！
+            if eff.max_response_bytes > up_cap_bytes {
+                let safe_resp_bytes = snap_u64(
+                    (up_cap_bytes as f64 * 0.65) as u64,
+                    256 * 1024,
+                    96 * 1024 * 1024,
+                );
+                if safe_resp_bytes < eff.max_response_bytes {
+                    recs.push(make_num_rec(
+                    "dec_resp_bytes_unguarded",
+                    "udp_crawl",
+                    RecommendationSeverity::Warning,
+                    RecommendationAction::Decrease,
+                    "crawl.rate_limit.max_response_bytes_per_sec",
+                    "UDP 回包字节上限 (B/s)",
+                    eff.max_response_bytes,
+                    safe_resp_bytes,
+                    format!(
+                        "当前回包字节上限 {:.1} MiB/s 已超出服务器物理上行 {:.0} Mbps ({:.1} MiB/s)",
+                        eff.max_response_bytes as f64 / (1024.0 * 1024.0),
+                        up_cap,
+                        up_cap_bytes as f64 / (1024.0 * 1024.0)
+                    ),
+                    "在遇到 DHT 突发反射查询时缺少上行硬护栏会打断 SSH 与 TCP 握手，建议收敛至上行带宽 65% 以内。",
+                ));
+                }
+            }
+        }
+
+        // --- 规则 7: 精细超时校准（基于真实增量分阶段超时 + 耗时直方图！）---
+        if total_stage_to >= 40 {
+            // 7A. 传输分片阶段被截断过多 -> 延长 timeout_secs
+            if timeout_piece_recv_share_pct >= 38.0
+                && cfg.metadata.timeout_secs < 8
+                && fetch_dur_p95.is_none_or(|ms| ms >= cfg.metadata.timeout_secs * 850)
+            {
+                let next_to = (cfg.metadata.timeout_secs + 2).min(8);
+                recs.push(make_num_rec(
                 "inc_meta_timeout_piece",
                 "metadata",
                 RecommendationSeverity::Warning,
@@ -2268,14 +2342,14 @@ pub fn analyze_crawler_samples(
                 ),
                 "大量已握手成功并正在下发元数据的 Peer 因总超时过短被中途掐断，适当放宽总超时可直接挽回有效种子。",
             ));
-        } else if cfg.metadata.timeout_secs >= 5
-            && timeout_piece_recv_share_pct <= 22.0
-            && (overfed || fetch_dur_p95.is_some_and(|ms| ms < cfg.metadata.timeout_secs * 720))
-        {
-            // 7B. 总超时偏长（例如 6s），但大部分超时死在建连/握手阶段 -> 缩短至 4s 加快槽位周转！
-            let next_to = cfg.metadata.timeout_secs.saturating_sub(2).max(4);
-            if next_to < cfg.metadata.timeout_secs {
-                recs.push(make_num_rec(
+            } else if cfg.metadata.timeout_secs >= 5
+                && timeout_piece_recv_share_pct <= 22.0
+                && (overfed || fetch_dur_p95.is_some_and(|ms| ms < cfg.metadata.timeout_secs * 720))
+            {
+                // 7B. 总超时偏长（例如 6s），但大部分超时死在建连/握手阶段 -> 缩短至 4s 加快槽位周转！
+                let next_to = cfg.metadata.timeout_secs.saturating_sub(2).max(4);
+                if next_to < cfg.metadata.timeout_secs {
+                    recs.push(make_num_rec(
                     "dec_meta_timeout_turnover",
                     "metadata",
                     RecommendationSeverity::Opportunity,
@@ -2293,15 +2367,15 @@ pub fn analyze_crawler_samples(
                     ),
                     "缩短总超时至 4s 可加快失联槽位释放，在不增加并发的前提下提升约 25%–35% 队列消化速度。",
                 ));
+                }
             }
-        }
 
-        // 7C. TCP 建连超时占比极高 -> 缩短 connect_timeout_ms 快速淘汰死端口
-        if timeout_tcp_connect_share_pct >= 58.0
-            && cfg.metadata.connect_timeout_ms >= 2_000
-            && overfed
-        {
-            recs.push(make_num_rec(
+            // 7C. TCP 建连超时占比极高 -> 缩短 connect_timeout_ms 快速淘汰死端口
+            if timeout_tcp_connect_share_pct >= 58.0
+                && cfg.metadata.connect_timeout_ms >= 2_000
+                && overfed
+            {
+                recs.push(make_num_rec(
                 "dec_connect_timeout",
                 "metadata",
                 RecommendationSeverity::Opportunity,
@@ -2316,22 +2390,22 @@ pub fn analyze_crawler_samples(
                 ),
                 "将 TCP 建连超时由 2000ms 收紧至 1500ms 可更快跳过不可达端口，加速多 Peer 竞速轮转。",
             ));
+            }
         }
-    }
 
-    // --- 规则 8: UDP 回包限流检查 ---
-    if (response_rate_limited_pct >= 15.0 || response_fallback_pct >= 12.0)
-        && !tx_saturated
-        && !udp_cpu_saturated
-    {
-        score_penalty += 8.0;
-        let next_rr = snap_u32(
-            (f64::from(eff.max_response_rate) * 1.4) as u32,
-            500,
-            240_000,
-        );
-        if next_rr > eff.max_response_rate {
-            recs.push(make_num_rec(
+        // --- 规则 8: UDP 回包限流检查 ---
+        if (response_rate_limited_pct >= 15.0 || response_fallback_pct >= 12.0)
+            && !tx_saturated
+            && !udp_cpu_saturated
+        {
+            score_penalty += 8.0;
+            let next_rr = snap_u32(
+                (f64::from(eff.max_response_rate) * 1.4) as u32,
+                500,
+                240_000,
+            );
+            if next_rr > eff.max_response_rate {
+                recs.push(make_num_rec(
                 "inc_resp_rate",
                 "udp_crawl",
                 RecommendationSeverity::Warning,
@@ -2346,50 +2420,50 @@ pub fn analyze_crawler_samples(
                 ),
                 "大量丢弃入站查询回包会导致远端节点将本机踢出路由表、降低 announce_peer 被动流量。",
             ));
+            }
+            let next_rb = snap_u64(
+                (eff.max_response_bytes as f64 * 1.4) as u64,
+                256 * 1024,
+                96 * 1024 * 1024,
+            );
+            let safe_max_rb = constraints
+                .up_mbps
+                .filter(|&m| m > 0.0)
+                .map(|m| ((m * 1_000_000.0 / 8.0) * 0.72) as u64)
+                .unwrap_or(96 * 1024 * 1024);
+            let capped_rb = next_rb.min(safe_max_rb);
+            if capped_rb > eff.max_response_bytes {
+                recs.push(make_num_rec(
+                    "inc_resp_bytes",
+                    "udp_crawl",
+                    RecommendationSeverity::Warning,
+                    RecommendationAction::Increase,
+                    "crawl.rate_limit.max_response_bytes_per_sec",
+                    "UDP 回包字节上限 (B/s)",
+                    eff.max_response_bytes,
+                    capped_rb,
+                    format!(
+                        "回包限流占比 {:.1}%，当前实测 UDP TX 仅 {:.1} Mbps",
+                        response_rate_limited_pct, udp_tx_mbps
+                    ),
+                    "同步抬高回包字节配额，避免在包数未超限时被字节桶提前截断。",
+                ));
+            }
         }
-        let next_rb = snap_u64(
-            (eff.max_response_bytes as f64 * 1.4) as u64,
-            256 * 1024,
-            96 * 1024 * 1024,
-        );
-        let safe_max_rb = constraints
-            .up_mbps
-            .filter(|&m| m > 0.0)
-            .map(|m| ((m * 1_000_000.0 / 8.0) * 0.72) as u64)
-            .unwrap_or(96 * 1024 * 1024);
-        let capped_rb = next_rb.min(safe_max_rb);
-        if capped_rb > eff.max_response_bytes {
-            recs.push(make_num_rec(
-                "inc_resp_bytes",
-                "udp_crawl",
-                RecommendationSeverity::Warning,
-                RecommendationAction::Increase,
-                "crawl.rate_limit.max_response_bytes_per_sec",
-                "UDP 回包字节上限 (B/s)",
-                eff.max_response_bytes,
-                capped_rb,
-                format!(
-                    "回包限流占比 {:.1}%，当前实测 UDP TX 仅 {:.1} Mbps",
-                    response_rate_limited_pct, udp_tx_mbps
-                ),
-                "同步抬高回包字节配额，避免在包数未超限时被字节桶提前截断。",
-            ));
-        }
-    }
 
-    // --- 规则 9: find_node 在途窗口 & 事务超时检查 ---
-    if find_node_in_flight_p95_pct >= 88.0
-        && actual_find_node_qps < f64::from(eff.find_node_qps) * 0.85
-        && !overfed
-        && !udp_cpu_saturated
-    {
-        let next_if = snap_usize(
-            (eff.find_node_max_in_flight as f64 * 1.4) as usize,
-            256,
-            98_304,
-        );
-        if next_if > eff.find_node_max_in_flight {
-            recs.push(make_num_rec(
+        // --- 规则 9: find_node 在途窗口 & 事务超时检查 ---
+        if find_node_in_flight_p95_pct >= 88.0
+            && actual_find_node_qps < f64::from(eff.find_node_qps) * 0.85
+            && !overfed
+            && !udp_cpu_saturated
+        {
+            let next_if = snap_usize(
+                (eff.find_node_max_in_flight as f64 * 1.4) as usize,
+                256,
+                98_304,
+            );
+            if next_if > eff.find_node_max_in_flight {
+                recs.push(make_num_rec(
                 "inc_find_node_inflight",
                 "udp_crawl",
                 RecommendationSeverity::Warning,
@@ -2404,38 +2478,38 @@ pub fn analyze_crawler_samples(
                 ),
                 "按利特尔法则，max_in_flight 需略大于 QPS × request_timeout_secs；放宽窗口可解除发包阻塞。",
             ));
+            }
         }
-    }
 
-    if d_responses >= 200 && find_node_unmatched_pct >= 12.0 && eff.request_timeout_secs < 4 {
-        recs.push(make_num_rec(
-            "inc_crawl_req_timeout",
-            "udp_crawl",
-            RecommendationSeverity::Info,
-            RecommendationAction::Increase,
-            "crawl.rate_limit.request_timeout_secs",
-            "find_node 请求超时 (s)",
-            eff.request_timeout_secs,
-            eff.request_timeout_secs + 1,
-            format!(
-                "收到未匹配/迟到响应占比 {:.1}%（{} 条），说明不少跨洲节点在 {}s 后才回包",
-                find_node_unmatched_pct, d_unmatched, eff.request_timeout_secs
-            ),
-            "适当放宽 1 秒请求超时可回收更多远距离高价值路由节点。",
-        ));
-    }
+        if d_responses >= 200 && find_node_unmatched_pct >= 12.0 && eff.request_timeout_secs < 4 {
+            recs.push(make_num_rec(
+                "inc_crawl_req_timeout",
+                "udp_crawl",
+                RecommendationSeverity::Info,
+                RecommendationAction::Increase,
+                "crawl.rate_limit.request_timeout_secs",
+                "find_node 请求超时 (s)",
+                eff.request_timeout_secs,
+                eff.request_timeout_secs + 1,
+                format!(
+                    "收到未匹配/迟到响应占比 {:.1}%（{} 条），说明不少跨洲节点在 {}s 后才回包",
+                    find_node_unmatched_pct, d_unmatched, eff.request_timeout_secs
+                ),
+                "适当放宽 1 秒请求超时可回收更多远距离高价值路由节点。",
+            ));
+        }
 
-    // --- 规则 10: PeerLookup 补人通道诊断 ---
-    if d_pl_req >= 50 {
-        if peer_lookup_rate_limited_pct >= 15.0
-            && peer_lookup_yield_per_started >= 0.4
-            && !overfed
-            && allow_scale_up
-            && eff.peer_lookup_rate < 1_024
-        {
-            let next_pl = snap_u32((f64::from(eff.peer_lookup_rate) * 1.45) as u32, 16, 1_024);
-            if next_pl > eff.peer_lookup_rate {
-                recs.push(make_num_rec(
+        // --- 规则 10: PeerLookup 补人通道诊断 ---
+        if d_pl_req >= 50 {
+            if peer_lookup_rate_limited_pct >= 15.0
+                && peer_lookup_yield_per_started >= 0.4
+                && !overfed
+                && allow_scale_up
+                && eff.peer_lookup_rate < 1_024
+            {
+                let next_pl = snap_u32((f64::from(eff.peer_lookup_rate) * 1.45) as u32, 16, 1_024);
+                if next_pl > eff.peer_lookup_rate {
+                    recs.push(make_num_rec(
                     "inc_peer_lookup_rate",
                     "peer_lookup",
                     RecommendationSeverity::Warning,
@@ -2450,9 +2524,9 @@ pub fn analyze_crawler_samples(
                     ),
                     "高回报补人通道被限流卡住，调高速率（并同步放宽 max_active_lookups）可直接提高纯 Hash 抓取成功率。",
                 ));
-                let next_active = (next_pl as usize * 2).clamp(32, 2_048);
-                if next_active > eff.peer_lookup_max_active {
-                    recs.push(make_num_rec(
+                    let next_active = (next_pl as usize * 2).clamp(32, 2_048);
+                    if next_active > eff.peer_lookup_max_active {
+                        recs.push(make_num_rec(
                         "inc_peer_lookup_active",
                         "peer_lookup",
                         RecommendationSeverity::Info,
@@ -2467,16 +2541,16 @@ pub fn analyze_crawler_samples(
                         ),
                         "保持活跃槽位为每秒发起速率的 2 倍左右（对应 2s lookup 超时），防止新速率被并发槽位卡死。",
                     ));
+                    }
                 }
-            }
-        } else if d_pl_start >= 100
-            && peer_lookup_yield_per_started < 0.08
-            && peer_lookup_timeout_pct >= 70.0
-            && eff.peer_lookup_rate > 16
-        {
-            let next_pl = snap_u32((f64::from(eff.peer_lookup_rate) * 0.6) as u32, 8, 1_024);
-            if next_pl < eff.peer_lookup_rate {
-                recs.push(make_num_rec(
+            } else if d_pl_start >= 100
+                && peer_lookup_yield_per_started < 0.08
+                && peer_lookup_timeout_pct >= 70.0
+                && eff.peer_lookup_rate > 16
+            {
+                let next_pl = snap_u32((f64::from(eff.peer_lookup_rate) * 0.6) as u32, 8, 1_024);
+                if next_pl < eff.peer_lookup_rate {
+                    recs.push(make_num_rec(
                     "dec_peer_lookup_low_yield",
                     "peer_lookup",
                     RecommendationSeverity::Opportunity,
@@ -2491,16 +2565,16 @@ pub fn analyze_crawler_samples(
                     ),
                     "降低低效的 get_peers 轮询速率可节省 UDP 小包与 PPS 开销。",
                 ));
+                }
             }
         }
-    }
 
-    // --- 规则 11: 入口队列 & 调度器通道 & 浅队列驱逐检查 ---
-    if d_ing_drop > 0 || ingress_fill_p95_pct >= 80.0 {
-        score_penalty += 8.0;
-        let next_hq = (cfg.hash_queue_capacity.saturating_mul(2)).clamp(2_048, 32_768);
-        if next_hq > cfg.hash_queue_capacity {
-            recs.push(make_num_rec(
+        // --- 规则 11: 入口队列 & 调度器通道 & 浅队列驱逐检查 ---
+        if d_ing_drop > 0 || ingress_fill_p95_pct >= 80.0 {
+            score_penalty += 8.0;
+            let next_hq = (cfg.hash_queue_capacity.saturating_mul(2)).clamp(2_048, 32_768);
+            if next_hq > cfg.hash_queue_capacity {
+                recs.push(make_num_rec(
                 "inc_hash_queue",
                 "queue_balance",
                 RecommendationSeverity::Warning,
@@ -2515,204 +2589,207 @@ pub fn analyze_crawler_samples(
                 ),
                 "加宽 hash_queue_capacity 可平滑突发 announce 洪峰，防止在进入去重调度器前直接丢弃。",
             ));
+            }
         }
-    }
 
-    if !overfed && meta_queue_evict_pct >= 3.0 && queue_wait_p95.is_some_and(|ms| ms < 4_000) {
-        let next_mq = snap_usize(
-            (cfg.metadata.max_queue_size as f64 * 1.5) as usize,
-            1_024,
-            30_000,
-        );
-        if next_mq > cfg.metadata.max_queue_size {
+        if !overfed && meta_queue_evict_pct >= 3.0 && queue_wait_p95.is_some_and(|ms| ms < 4_000) {
+            let next_mq = snap_usize(
+                (cfg.metadata.max_queue_size as f64 * 1.5) as usize,
+                1_024,
+                30_000,
+            );
+            if next_mq > cfg.metadata.max_queue_size {
+                recs.push(make_num_rec(
+                    "inc_meta_queue_burst",
+                    "queue_balance",
+                    RecommendationSeverity::Opportunity,
+                    RecommendationAction::Increase,
+                    "metadata.max_queue_size",
+                    "BEP-9 任务队列容量",
+                    cfg.metadata.max_queue_size as u64,
+                    next_mq as u64,
+                    format!(
+                        "排队等待 P95 仅 {:.1}s（Peer 很新鲜），但队列突发驱逐率达 {:.1}%",
+                        queue_wait_p95.unwrap_or(0) as f64 / 1000.0,
+                        meta_queue_evict_pct
+                    ),
+                    "当前队列偏浅导致短时波峰驱逐新任务，适度扩容可接住突发流量而不引入陈旧 Peer。",
+                ));
+            }
+        }
+
+        if prio_fill_p95_pct >= 75.0 && eff.prio_chan_cap < 49_152 {
+            let next_pc = (eff.prio_chan_cap.saturating_mul(2)).min(49_152);
             recs.push(make_num_rec(
-                "inc_meta_queue_burst",
-                "queue_balance",
-                RecommendationSeverity::Opportunity,
+                "inc_prio_chan",
+                "udp_crawl",
+                RecommendationSeverity::Warning,
                 RecommendationAction::Increase,
-                "metadata.max_queue_size",
-                "BEP-9 任务队列容量",
-                cfg.metadata.max_queue_size as u64,
-                next_mq as u64,
-                format!(
-                    "排队等待 P95 仅 {:.1}s（Peer 很新鲜），但队列突发驱逐率达 {:.1}%",
-                    queue_wait_p95.unwrap_or(0) as f64 / 1000.0,
-                    meta_queue_evict_pct
-                ),
-                "当前队列偏浅导致短时波峰驱逐新任务，适度扩容可接住突发流量而不引入陈旧 Peer。",
+                "crawl.scheduler.priority_event_channel_capacity",
+                "调度器优先事件通道容量",
+                eff.prio_chan_cap as u64,
+                next_pc as u64,
+                format!("priority 事件通道 P95 占用 {:.0}%", prio_fill_p95_pct),
+                "拓宽优先通道可防止高 QPS 下的回包路由事件丢弃。",
             ));
         }
-    }
-
-    if prio_fill_p95_pct >= 75.0 && eff.prio_chan_cap < 49_152 {
-        let next_pc = (eff.prio_chan_cap.saturating_mul(2)).min(49_152);
-        recs.push(make_num_rec(
-            "inc_prio_chan",
-            "udp_crawl",
-            RecommendationSeverity::Warning,
-            RecommendationAction::Increase,
-            "crawl.scheduler.priority_event_channel_capacity",
-            "调度器优先事件通道容量",
-            eff.prio_chan_cap as u64,
-            next_pc as u64,
-            format!("priority 事件通道 P95 占用 {:.0}%", prio_fill_p95_pct),
-            "拓宽优先通道可防止高 QPS 下的回包路由事件丢弃。",
-        ));
-    }
-    if disc_fill_p95_pct >= 75.0 && eff.disc_chan_cap < 98_304 {
-        let next_dc = (eff.disc_chan_cap.saturating_mul(2)).min(98_304);
-        recs.push(make_num_rec(
-            "inc_disc_chan",
-            "udp_crawl",
-            RecommendationSeverity::Warning,
-            RecommendationAction::Increase,
-            "crawl.scheduler.discovery_event_channel_capacity",
-            "调度器节点发现通道容量",
-            eff.disc_chan_cap as u64,
-            next_dc as u64,
-            format!("discovery 事件通道 P95 占用 {:.0}%", disc_fill_p95_pct),
-            "拓宽发现通道可减少新发现路由节点在入池前的排队丢弃。",
-        ));
-    }
-
-    // --- 规则 12: 节点池替换与重复探测优化 ---
-    if total_node_events >= 500 && node_dropped_rate_limited_pct >= 20.0 && !udp_cpu_saturated {
-        let next_rep = snap_u32(
-            (f64::from(eff.max_replacements_per_min) * 1.5) as u32,
-            10_000,
-            4_320_000,
-        );
-        if next_rep > eff.max_replacements_per_min {
+        if disc_fill_p95_pct >= 75.0 && eff.disc_chan_cap < 98_304 {
+            let next_dc = (eff.disc_chan_cap.saturating_mul(2)).min(98_304);
             recs.push(make_num_rec(
-                "inc_pool_replacements",
+                "inc_disc_chan",
+                "udp_crawl",
+                RecommendationSeverity::Warning,
+                RecommendationAction::Increase,
+                "crawl.scheduler.discovery_event_channel_capacity",
+                "调度器节点发现通道容量",
+                eff.disc_chan_cap as u64,
+                next_dc as u64,
+                format!("discovery 事件通道 P95 占用 {:.0}%", disc_fill_p95_pct),
+                "拓宽发现通道可减少新发现路由节点在入池前的排队丢弃。",
+            ));
+        }
+
+        // --- 规则 12: 节点池替换与重复探测优化 ---
+        if total_node_events >= 500 && node_dropped_rate_limited_pct >= 20.0 && !udp_cpu_saturated {
+            let next_rep = snap_u32(
+                (f64::from(eff.max_replacements_per_min) * 1.5) as u32,
+                10_000,
+                4_320_000,
+            );
+            if next_rep > eff.max_replacements_per_min {
+                recs.push(make_num_rec(
+                    "inc_pool_replacements",
+                    "udp_crawl",
+                    RecommendationSeverity::Opportunity,
+                    RecommendationAction::Increase,
+                    "crawl.rate_limit.max_replacements_per_minute",
+                    "节点池每分钟替换上限",
+                    u64::from(eff.max_replacements_per_min),
+                    u64::from(next_rep),
+                    format!(
+                        "有 {:.1}% 新发现路由节点因池替换限流被丢弃（池满载 P95 {:.0}%）",
+                        node_dropped_rate_limited_pct, node_pool_fill_p95_pct
+                    ),
+                    "提高 FIFO 节点池替换速率可加快淘汰僵尸节点、保持活跃路由新鲜度。",
+                ));
+            }
+        }
+
+        if d_queries >= 500
+            && revisit_share_pct >= 45.0
+            && eff.revisit_interval_secs < 15
+            && node_pool_fill_p95_pct >= 60.0
+        {
+            recs.push(make_num_rec(
+                "inc_revisit_interval",
                 "udp_crawl",
                 RecommendationSeverity::Opportunity,
                 RecommendationAction::Increase,
-                "crawl.rate_limit.max_replacements_per_minute",
-                "节点池每分钟替换上限",
-                u64::from(eff.max_replacements_per_min),
-                u64::from(next_rep),
+                "crawl.pool.revisit_interval_secs",
+                "活跃节点重访冷却间隔 (s)",
+                eff.revisit_interval_secs,
+                20,
                 format!(
-                    "有 {:.1}% 新发现路由节点因池替换限流被丢弃（池满载 P95 {:.0}%）",
-                    node_dropped_rate_limited_pct, node_pool_fill_p95_pct
+                    "窗口内重复回访占比达 {:.1}%（当前冷却间隔 {}s），节点池已充裕",
+                    revisit_share_pct, eff.revisit_interval_secs
                 ),
-                "提高 FIFO 节点池替换速率可加快淘汰僵尸节点、保持活跃路由新鲜度。",
+                "设置 20s 重访冷却可避免对同一活跃节点高频重复探测，把发包配额用于探索新区域。",
             ));
         }
-    }
 
-    if d_queries >= 500
-        && revisit_share_pct >= 45.0
-        && eff.revisit_interval_secs < 15
-        && node_pool_fill_p95_pct >= 60.0
-    {
-        recs.push(make_num_rec(
-            "inc_revisit_interval",
-            "udp_crawl",
-            RecommendationSeverity::Opportunity,
-            RecommendationAction::Increase,
-            "crawl.pool.revisit_interval_secs",
-            "活跃节点重访冷却间隔 (s)",
-            eff.revisit_interval_secs,
-            20,
-            format!(
-                "窗口内重复回访占比达 {:.1}%（当前冷却间隔 {}s），节点池已充裕",
-                revisit_share_pct, eff.revisit_interval_secs
-            ),
-            "设置 20s 重访冷却可避免对同一活跃节点高频重复探测，把发包配额用于探索新区域。",
-        ));
-    }
-
-    // --- 规则 13: BEP-51 冷却/容量与本地内存缓存调优 ---
-    if cfg.discovery.enabled && d_sm_cd_full > 0 && cfg.discovery.sample_cooldown_capacity < 600_000
-    {
-        let next_cd = (cfg.discovery.sample_cooldown_capacity.saturating_mul(2)).min(600_000);
-        recs.push(make_num_rec(
-            "inc_sample_cooldown",
-            "discovery",
-            RecommendationSeverity::Warning,
-            RecommendationAction::Increase,
-            "discovery.sample_cooldown_capacity",
-            "BEP-51 冷却历史表容量",
-            cfg.discovery.sample_cooldown_capacity as u64,
-            next_cd as u64,
-            format!("窗口内触发冷却表满暂停采样 {} 次", d_sm_cd_full),
-            "冷却表满会强制暂停 BEP-51 采样，扩容可恢复持续采样。",
-        ));
-    }
-    if cfg.discovery.enabled && d_sm_node_drop >= 50 && cfg.discovery.sample_max_nodes < 131_072 {
-        let next_sn = (cfg.discovery.sample_max_nodes.saturating_mul(2)).min(131_072);
-        recs.push(make_num_rec(
-            "inc_sample_nodes",
-            "discovery",
-            RecommendationSeverity::Info,
-            RecommendationAction::Increase,
-            "discovery.sample_max_nodes",
-            "BEP-51 候选节点上限",
-            cfg.discovery.sample_max_nodes as u64,
-            next_sn as u64,
-            format!("候选池容量不足丢弃采样节点 {} 次", d_sm_node_drop),
-            "适当扩大候选节点池可提高多节点轮询覆盖率。",
-        ));
-    }
-
-    if local_cache_fill_pct >= 92.0
-        && redis_indexed_miss_pct >= 22.0
-        && cfg.metadata_cache_capacity < 3_000_000
-        && rss_growth_mb_per_hour < 250.0
-    {
-        let next_cap = snap_usize(
-            (cfg.metadata_cache_capacity as f64 * 1.5) as usize,
-            100_000,
-            3_000_000,
-        );
-        if next_cap > cfg.metadata_cache_capacity {
+        // --- 规则 13: BEP-51 冷却/容量与本地内存缓存调优 ---
+        if cfg.discovery.enabled
+            && d_sm_cd_full > 0
+            && cfg.discovery.sample_cooldown_capacity < 600_000
+        {
+            let next_cd = (cfg.discovery.sample_cooldown_capacity.saturating_mul(2)).min(600_000);
             recs.push(make_num_rec(
-                "inc_local_cache",
-                "memory_cache",
-                RecommendationSeverity::Opportunity,
+                "inc_sample_cooldown",
+                "discovery",
+                RecommendationSeverity::Warning,
                 RecommendationAction::Increase,
-                "metadata_cache_capacity",
-                "本地去重缓存容量",
-                cfg.metadata_cache_capacity as u64,
-                next_cap as u64,
-                format!(
-                    "本地缓存已满 {:.0}%，穿透到 Redis 后命中「已索引」占比达 {:.1}%",
-                    local_cache_fill_pct, redis_indexed_miss_pct
-                ),
-                "扩容本地去重缓存可大幅减少 Redis 查重往返，降低网络延迟与 Redis CPU 消耗。",
+                "discovery.sample_cooldown_capacity",
+                "BEP-51 冷却历史表容量",
+                cfg.discovery.sample_cooldown_capacity as u64,
+                next_cd as u64,
+                format!("窗口内触发冷却表满暂停采样 {} 次", d_sm_cd_full),
+                "冷却表满会强制暂停 BEP-51 采样，扩容可恢复持续采样。",
             ));
         }
-    }
-
-    if peer_fail_cache_fill_pct >= 92.0 && cfg.metadata.peer_failure_cache_capacity < 800_000 {
-        let next_pfc = snap_usize(
-            (cfg.metadata.peer_failure_cache_capacity as f64 * 1.5) as usize,
-            50_000,
-            800_000,
-        );
-        if next_pfc > cfg.metadata.peer_failure_cache_capacity {
+        if cfg.discovery.enabled && d_sm_node_drop >= 50 && cfg.discovery.sample_max_nodes < 131_072
+        {
+            let next_sn = (cfg.discovery.sample_max_nodes.saturating_mul(2)).min(131_072);
             recs.push(make_num_rec(
-                "inc_peer_fail_cache",
-                "memory_cache",
+                "inc_sample_nodes",
+                "discovery",
                 RecommendationSeverity::Info,
                 RecommendationAction::Increase,
-                "metadata.peer_failure_cache_capacity",
-                "坏 Peer 失败缓存容量",
-                cfg.metadata.peer_failure_cache_capacity as u64,
-                next_pfc as u64,
-                format!(
-                    "失败缓存占用率达 {:.0}%，高并发下旧黑名单被过早淘汰",
-                    peer_fail_cache_fill_pct
-                ),
-                "扩容可避免反复重连近期已超时/拒绝连接的死 Peer。",
+                "discovery.sample_max_nodes",
+                "BEP-51 候选节点上限",
+                cfg.discovery.sample_max_nodes as u64,
+                next_sn as u64,
+                format!("候选池容量不足丢弃采样节点 {} 次", d_sm_node_drop),
+                "适当扩大候选节点池可提高多节点轮询覆盖率。",
             ));
         }
-    }
 
-    if d_io_other >= 50 && pct(d_io_other, d_peer_att.max(1)) >= 3.0 {
-        score_penalty += 10.0;
-        recs.push(TuningRecommendation {
+        if local_cache_fill_pct >= 92.0
+            && redis_indexed_miss_pct >= 22.0
+            && cfg.metadata_cache_capacity < 3_000_000
+            && rss_growth_mb_per_hour < 250.0
+        {
+            let next_cap = snap_usize(
+                (cfg.metadata_cache_capacity as f64 * 1.5) as usize,
+                100_000,
+                3_000_000,
+            );
+            if next_cap > cfg.metadata_cache_capacity {
+                recs.push(make_num_rec(
+                    "inc_local_cache",
+                    "memory_cache",
+                    RecommendationSeverity::Opportunity,
+                    RecommendationAction::Increase,
+                    "metadata_cache_capacity",
+                    "本地去重缓存容量",
+                    cfg.metadata_cache_capacity as u64,
+                    next_cap as u64,
+                    format!(
+                        "本地缓存已满 {:.0}%，穿透到 Redis 后命中「已索引」占比达 {:.1}%",
+                        local_cache_fill_pct, redis_indexed_miss_pct
+                    ),
+                    "扩容本地去重缓存可大幅减少 Redis 查重往返，降低网络延迟与 Redis CPU 消耗。",
+                ));
+            }
+        }
+
+        if peer_fail_cache_fill_pct >= 92.0 && cfg.metadata.peer_failure_cache_capacity < 800_000 {
+            let next_pfc = snap_usize(
+                (cfg.metadata.peer_failure_cache_capacity as f64 * 1.5) as usize,
+                50_000,
+                800_000,
+            );
+            if next_pfc > cfg.metadata.peer_failure_cache_capacity {
+                recs.push(make_num_rec(
+                    "inc_peer_fail_cache",
+                    "memory_cache",
+                    RecommendationSeverity::Info,
+                    RecommendationAction::Increase,
+                    "metadata.peer_failure_cache_capacity",
+                    "坏 Peer 失败缓存容量",
+                    cfg.metadata.peer_failure_cache_capacity as u64,
+                    next_pfc as u64,
+                    format!(
+                        "失败缓存占用率达 {:.0}%，高并发下旧黑名单被过早淘汰",
+                        peer_fail_cache_fill_pct
+                    ),
+                    "扩容可避免反复重连近期已超时/拒绝连接的死 Peer。",
+                ));
+            }
+        }
+
+        if d_io_other >= 50 && pct(d_io_other, d_peer_att.max(1)) >= 3.0 {
+            score_penalty += 10.0;
+            recs.push(TuningRecommendation {
             id: "sys_conntrack_ports".to_string(),
             category: "system".to_string(),
             severity: RecommendationSeverity::Warning,
@@ -2732,6 +2809,7 @@ pub fn analyze_crawler_samples(
             reason: "检查 dmesg 是否有 nf_conntrack: table full，并扩大 ip_local_port_range 与 nf_conntrack_max。".to_string(),
             apply_supported: false,
         });
+        }
     }
 
     // 按严重级别与动作排序（Critical > Warning > Opportunity > Info；Decrease 优先于 Increase）
@@ -3435,6 +3513,90 @@ mod tests {
             r.param_path == "metadata.max_worker_count"
                 && r.action == RecommendationAction::Increase
         }));
+    }
+
+    #[test]
+    fn high_nofile_with_unrestarted_worker_count_does_not_misreport_nofile() {
+        let mut cfg = CrawlerWorkerConfig::default();
+        cfg.metadata.max_worker_count = 640;
+        let samples = vec![
+            CrawlerMetricSample {
+                captured_at: 1_000,
+                uptime_secs: 500,
+                config_version: 2,
+                effective_metadata_workers: 512,
+                metadata_in_flight: 480,
+                metadata_queue_depth: 5_000,
+                metadata_queue_max: 10_000,
+                ..Default::default()
+            },
+            CrawlerMetricSample {
+                captured_at: 1_300,
+                uptime_secs: 800,
+                config_version: 2,
+                effective_metadata_workers: 512,
+                metadata_in_flight: 490,
+                metadata_queue_depth: 5_500,
+                metadata_queue_max: 10_000,
+                ..Default::default()
+            },
+        ];
+        // 当前 NOFILE 为 262,144，远大于 640 并发所需的 16,384，绝不应误报 system.nofile 瓶颈
+        let report = analyze_crawler_samples(
+            "crawler-1",
+            "ring",
+            2,
+            &cfg,
+            &samples,
+            TuningConstraints::default(),
+            Some(262_144),
+        );
+        assert_ne!(report.regime, OperatingRegime::NofileClamped);
+        assert!(!report.summary.fd_clamped);
+        assert!(!report.recommendations.iter().any(|r| r.id == "sys_nofile"));
+        assert!(
+            report
+                .recommendations
+                .iter()
+                .any(|r| r.id == "sys_worker_restart_pending")
+        );
+    }
+
+    #[test]
+    fn single_sample_after_restart_produces_no_spurious_recommendations() {
+        let mut cfg = CrawlerWorkerConfig::default();
+        cfg.metadata.max_worker_count = 640;
+        let samples = vec![
+            // 重启前旧配置样本
+            CrawlerMetricSample {
+                captured_at: 1_000,
+                uptime_secs: 600,
+                config_version: 1,
+                effective_metadata_workers: 512,
+                ..Default::default()
+            },
+            // 刚重启完成的新配置仅采集到 1 个基线点
+            CrawlerMetricSample {
+                captured_at: 1_010,
+                uptime_secs: 3,
+                config_version: 2,
+                effective_metadata_workers: 640,
+                ..Default::default()
+            },
+        ];
+        let report = analyze_crawler_samples(
+            "crawler-1",
+            "ring",
+            2,
+            &cfg,
+            &samples,
+            TuningConstraints::default(),
+            Some(262_144),
+        );
+        assert_eq!(report.confidence, ConfidenceLevel::Insufficient);
+        assert!(report.summary.restart_detected);
+        assert_eq!(report.summary.continuous_samples, 1);
+        assert!(report.recommendations.is_empty());
     }
 
     #[test]
