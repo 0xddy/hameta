@@ -11,7 +11,7 @@ use hameta_storage::Database;
 use redis::Value as RedisValue;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -23,6 +23,14 @@ const MANTICORE_STATUS_TTL: Duration = Duration::from_secs(60);
 const REDIS_PROBE_TTL: Duration = Duration::from_secs(3);
 const GEOIP_CONFIG_TTL: Duration = Duration::from_secs(5);
 const GLOBE_MAX_COUNTRIES: usize = 64;
+/// Crawler 瞬时速率滑动窗口（5s 平滑，消除 1s 抖动且响应迅速）。
+const CRAWLER_RATE_WINDOW_MS: i64 = 5_000;
+/// Indexer 瞬时速率滑动窗口（15s 覆盖 3 个默认 5s 刷库周期，避免批次间隙跳 0）。
+const INDEXER_RATE_WINDOW_MS: i64 = 15_000;
+/// 单 Worker 计数历史最大保留时长。
+const WORKER_HISTORY_RETENTION_MS: i64 = 25_000;
+/// 重复快照容忍保持时长：超过该时长仍无新快照则归零，避免掩盖进程卡死。
+const SNAPSHOT_STALE_HOLD_MS: i64 = 6_000;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct OverviewHealth {
@@ -310,8 +318,95 @@ struct LocalGeoIpProbe {
     fingerprint: Option<(String, u64, Option<std::time::SystemTime>)>,
 }
 
+#[derive(Debug, Clone, Default)]
+struct WorkerCounterHistory {
+    last_snapshot_seq: u64,
+    last_uptime_secs: u64,
+    last_records_written: u64,
+    samples: VecDeque<WorkerPrevTotals>,
+}
+
+impl WorkerCounterHistory {
+    /// 写入新快照（按 `snapshot_seq` 去重，避免轮询相位竞态写入 0 增量重复点）。
+    /// 返回本次新快照产生的精确 `records_written` 增量（仅用于今日累计计数，不重复叠加）。
+    fn record_snapshot(&mut self, snapshot_seq: u64, sample: WorkerPrevTotals) -> u64 {
+        let restarted = !self.samples.is_empty() && sample.uptime_secs < self.last_uptime_secs;
+        if restarted {
+            self.samples.clear();
+            self.last_snapshot_seq = 0;
+            self.last_records_written = sample.records_written;
+        }
+
+        let is_duplicate =
+            !self.samples.is_empty() && snapshot_seq != 0 && snapshot_seq == self.last_snapshot_seq;
+        if is_duplicate {
+            return 0;
+        }
+
+        let delta_written = if self.samples.is_empty() {
+            0
+        } else {
+            sample
+                .records_written
+                .saturating_sub(self.last_records_written)
+        };
+
+        self.last_snapshot_seq = snapshot_seq;
+        self.last_uptime_secs = sample.uptime_secs;
+        self.last_records_written = sample.records_written;
+
+        let now_ms = sample.captured_at_ms;
+        self.samples.push_back(sample);
+        // 保留至少 2 个点（且最早点可覆盖 WORKER_HISTORY_RETENTION_MS），用于准确计算滑窗差分
+        while self.samples.len() > 2
+            && self.samples.get(1).is_some_and(|second| {
+                now_ms.saturating_sub(second.captured_at_ms) > WORKER_HISTORY_RETENTION_MS
+            })
+        {
+            self.samples.pop_front();
+        }
+
+        delta_written
+    }
+
+    /// 选取 `(基准点, 最新点, 窗口时长秒)` 计算滑动窗口平均速率。
+    /// 若超过 `SNAPSHOT_STALE_HOLD_MS` 无任何新快照到达，返回 `None` 让速率自然衰减为 0。
+    fn rate_window(
+        &self,
+        now_ms: i64,
+        window_ms: i64,
+    ) -> Option<(&WorkerPrevTotals, &WorkerPrevTotals, f64)> {
+        let latest = self.samples.back()?;
+        if now_ms.saturating_sub(latest.captured_at_ms) > SNAPSHOT_STALE_HOLD_MS {
+            return None;
+        }
+        if self.samples.len() < 2 {
+            return None;
+        }
+        // 在历史队列中找距离 latest 刚超过 window_ms 的最新点；若总跨度不足 window_ms，则退化为最早点
+        let mut baseline = self.samples.front()?;
+        for candidate in self.samples.iter().rev().skip(1) {
+            baseline = candidate;
+            if latest
+                .captured_at_ms
+                .saturating_sub(candidate.captured_at_ms)
+                >= window_ms
+            {
+                break;
+            }
+        }
+        let dt_ms = latest
+            .captured_at_ms
+            .saturating_sub(baseline.captured_at_ms);
+        if dt_ms < 200 {
+            return None;
+        }
+        Some((baseline, latest, dt_ms as f64 / 1000.0))
+    }
+}
+
 struct CollectorInner {
-    prev_workers: HashMap<String, WorkerPrevTotals>,
+    prev_workers: HashMap<String, WorkerCounterHistory>,
     ring: VecDeque<OverviewSnapshot>,
     minute_acc: Option<MinuteAccumulator>,
     hour_acc: Option<HourAccumulator>,
@@ -508,7 +603,6 @@ impl MetricsCollector {
         let mut ipv6_pps = 0.0_f64;
         let mut metadata_rx_bps = 0.0_f64;
         let mut total_rss_bytes = 0_i64;
-        let mut indexed_written_delta_in_tick = 0.0_f64;
         let mut worker_briefs = Vec::with_capacity(workers.len());
         let mut channels = GlobeChannelRates::default();
         let mut geo_samples_dropped_pps = 0.0_f64;
@@ -521,6 +615,14 @@ impl MetricsCollector {
             guard.today_ymd = today_ymd;
             guard.today_indexed_docs = 0;
         }
+        let running_worker_ids: HashSet<&str> = workers
+            .iter()
+            .filter(|w| w.runtime_state == WorkerRuntimeState::Running)
+            .map(|w| w.id.as_str())
+            .collect();
+        guard
+            .prev_workers
+            .retain(|id, _| running_worker_ids.contains(id.as_str()));
 
         for w in &workers {
             match w.role {
@@ -554,7 +656,11 @@ impl MetricsCollector {
             {
                 let p = &env.payload;
                 let uptime_secs = p.get("uptime_secs").and_then(Value::as_u64).unwrap_or(0);
-                let prev = guard.prev_workers.get(&w.id).cloned();
+                let sample_ts_ms = if w.snapshot_fetched_at_ms > 0 {
+                    w.snapshot_fetched_at_ms
+                } else {
+                    now_ms
+                };
 
                 match w.role {
                     WorkerRole::Crawler => {
@@ -609,121 +715,12 @@ impl MetricsCollector {
                             }
                         }
 
-                        if let Some(prev_s) = prev
-                            && uptime_secs >= prev_s.uptime_secs
-                        {
-                            let dt_secs =
-                                ((now_ms - prev_s.captured_at_ms) as f64 / 1000.0).max(0.2);
-                            let per_min_scale = 60.0 / dt_secs;
-                            funnel.hashes_per_min += (hashes.saturating_sub(prev_s.hashes_received))
-                                as f64
-                                * per_min_scale;
-                            funnel.dedup_blocked_per_min +=
-                                (early_blocked.saturating_sub(prev_s.early_blocked)) as f64
-                                    * per_min_scale;
-                            funnel.metadata_succeeded_per_min +=
-                                (meta_ok.saturating_sub(prev_s.metadata_succeeded)) as f64
-                                    * per_min_scale;
-                            funnel.stream_pushed_per_min +=
-                                (pushed.saturating_sub(prev_s.torrents_pushed)) as f64
-                                    * per_min_scale;
-                            funnel.hot_pushed_per_min +=
-                                (hot_pushed.saturating_sub(prev_s.hot_pushed)) as f64
-                                    * per_min_scale;
-                            actual_qps +=
-                                (queries.saturating_sub(prev_s.queries_sent)) as f64 / dt_secs;
-                            udp_rx_bps +=
-                                (udp_rx.saturating_sub(prev_s.udp_rx_bytes)) as f64 / dt_secs;
-                            udp_tx_bps +=
-                                (udp_tx.saturating_sub(prev_s.udp_tx_bytes)) as f64 / dt_secs;
-                            udp_rx_pps += (udp_rx_packets.saturating_sub(prev_s.udp_rx_packets))
-                                as f64
-                                / dt_secs;
-                            udp_tx_pps += (udp_tx_packets.saturating_sub(prev_s.udp_tx_packets))
-                                as f64
-                                / dt_secs;
-                            ipv4_pps += (udp_rx_ipv4_packets
-                                .saturating_sub(prev_s.udp_rx_ipv4_packets))
-                                as f64
-                                / dt_secs;
-                            ipv6_pps += (udp_rx_ipv6_packets
-                                .saturating_sub(prev_s.udp_rx_ipv6_packets))
-                                as f64
-                                / dt_secs;
-                            metadata_rx_bps +=
-                                (meta_bytes.saturating_sub(prev_s.metadata_bytes)) as f64 / dt_secs;
-
-                            channels.get_peers_pps +=
-                                (inbound_get_peers.saturating_sub(prev_s.inbound_get_peers)) as f64
-                                    / dt_secs;
-                            channels.announce_peer_pps += (inbound_announce_peer
-                                .saturating_sub(prev_s.inbound_announce_peer))
-                                as f64
-                                / dt_secs;
-                            channels.response_pps +=
-                                (inbound_response.saturating_sub(prev_s.inbound_response)) as f64
-                                    / dt_secs;
-                            let prev_fp =
-                                prev_s.inbound_ping.saturating_add(prev_s.inbound_find_node);
-                            let cur_fp = inbound_ping.saturating_add(inbound_find_node);
-                            channels.find_node_ping_pps +=
-                                (cur_fp.saturating_sub(prev_fp)) as f64 / dt_secs;
-                            channels.error_pps +=
-                                (inbound_error.saturating_sub(prev_s.inbound_error)) as f64
-                                    / dt_secs;
-                            channels.other_pps +=
-                                (inbound_other.saturating_sub(prev_s.inbound_other)) as f64
-                                    / dt_secs;
-                            channels.parse_error_pps += (inbound_parse_error
-                                .saturating_sub(prev_s.inbound_parse_error))
-                                as f64
-                                / dt_secs;
-                            channels.invalid_udp_pps +=
-                                (udp_invalid.saturating_sub(prev_s.udp_invalid)) as f64 / dt_secs;
-                            channels.queue_full_pps +=
-                                (udp_queue_full.saturating_sub(prev_s.udp_queue_full)) as f64
-                                    / dt_secs;
-
-                            geo_samples_dropped_pps += (geo_samples_dropped
-                                .saturating_sub(prev_s.geo_samples_dropped))
-                                as f64
-                                / dt_secs;
-                            geo_unknown_pps += (geo_unknown_packets
-                                .saturating_sub(prev_s.geo_unknown_packets))
-                                as f64
-                                / dt_secs;
-
-                            for (iso, cur) in &geo_countries {
-                                let prev_c = prev_s.geo_countries.get(iso);
-                                let p_pkts = prev_c.map_or(0, |c| c.packets);
-                                let p_bytes = prev_c.map_or(0, |c| c.bytes);
-                                let p_gp = prev_c.map_or(0, |c| c.get_peers);
-                                let p_ap = prev_c.map_or(0, |c| c.announce_peer);
-                                let p_resp = prev_c.map_or(0, |c| c.response);
-                                let p_fp = prev_c.map_or(0, |c| c.find_node_ping);
-                                let p_other = prev_c.map_or(0, |c| c.other);
-
-                                let agg = geo_country_agg.entry(iso.clone()).or_default();
-                                agg.pps += (cur.packets.saturating_sub(p_pkts)) as f64 / dt_secs;
-                                agg.bps += (cur.bytes.saturating_sub(p_bytes)) as f64 / dt_secs;
-                                agg.get_peers_pps +=
-                                    (cur.get_peers.saturating_sub(p_gp)) as f64 / dt_secs;
-                                agg.announce_peer_pps +=
-                                    (cur.announce_peer.saturating_sub(p_ap)) as f64 / dt_secs;
-                                agg.response_pps +=
-                                    (cur.response.saturating_sub(p_resp)) as f64 / dt_secs;
-                                agg.find_node_ping_pps +=
-                                    (cur.find_node_ping.saturating_sub(p_fp)) as f64 / dt_secs;
-                                agg.other_pps +=
-                                    (cur.other.saturating_sub(p_other)) as f64 / dt_secs;
-                            }
-                        }
-
-                        guard.prev_workers.insert(
-                            w.id.clone(),
+                        let history = guard.prev_workers.entry(w.id.clone()).or_default();
+                        history.record_snapshot(
+                            w.snapshot_seq,
                             WorkerPrevTotals {
                                 uptime_secs,
-                                captured_at_ms: now_ms,
+                                captured_at_ms: sample_ts_ms,
                                 hashes_received: hashes,
                                 early_blocked,
                                 metadata_succeeded: meta_ok,
@@ -753,6 +750,133 @@ impl MetricsCollector {
                                 ..Default::default()
                             },
                         );
+
+                        if let Some((prev_s, cur_s, dt_secs)) =
+                            history.rate_window(now_ms, CRAWLER_RATE_WINDOW_MS)
+                        {
+                            let per_min_scale = 60.0 / dt_secs;
+                            funnel.hashes_per_min +=
+                                (cur_s.hashes_received.saturating_sub(prev_s.hashes_received))
+                                    as f64
+                                    * per_min_scale;
+                            funnel.dedup_blocked_per_min +=
+                                (cur_s.early_blocked.saturating_sub(prev_s.early_blocked)) as f64
+                                    * per_min_scale;
+                            funnel.metadata_succeeded_per_min += (cur_s
+                                .metadata_succeeded
+                                .saturating_sub(prev_s.metadata_succeeded))
+                                as f64
+                                * per_min_scale;
+                            funnel.stream_pushed_per_min +=
+                                (cur_s.torrents_pushed.saturating_sub(prev_s.torrents_pushed))
+                                    as f64
+                                    * per_min_scale;
+                            funnel.hot_pushed_per_min +=
+                                (cur_s.hot_pushed.saturating_sub(prev_s.hot_pushed)) as f64
+                                    * per_min_scale;
+                            actual_qps += (cur_s.queries_sent.saturating_sub(prev_s.queries_sent))
+                                as f64
+                                / dt_secs;
+                            udp_rx_bps += (cur_s.udp_rx_bytes.saturating_sub(prev_s.udp_rx_bytes))
+                                as f64
+                                / dt_secs;
+                            udp_tx_bps += (cur_s.udp_tx_bytes.saturating_sub(prev_s.udp_tx_bytes))
+                                as f64
+                                / dt_secs;
+                            udp_rx_pps +=
+                                (cur_s.udp_rx_packets.saturating_sub(prev_s.udp_rx_packets)) as f64
+                                    / dt_secs;
+                            udp_tx_pps +=
+                                (cur_s.udp_tx_packets.saturating_sub(prev_s.udp_tx_packets)) as f64
+                                    / dt_secs;
+                            ipv4_pps += (cur_s
+                                .udp_rx_ipv4_packets
+                                .saturating_sub(prev_s.udp_rx_ipv4_packets))
+                                as f64
+                                / dt_secs;
+                            ipv6_pps += (cur_s
+                                .udp_rx_ipv6_packets
+                                .saturating_sub(prev_s.udp_rx_ipv6_packets))
+                                as f64
+                                / dt_secs;
+                            metadata_rx_bps +=
+                                (cur_s.metadata_bytes.saturating_sub(prev_s.metadata_bytes)) as f64
+                                    / dt_secs;
+
+                            channels.get_peers_pps += (cur_s
+                                .inbound_get_peers
+                                .saturating_sub(prev_s.inbound_get_peers))
+                                as f64
+                                / dt_secs;
+                            channels.announce_peer_pps += (cur_s
+                                .inbound_announce_peer
+                                .saturating_sub(prev_s.inbound_announce_peer))
+                                as f64
+                                / dt_secs;
+                            channels.response_pps += (cur_s
+                                .inbound_response
+                                .saturating_sub(prev_s.inbound_response))
+                                as f64
+                                / dt_secs;
+                            let prev_fp =
+                                prev_s.inbound_ping.saturating_add(prev_s.inbound_find_node);
+                            let cur_fp = cur_s.inbound_ping.saturating_add(cur_s.inbound_find_node);
+                            channels.find_node_ping_pps +=
+                                (cur_fp.saturating_sub(prev_fp)) as f64 / dt_secs;
+                            channels.error_pps +=
+                                (cur_s.inbound_error.saturating_sub(prev_s.inbound_error)) as f64
+                                    / dt_secs;
+                            channels.other_pps +=
+                                (cur_s.inbound_other.saturating_sub(prev_s.inbound_other)) as f64
+                                    / dt_secs;
+                            channels.parse_error_pps += (cur_s
+                                .inbound_parse_error
+                                .saturating_sub(prev_s.inbound_parse_error))
+                                as f64
+                                / dt_secs;
+                            channels.invalid_udp_pps +=
+                                (cur_s.udp_invalid.saturating_sub(prev_s.udp_invalid)) as f64
+                                    / dt_secs;
+                            channels.queue_full_pps +=
+                                (cur_s.udp_queue_full.saturating_sub(prev_s.udp_queue_full)) as f64
+                                    / dt_secs;
+
+                            geo_samples_dropped_pps += (cur_s
+                                .geo_samples_dropped
+                                .saturating_sub(prev_s.geo_samples_dropped))
+                                as f64
+                                / dt_secs;
+                            geo_unknown_pps += (cur_s
+                                .geo_unknown_packets
+                                .saturating_sub(prev_s.geo_unknown_packets))
+                                as f64
+                                / dt_secs;
+
+                            for (iso, cur) in &cur_s.geo_countries {
+                                let prev_c = prev_s.geo_countries.get(iso);
+                                let p_pkts = prev_c.map_or(0, |c| c.packets);
+                                let p_bytes = prev_c.map_or(0, |c| c.bytes);
+                                let p_gp = prev_c.map_or(0, |c| c.get_peers);
+                                let p_ap = prev_c.map_or(0, |c| c.announce_peer);
+                                let p_resp = prev_c.map_or(0, |c| c.response);
+                                let p_fp = prev_c.map_or(0, |c| c.find_node_ping);
+                                let p_other = prev_c.map_or(0, |c| c.other);
+
+                                let agg = geo_country_agg.entry(iso.clone()).or_default();
+                                agg.pps += (cur.packets.saturating_sub(p_pkts)) as f64 / dt_secs;
+                                agg.bps += (cur.bytes.saturating_sub(p_bytes)) as f64 / dt_secs;
+                                agg.get_peers_pps +=
+                                    (cur.get_peers.saturating_sub(p_gp)) as f64 / dt_secs;
+                                agg.announce_peer_pps +=
+                                    (cur.announce_peer.saturating_sub(p_ap)) as f64 / dt_secs;
+                                agg.response_pps +=
+                                    (cur.response.saturating_sub(p_resp)) as f64 / dt_secs;
+                                agg.find_node_ping_pps +=
+                                    (cur.find_node_ping.saturating_sub(p_fp)) as f64 / dt_secs;
+                                agg.other_pps +=
+                                    (cur.other.saturating_sub(p_other)) as f64 / dt_secs;
+                            }
+                        }
                     }
                     WorkerRole::Indexer => {
                         let accepted = json_u64(p, &["app", "filter_accepted"]);
@@ -760,42 +884,48 @@ impl MetricsCollector {
                         let written = json_u64(p, &["app", "records_written"]);
                         let hot_updated = json_u64(p, &["app", "hot_records_updated"]);
 
-                        if let Some(prev_s) = prev
-                            && uptime_secs >= prev_s.uptime_secs
-                        {
-                            let dt_secs =
-                                ((now_ms - prev_s.captured_at_ms) as f64 / 1000.0).max(0.2);
-                            let per_min_scale = 60.0 / dt_secs;
-                            let delta_written = written.saturating_sub(prev_s.records_written);
-                            indexed_written_delta_in_tick += delta_written as f64;
-                            guard.today_indexed_docs = guard
-                                .today_indexed_docs
-                                .saturating_add(i64::try_from(delta_written).unwrap_or(0));
+                        let delta_written = {
+                            let history = guard.prev_workers.entry(w.id.clone()).or_default();
+                            history.record_snapshot(
+                                w.snapshot_seq,
+                                WorkerPrevTotals {
+                                    uptime_secs,
+                                    captured_at_ms: sample_ts_ms,
+                                    filter_accepted: accepted,
+                                    filter_rejected: rejected,
+                                    records_written: written,
+                                    hot_records_updated: hot_updated,
+                                    ..Default::default()
+                                },
+                            )
+                        };
+                        guard.today_indexed_docs = guard
+                            .today_indexed_docs
+                            .saturating_add(i64::try_from(delta_written).unwrap_or(0));
 
+                        if let Some(history) = guard.prev_workers.get(&w.id)
+                            && let Some((prev_s, cur_s, dt_secs)) =
+                                history.rate_window(now_ms, INDEXER_RATE_WINDOW_MS)
+                        {
+                            let per_min_scale = 60.0 / dt_secs;
                             funnel.filter_accepted_per_min +=
-                                (accepted.saturating_sub(prev_s.filter_accepted)) as f64
+                                (cur_s.filter_accepted.saturating_sub(prev_s.filter_accepted))
+                                    as f64
                                     * per_min_scale;
                             funnel.filter_rejected_per_min +=
-                                (rejected.saturating_sub(prev_s.filter_rejected)) as f64
+                                (cur_s.filter_rejected.saturating_sub(prev_s.filter_rejected))
+                                    as f64
                                     * per_min_scale;
-                            funnel.indexed_written_per_min += delta_written as f64 * per_min_scale;
-                            funnel.hot_updated_per_min +=
-                                (hot_updated.saturating_sub(prev_s.hot_records_updated)) as f64
+                            funnel.indexed_written_per_min +=
+                                (cur_s.records_written.saturating_sub(prev_s.records_written))
+                                    as f64
                                     * per_min_scale;
+                            funnel.hot_updated_per_min += (cur_s
+                                .hot_records_updated
+                                .saturating_sub(prev_s.hot_records_updated))
+                                as f64
+                                * per_min_scale;
                         }
-
-                        guard.prev_workers.insert(
-                            w.id.clone(),
-                            WorkerPrevTotals {
-                                uptime_secs,
-                                captured_at_ms: now_ms,
-                                filter_accepted: accepted,
-                                filter_rejected: rejected,
-                                records_written: written,
-                                hot_records_updated: hot_updated,
-                                ..Default::default()
-                            },
-                        );
                     }
                 }
             }
@@ -811,8 +941,6 @@ impl MetricsCollector {
                 last_error: w.last_error.clone(),
             });
         }
-
-        let _ = indexed_written_delta_in_tick;
 
         let running_crawlers = health.running_crawlers;
         let snapshot = OverviewSnapshot {
@@ -1623,5 +1751,94 @@ mod tests {
         assert!(!disabled_status.enabled);
         assert!(!disabled_status.mmdb_loaded);
         assert!(disabled_status.error.as_deref().unwrap().contains("停用"));
+    }
+
+    #[test]
+    fn indexer_sliding_window_prevents_zero_drops_between_5s_batch_flushes() {
+        let mut hist = WorkerCounterHistory::default();
+        let mut written_total = 1_000_u64;
+        let mut today_sum = 0_u64;
+
+        // 模拟 Indexer 每 5 秒批量落库 100 条（真实速率 1200/min），期间 4 秒增量为 0
+        for sec in 0..=20_i64 {
+            if sec > 0 && sec % 5 == 0 {
+                written_total += 100;
+            }
+            let now_ms = 1_700_000_000_000 + sec * 1_000;
+            let delta = hist.record_snapshot(
+                (sec + 1) as u64,
+                WorkerPrevTotals {
+                    uptime_secs: 100 + sec as u64,
+                    captured_at_ms: now_ms,
+                    records_written: written_total,
+                    ..Default::default()
+                },
+            );
+            today_sum += delta;
+
+            if sec >= 5 {
+                let (base, cur, dt) = hist
+                    .rate_window(now_ms, INDEXER_RATE_WINDOW_MS)
+                    .expect("valid rate window");
+                let per_min =
+                    cur.records_written.saturating_sub(base.records_written) as f64 * (60.0 / dt);
+                // 预热期内任何一秒（含未刷库的 6..9, 11..14 秒）都不应跳 0
+                assert!(
+                    per_min >= 600.0,
+                    "sec={sec} dropped unexpectedly to {per_min}/min"
+                );
+                // 15s 滑窗满载后，恰好覆盖 3 个 5s 刷库周期，应稳定收敛至真实速率 1200/min
+                if sec >= 15 {
+                    assert!(
+                        (per_min - 1200.0).abs() < 1e-6,
+                        "sec={sec} expected steady 1200/min, got {per_min}/min"
+                    );
+                }
+            }
+        }
+        // 今日累计计数必须精确等于实际新增 400 条，绝不重复叠加
+        assert_eq!(today_sum, 400);
+    }
+
+    #[test]
+    fn duplicate_snapshot_seq_carries_rate_and_decays_when_stale() {
+        let mut hist = WorkerCounterHistory::default();
+        hist.record_snapshot(
+            1,
+            WorkerPrevTotals {
+                uptime_secs: 10,
+                captured_at_ms: 1_000,
+                queries_sent: 100,
+                ..Default::default()
+            },
+        );
+        hist.record_snapshot(
+            2,
+            WorkerPrevTotals {
+                uptime_secs: 11,
+                captured_at_ms: 2_000,
+                queries_sent: 200,
+                ..Default::default()
+            },
+        );
+        // 同一 snapshot_seq=2 再次到来（HTTP 轮询相位抖动），不应归零
+        let dup_delta = hist.record_snapshot(
+            2,
+            WorkerPrevTotals {
+                uptime_secs: 11,
+                captured_at_ms: 3_000,
+                queries_sent: 200,
+                ..Default::default()
+            },
+        );
+        assert_eq!(dup_delta, 0);
+        let (b, c, dt) = hist
+            .rate_window(3_000, CRAWLER_RATE_WINDOW_MS)
+            .expect("should carry rate on duplicate seq");
+        let qps = (c.queries_sent - b.queries_sent) as f64 / dt;
+        assert!((qps - 100.0).abs() < 0.1);
+
+        // 超过 SNAPSHOT_STALE_HOLD_MS (6s) 仍无新快照则自然衰减返回 None (-> 0)
+        assert!(hist.rate_window(9_000, CRAWLER_RATE_WINDOW_MS).is_none());
     }
 }

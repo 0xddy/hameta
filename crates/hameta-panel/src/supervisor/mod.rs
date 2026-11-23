@@ -76,6 +76,10 @@ pub struct WorkerStatusView {
     pub stderr_tail: String,
     pub drain_status: Option<WorkerDrainStatus>,
     pub snapshot: Option<WorkerSnapshotEnvelope>,
+    #[serde(skip)]
+    pub snapshot_seq: u64,
+    #[serde(skip)]
+    pub snapshot_fetched_at_ms: i64,
 }
 
 pub const META_GEOIP_CONFIG_KEY: &str = "geoip_config";
@@ -120,6 +124,8 @@ struct ManagedWorker {
     recent_crashes: VecDeque<Instant>,
     manual_stop: bool,
     latest_snapshot: Option<WorkerSnapshotEnvelope>,
+    snapshot_seq: u64,
+    snapshot_fetched_at_ms: i64,
     drain_status: Option<WorkerDrainStatus>,
     stderr_ring: Arc<StderrRingBuffer>,
     log_tx: broadcast::Sender<String>,
@@ -147,6 +153,8 @@ impl ManagedWorker {
             recent_crashes: VecDeque::new(),
             manual_stop: false,
             latest_snapshot: None,
+            snapshot_seq: 0,
+            snapshot_fetched_at_ms: 0,
             drain_status: None,
             stderr_ring: Arc::new(StderrRingBuffer::default()),
             log_tx,
@@ -320,6 +328,7 @@ impl Supervisor {
                 entry.manual_stop = false;
                 entry.drain_status = None;
                 entry.latest_snapshot = None;
+                entry.snapshot_fetched_at_ms = 0;
                 entry.generation
             };
 
@@ -1059,6 +1068,8 @@ impl Supervisor {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             if let Some(entry) = guard.get_mut(instance_id) {
                 entry.latest_snapshot = Some(env);
+                entry.snapshot_seq = entry.snapshot_seq.wrapping_add(1).max(1);
+                entry.snapshot_fetched_at_ms = Utc::now().timestamp_millis();
             }
         }
     }
@@ -1157,6 +1168,8 @@ impl Supervisor {
                     .unwrap_or_default(),
                 drain_status: managed.and_then(|m| m.drain_status.clone()),
                 snapshot: managed.and_then(|m| m.latest_snapshot.clone()),
+                snapshot_seq: managed.map_or(0, |m| m.snapshot_seq),
+                snapshot_fetched_at_ms: managed.map_or(0, |m| m.snapshot_fetched_at_ms),
             });
         }
         Ok(out)

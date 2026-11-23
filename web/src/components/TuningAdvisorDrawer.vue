@@ -59,8 +59,8 @@ const applyRestart = ref(true);
 
 const form = reactive({
   duration_secs: 3600,
-  up_mbps_text: "",
-  down_mbps_text: "",
+  up_mbps_text: "" as string | number,
+  down_mbps_text: "" as string | number,
   goal: "balanced" as TuningGoal,
 });
 
@@ -79,8 +79,10 @@ const GOAL_OPTIONS: Array<{ label: string; value: TuningGoal }> = [
 
 let pollTimer: number | null = null;
 
-function parseMbps(raw: string): number | null {
-  const t = raw.trim();
+function parseMbps(raw: string | number | null | undefined): number | null {
+  if (raw === null || raw === undefined) return null;
+  if (typeof raw === "number") return Number.isFinite(raw) && raw > 0 ? raw : null;
+  const t = String(raw).trim();
   if (!t) return null;
   const n = Number(t);
   return Number.isFinite(n) && n > 0 ? n : null;
