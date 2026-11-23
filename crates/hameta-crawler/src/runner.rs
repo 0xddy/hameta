@@ -138,7 +138,9 @@ pub async fn run_crawler_worker(bootstrap: WorkerBootstrap) -> Result<()> {
             });
             serde_json::to_value(snap).unwrap_or_default()
         }),
-        geoip_reloader: Some(Arc::new(move |cfg| geoip_for_reload.reload(&cfg, &reload_data_dir))),
+        geoip_reloader: Some(Arc::new(move |cfg| {
+            geoip_for_reload.reload(&cfg, &reload_data_dir)
+        })),
         shutdown_token: worker_shutdown.clone(),
     });
 

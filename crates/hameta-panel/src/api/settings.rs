@@ -13,8 +13,8 @@ use axum::Json;
 use axum::extract::{Query, State};
 use axum::http::HeaderMap;
 use hameta_common::{
-    GeoIpConfig, ManticoreAuthMode, ManticoreServiceConfig,
-    RedisServiceConfig, ServiceKind, WorkerRole, WorkerRuntimeState,
+    GeoIpConfig, ManticoreAuthMode, ManticoreServiceConfig, RedisServiceConfig, ServiceKind,
+    WorkerRole, WorkerRuntimeState,
 };
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -387,11 +387,12 @@ async fn load_manticore_detail(
         .get_active_service_config(ServiceKind::Manticore)
         .await?
     {
-        let cfg: ManticoreServiceConfig = serde_json::from_str::<ManticoreServiceConfig>(
-            &row.config_json,
-        )
-        .map_err(|e| ApiError::internal("解析 Manticore 配置 JSON 失败").with_detail(e.to_string()))?
-        .normalized();
+        let cfg: ManticoreServiceConfig =
+            serde_json::from_str::<ManticoreServiceConfig>(&row.config_json)
+                .map_err(|e| {
+                    ApiError::internal("解析 Manticore 配置 JSON 失败").with_detail(e.to_string())
+                })?
+                .normalized();
         return Ok(ServiceConfigDetail {
             version: row.version,
             config: cfg,
@@ -837,13 +838,13 @@ pub async fn update_geoip_settings_handler(
 
     let cfg_json = serde_json::to_string(&normalized)
         .map_err(|e| ApiError::internal("序列化 GeoIP 配置失败").with_detail(e.to_string()))?;
-    state
-        .db
-        .set_meta(META_GEOIP_CONFIG_KEY, &cfg_json)
-        .await?;
+    state.db.set_meta(META_GEOIP_CONFIG_KEY, &cfg_json).await?;
 
     let reload_results = if req.reload_crawlers {
-        state.supervisor.reload_all_crawlers_geoip(&normalized).await
+        state
+            .supervisor
+            .reload_all_crawlers_geoip(&normalized)
+            .await
     } else {
         Vec::new()
     };
@@ -944,9 +945,9 @@ async fn download_and_validate_mmdb_to_temp(
         Some(p) if !p.as_os_str().is_empty() => p,
         _ => Path::new("."),
     };
-    tokio::fs::create_dir_all(parent).await.map_err(|e| {
-        ApiError::internal("创建 GeoIP 数据目录失败").with_detail(e.to_string())
-    })?;
+    tokio::fs::create_dir_all(parent)
+        .await
+        .map_err(|e| ApiError::internal("创建 GeoIP 数据目录失败").with_detail(e.to_string()))?;
 
     let captured_tag = Arc::new(StdMutex::new(
         reqwest::Url::parse(source_url)
@@ -975,11 +976,12 @@ async fn download_and_validate_mmdb_to_temp(
         .build()
         .map_err(|e| ApiError::internal("构建 HTTP 下载客户端失败").with_detail(e.to_string()))?;
 
-    let mut resp = client
-        .get(source_url)
-        .send()
-        .await
-        .map_err(|e| ApiError::bad_request("GEOIP_DOWNLOAD_FAILED", format!("下载 GeoIP 数据库失败: {e}")))?;
+    let mut resp = client.get(source_url).send().await.map_err(|e| {
+        ApiError::bad_request(
+            "GEOIP_DOWNLOAD_FAILED",
+            format!("下载 GeoIP 数据库失败: {e}"),
+        )
+    })?;
 
     if let Some(tag) = extract_release_tag_from_url_path(resp.url().path())
         && let Ok(mut guard) = captured_tag.lock()
@@ -1008,9 +1010,9 @@ async fn download_and_validate_mmdb_to_temp(
         file_name,
         chrono::Utc::now().timestamp_millis()
     ));
-    let mut tmp_file = tokio::fs::File::create(&tmp_path).await.map_err(|e| {
-        ApiError::internal("创建 GeoIP 临时文件失败").with_detail(e.to_string())
-    })?;
+    let mut tmp_file = tokio::fs::File::create(&tmp_path)
+        .await
+        .map_err(|e| ApiError::internal("创建 GeoIP 临时文件失败").with_detail(e.to_string()))?;
 
     let mut downloaded_bytes: u64 = 0;
     let write_res: Result<(), ApiError> = async {
@@ -1141,17 +1143,15 @@ pub async fn download_geoip_mmdb_handler(
 
         if let Some(final_err) = rename_err {
             let _ = tokio::fs::remove_file(&tmp_path).await;
-            return Err(ApiError::internal("替换 GeoIP MMDB 文件失败")
-                .with_detail(final_err.to_string()));
+            return Err(
+                ApiError::internal("替换 GeoIP MMDB 文件失败").with_detail(final_err.to_string())
+            );
         }
     }
 
     let cfg_json = serde_json::to_string(&config)
         .map_err(|e| ApiError::internal("序列化 GeoIP 配置失败").with_detail(e.to_string()))?;
-    state
-        .db
-        .set_meta(META_GEOIP_CONFIG_KEY, &cfg_json)
-        .await?;
+    state.db.set_meta(META_GEOIP_CONFIG_KEY, &cfg_json).await?;
 
     let reload_results = if req.reload_crawlers {
         state.supervisor.reload_all_crawlers_geoip(&config).await

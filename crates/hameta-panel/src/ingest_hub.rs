@@ -58,7 +58,10 @@ impl IngestHub {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         for item in items {
-            let seq = self.next_seq.fetch_add(1, Ordering::Relaxed).saturating_add(1);
+            let seq = self
+                .next_seq
+                .fetch_add(1, Ordering::Relaxed)
+                .saturating_add(1);
             let ev = ConsoleIngestEvent { seq, item };
             if guard.len() >= INGEST_RING_CAPACITY {
                 guard.pop_front();
@@ -74,7 +77,11 @@ impl IngestHub {
     }
 
     /// 按升序返回历史缓冲事件：`last_event_id` 存在时仅返回 `seq > since`；否则返回最新至多 `limit` 条。
-    pub fn replay_after(&self, last_event_id: Option<u64>, limit: usize) -> Vec<ConsoleIngestEvent> {
+    pub fn replay_after(
+        &self,
+        last_event_id: Option<u64>,
+        limit: usize,
+    ) -> Vec<ConsoleIngestEvent> {
         let cap = limit.min(INGEST_RING_CAPACITY);
         if cap == 0 {
             return Vec::new();

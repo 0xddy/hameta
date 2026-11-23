@@ -520,7 +520,13 @@ async fn console_ingest_stream_replays_resumes_and_filters_live_events() {
     let idx_cfg = serde_json::to_string(&IndexerWorkerConfig::default()).unwrap();
     state
         .db
-        .create_worker("indexer-1", WorkerRole::Indexer, "Indexer #1", &idx_cfg, "admin")
+        .create_worker(
+            "indexer-1",
+            WorkerRole::Indexer,
+            "Indexer #1",
+            &idx_cfg,
+            "admin",
+        )
         .await
         .unwrap();
     state.supervisor.start_worker("indexer-1").await.unwrap();
@@ -607,7 +613,12 @@ async fn console_ingest_stream_replays_resumes_and_filters_live_events() {
         .await
         .unwrap();
     assert_eq!(filtered_sse.status(), StatusCode::OK);
-    let filtered_text = read_sse_until(&mut filtered_sse, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", 3).await;
+    let filtered_text = read_sse_until(
+        &mut filtered_sse,
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        3,
+    )
+    .await;
     assert!(filtered_text.contains("event: ready"));
     assert!(filtered_text.contains("event: ingest"));
     assert!(!filtered_text.contains("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"));
@@ -623,32 +634,43 @@ async fn console_ingest_stream_replays_resumes_and_filters_live_events() {
         .await
         .unwrap();
     assert_eq!(resume_sse.status(), StatusCode::OK);
-    let initial_resume =
-        read_sse_until(&mut resume_sse, "cccccccccccccccccccccccccccccccccccccccc", 3).await;
+    let initial_resume = read_sse_until(
+        &mut resume_sse,
+        "cccccccccccccccccccccccccccccccccccccccc",
+        3,
+    )
+    .await;
     assert!(initial_resume.contains("\"resumed_from\":1"));
     assert!(!initial_resume.contains("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"));
     assert!(initial_resume.contains("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"));
     assert!(initial_resume.contains("cccccccccccccccccccccccccccccccccccccccc"));
 
-    state.supervisor.ingest_hub().publish_batch(vec![IngestEventItem {
-        info_hash: "dddddddddddddddddddddddddddddddddddddddd".to_string(),
-        event_type: IngestEventType::Indexed,
-        worker_id: "indexer-1".to_string(),
-        manticore_id: 4004,
-        batch_id: 3,
-        raw_name: "ArchLinux.iso".to_string(),
-        refine_name: "ArchLinux.iso".to_string(),
-        cleaned: false,
-        total_size: 4096,
-        file_count: 1,
-        files_preview: Vec::new(),
-        hot: 1,
-        hot_delta: 1,
-        latency_ms: 5,
-        updated_at: 1_763_800_003,
-    }]);
-    let live_chunk =
-        read_sse_until(&mut resume_sse, "dddddddddddddddddddddddddddddddddddddddd", 3).await;
+    state
+        .supervisor
+        .ingest_hub()
+        .publish_batch(vec![IngestEventItem {
+            info_hash: "dddddddddddddddddddddddddddddddddddddddd".to_string(),
+            event_type: IngestEventType::Indexed,
+            worker_id: "indexer-1".to_string(),
+            manticore_id: 4004,
+            batch_id: 3,
+            raw_name: "ArchLinux.iso".to_string(),
+            refine_name: "ArchLinux.iso".to_string(),
+            cleaned: false,
+            total_size: 4096,
+            file_count: 1,
+            files_preview: Vec::new(),
+            hot: 1,
+            hot_delta: 1,
+            latency_ms: 5,
+            updated_at: 1_763_800_003,
+        }]);
+    let live_chunk = read_sse_until(
+        &mut resume_sse,
+        "dddddddddddddddddddddddddddddddddddddddd",
+        3,
+    )
+    .await;
     assert!(live_chunk.contains("id: 4"));
     assert!(live_chunk.contains("dddddddddddddddddddddddddddddddddddddddd"));
 

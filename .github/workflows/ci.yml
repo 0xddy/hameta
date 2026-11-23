@@ -45,6 +45,11 @@ jobs:
       - name: Check formatting
         run: cargo fmt --check
 
+      - name: Update dht-crawler to latest master
+        run: |
+          cargo metadata --format-version 1 >/dev/null
+          cargo update -p dht-crawler
+
       - name: Run clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 

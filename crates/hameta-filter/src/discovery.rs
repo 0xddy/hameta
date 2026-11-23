@@ -29,7 +29,8 @@ struct TrackedEntry {
 fn fnv1a_64_normalized(text: &str) -> u64 {
     let mut hash: u64 = 0xcbf29ce484222325;
     for c in text.chars() {
-        if c.is_whitespace() || matches!(c, '.' | '-' | '_' | '[' | ']' | '【' | '】' | '(' | ')') {
+        if c.is_whitespace() || matches!(c, '.' | '-' | '_' | '[' | ']' | '【' | '】' | '(' | ')')
+        {
             continue;
         }
         for lc in c.to_lowercase() {
@@ -116,9 +117,7 @@ impl AdDiscoveryTracker {
                 && let Some(victim_key) = self
                     .entries
                     .iter()
-                    .min_by_key(|(_, e)| {
-                        (e.distinct_bodies.len(), e.occurrences, e.last_seen_unix)
-                    })
+                    .min_by_key(|(_, e)| (e.distinct_bodies.len(), e.occurrences, e.last_seen_unix))
                     .map(|(k, _)| k.clone())
             {
                 self.entries.remove(&victim_key);
@@ -208,7 +207,8 @@ pub fn merge_discovered_candidates(
         for cand in batch {
             let key = cand.phrase.trim().to_lowercase();
             let inner_key = strip_outer_brackets_lower(&cand.phrase);
-            if key.is_empty() || exclude_lower.contains(&key) || exclude_lower.contains(&inner_key) {
+            if key.is_empty() || exclude_lower.contains(&key) || exclude_lower.contains(&inner_key)
+            {
                 continue;
             }
             merged

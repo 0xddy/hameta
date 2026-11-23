@@ -201,6 +201,12 @@ jobs:
         with:
           key: ${{ matrix.target }}
 
+      - name: Update dht-crawler to latest master
+        shell: bash
+        run: |
+          cargo metadata --format-version 1 >/dev/null
+          cargo update -p dht-crawler
+
       - name: Build release binary
         shell: bash
         env:

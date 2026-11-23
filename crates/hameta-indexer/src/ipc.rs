@@ -148,7 +148,13 @@ async fn post_ingest_batch(
         instance_id: instance_id.to_string(),
         events,
     };
-    if let Err(err) = client.post(url).bearer_auth(ipc_token).json(&req).send().await {
+    if let Err(err) = client
+        .post(url)
+        .bearer_auth(ipc_token)
+        .json(&req)
+        .send()
+        .await
+    {
         tracing::debug!("上报入库事件批次到 Panel 失败: {err}");
     }
 }

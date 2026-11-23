@@ -613,10 +613,7 @@ async fn manticore_reverse_proxy_auth_modes_settings_and_audit() {
     .await;
     assert_eq!(st, StatusCode::OK);
     assert_eq!(upd_bearer["config"]["auth_mode"], "bearer");
-    assert_eq!(
-        upd_bearer["config"]["bearer_token"],
-        "tok_secret_live_1"
-    );
+    assert_eq!(upd_bearer["config"]["bearer_token"], "tok_secret_live_1");
 
     // 切换为自定义请求头 API Key（如 X-API-Key）
     let (st, upd_hdr, _) = send_json(

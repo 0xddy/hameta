@@ -158,8 +158,10 @@ impl GeoIpEngine {
         let (loaded, meta_view) = load_mmdb_state(config, &resolved_path);
 
         self.enabled.store(config.enabled, Ordering::Relaxed);
-        self.adaptive_threshold_pps
-            .store(config.adaptive_sample_threshold_pps.max(1_000), Ordering::Relaxed);
+        self.adaptive_threshold_pps.store(
+            config.adaptive_sample_threshold_pps.max(1_000),
+            Ordering::Relaxed,
+        );
         if !config.enabled {
             self.sample_shift.store(0, Ordering::Relaxed);
         }
@@ -230,7 +232,10 @@ impl GeoIpEngine {
         }
     }
 
-    pub fn spawn_worker(self: &Arc<Self>, shutdown: CancellationToken) -> tokio::task::JoinHandle<()> {
+    pub fn spawn_worker(
+        self: &Arc<Self>,
+        shutdown: CancellationToken,
+    ) -> tokio::task::JoinHandle<()> {
         let engine = self.clone();
         tokio::spawn(async move {
             let Some(mut rx) = engine.sample_rx.lock().await.take() else {
@@ -408,7 +413,10 @@ impl GeoIpEngine {
     }
 }
 
-fn load_mmdb_state(config: &GeoIpConfig, resolved_path: &Path) -> (Option<LoadedMmdb>, GeoMetaView) {
+fn load_mmdb_state(
+    config: &GeoIpConfig,
+    resolved_path: &Path,
+) -> (Option<LoadedMmdb>, GeoMetaView) {
     let path_str = resolved_path.to_string_lossy().into_owned();
     let home_country = config.normalized_home_country();
 

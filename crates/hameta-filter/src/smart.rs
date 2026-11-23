@@ -16,30 +16,92 @@ pub struct ScoredSpanHit {
 const KNOWN_TRAILING_MEDIA_EXTS: &[&str] = &[
     ".mp4", ".mkv", ".avi", ".mov", ".wmv", ".flv", ".webm", ".m4v", ".mpg", ".mpeg", ".3gp",
     ".rm", ".rmvb", ".vob", ".asf", ".m2ts", ".ts", ".flac", ".ape", ".wav", ".mp3", ".aac",
-    ".m4a", ".ogg", ".zip", ".rar", ".7z", ".iso", ".pdf", ".epub", ".srt", ".ass", ".ssa",
-    ".sub", ".nfo",
+    ".m4a", ".ogg", ".zip", ".rar", ".7z", ".iso", ".pdf", ".epub", ".srt", ".ass", ".ssa", ".sub",
+    ".nfo",
 ];
 
 const HIGH_RISK_TLDS: &[&str] = &[
-    "cc", "tv", "vip", "top", "me", "club", "info", "site", "online", "shop", "fun", "live",
-    "pro", "click", "link", "buzz", "lat", "lol", "work", "ink", "gg", "to", "la", "io", "tw",
-    "hk", "cn", "com", "net", "org", "xyz", "biz", "pw", "icu", "mobi", "ws",
+    "cc", "tv", "vip", "top", "me", "club", "info", "site", "online", "shop", "fun", "live", "pro",
+    "click", "link", "buzz", "lat", "lol", "work", "ink", "gg", "to", "la", "io", "tw", "hk", "cn",
+    "com", "net", "org", "xyz", "biz", "pw", "icu", "mobi", "ws",
 ];
 
 const FILE_EXTENSION_COLLISIONS: &[&str] = &[
-    "mp4", "mkv", "avi", "mov", "md", "zip", "rar", "7z", "ts", "m2ts", "iso", "pdf", "txt",
-    "nfo", "srt", "ass", "ssa", "sub", "exe", "bin", "img", "sh", "py", "js", "ps1", "mp3",
-    "flac", "wav", "aac", "png", "jpg", "jpeg", "gif",
+    "mp4", "mkv", "avi", "mov", "md", "zip", "rar", "7z", "ts", "m2ts", "iso", "pdf", "txt", "nfo",
+    "srt", "ass", "ssa", "sub", "exe", "bin", "img", "sh", "py", "js", "ps1", "mp3", "flac", "wav",
+    "aac", "png", "jpg", "jpeg", "gif",
 ];
 
 const GENERIC_MEDIA_LABELS_LOWER: &[&str] = &[
-    "web", "dl", "hd", "fhd", "uhd", "bd", "dvd", "cam", "rip", "webrip", "bdrip", "dvdrip",
-    "bluray", "remux", "hevc", "avc", "x264", "x265", "h264", "h265", "aac", "ac3", "dts",
-    "truehd", "atmos", "flac", "hdr", "hdr10", "dv", "max", "amzn", "nf", "dsnp", "hmax",
-    "atvp", "apple", "android", "live", "vip", "top", "cn", "cc", "tv", "me", "pro", "info",
-    "album", "movie", "concert", "show", "part", "season", "episode", "series", "film", "video",
-    "clean", "raw", "raws", "proper", "repack", "extended", "uncut", "uncensored", "director",
-    "directors", "edition", "complete", "pack",
+    "web",
+    "dl",
+    "hd",
+    "fhd",
+    "uhd",
+    "bd",
+    "dvd",
+    "cam",
+    "rip",
+    "webrip",
+    "bdrip",
+    "dvdrip",
+    "bluray",
+    "remux",
+    "hevc",
+    "avc",
+    "x264",
+    "x265",
+    "h264",
+    "h265",
+    "aac",
+    "ac3",
+    "dts",
+    "truehd",
+    "atmos",
+    "flac",
+    "hdr",
+    "hdr10",
+    "dv",
+    "max",
+    "amzn",
+    "nf",
+    "dsnp",
+    "hmax",
+    "atvp",
+    "apple",
+    "android",
+    "live",
+    "vip",
+    "top",
+    "cn",
+    "cc",
+    "tv",
+    "me",
+    "pro",
+    "info",
+    "album",
+    "movie",
+    "concert",
+    "show",
+    "part",
+    "season",
+    "episode",
+    "series",
+    "film",
+    "video",
+    "clean",
+    "raw",
+    "raws",
+    "proper",
+    "repack",
+    "extended",
+    "uncut",
+    "uncensored",
+    "director",
+    "directors",
+    "edition",
+    "complete",
+    "pack",
 ];
 
 const GENERIC_FILE_STEMS: &[&str] = &[
@@ -350,7 +412,7 @@ fn push_non_bracket_gap<'a>(
                 if cursor < idx {
                     let word = &sub[cursor..idx];
                     spans.push(TitleSpan {
-                        leading_sep: if first { *p_sep } else { "" },
+                        leading_sep: if first { p_sep } else { "" },
                         raw: word,
                         inner: word,
                         is_bracketed: false,
@@ -366,7 +428,7 @@ fn push_non_bracket_gap<'a>(
         if cursor < sub.len() {
             let word = &sub[cursor..];
             spans.push(TitleSpan {
-                leading_sep: if first { *p_sep } else { "" },
+                leading_sep: if first { p_sep } else { "" },
                 raw: word,
                 inner: word,
                 is_bracketed: false,
@@ -383,8 +445,14 @@ fn push_non_bracket_gap<'a>(
 
         let is_spaced_dash = matches!(ch, '-' | '—' | '–')
             && i > 0
-            && gap[..i].chars().next_back().is_some_and(char::is_whitespace)
-            && gap[i + ch_len..].chars().next().is_some_and(char::is_whitespace);
+            && gap[..i]
+                .chars()
+                .next_back()
+                .is_some_and(char::is_whitespace)
+            && gap[i + ch_len..]
+                .chars()
+                .next()
+                .is_some_and(char::is_whitespace);
 
         if is_clause_separator_char(ch) || is_spaced_dash {
             let before = &gap[chunk_start..i];
@@ -609,7 +677,9 @@ const PROMO_VERBS: &[(&str, i32, &str)] = &[
 ];
 
 fn is_release_part_label(label_lower: &str) -> bool {
-    for prefix in ["cd", "disc", "disk", "part", "vol", "track", "ch", "ep", "ver", "v"] {
+    for prefix in [
+        "cd", "disc", "disk", "part", "vol", "track", "ch", "ep", "ver", "v",
+    ] {
         if let Some(rest) = label_lower.strip_prefix(prefix)
             && !rest.is_empty()
             && rest.chars().all(|c| c.is_ascii_digit())
@@ -635,7 +705,27 @@ enum DomainRiskHit {
 }
 
 fn classify_high_risk_domain(inner: &str, context_promo_or_bracket: bool) -> DomainRiskHit {
-    for piece in inner.split(|c: char| c.is_whitespace() || matches!(c, '|' | '/' | ',' | '，' | '；' | ';' | '：' | ':' | '[' | ']' | '【' | '】' | '(' | ')' | '（' | '）')) {
+    for piece in inner.split(|c: char| {
+        c.is_whitespace()
+            || matches!(
+                c,
+                '|' | '/'
+                    | ','
+                    | '，'
+                    | '；'
+                    | ';'
+                    | '：'
+                    | ':'
+                    | '['
+                    | ']'
+                    | '【'
+                    | '】'
+                    | '('
+                    | ')'
+                    | '（'
+                    | '）'
+            )
+    }) {
         let tok = piece.trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '.' && c != '-');
         if tok.len() < 4 || !tok.contains('.') {
             continue;
@@ -650,7 +740,11 @@ fn classify_high_risk_domain(inner: &str, context_promo_or_bracket: bool) -> Dom
             continue;
         }
         let label_raw = parts[parts.len() - 2];
-        if label_raw.len() < 2 || !label_raw.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+        if label_raw.len() < 2
+            || !label_raw
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-')
+        {
             continue;
         }
         let label = label_raw.to_ascii_lowercase();
@@ -670,7 +764,8 @@ fn classify_high_risk_domain(inner: &str, context_promo_or_bracket: bool) -> Dom
         let has_alpha = label.chars().any(|c| c.is_ascii_alphabetic());
         let is_mixed_alnum = has_digit && has_alpha;
         let is_long_digits = has_digit && !has_alpha && label.len() >= 5;
-        let all_upper_short = label_raw.len() <= 4 && label_raw.chars().all(|c| !c.is_ascii_lowercase());
+        let all_upper_short =
+            label_raw.len() <= 4 && label_raw.chars().all(|c| !c.is_ascii_lowercase());
 
         if (is_mixed_alnum || is_long_digits) && !has_media_sibling {
             return DomainRiskHit::HighConfidence;
@@ -693,11 +788,7 @@ pub(crate) fn score_span(
     is_edge: bool,
     has_clause_sep_before: bool,
 ) -> (i32, Vec<&'static str>) {
-    let normalized = inner
-        .nfkc()
-        .collect::<String>()
-        .trim()
-        .to_string();
+    let normalized = inner.nfkc().collect::<String>().trim().to_string();
     if normalized.is_empty() {
         return (0, Vec::new());
     }
@@ -754,7 +845,7 @@ pub(crate) fn score_span(
     }
 
     let has_cjk = normalized.chars().any(is_cjk_han);
-    let context_promo_or_bracket = is_bracketed && (has_cjk || score > 0) || score > 0;
+    let context_promo_or_bracket = score > 0 || (is_bracketed && has_cjk);
     let domain_risk = classify_high_risk_domain(&normalized, context_promo_or_bracket);
     let has_risk_domain = domain_risk != DomainRiskHit::None;
     match domain_risk {
@@ -784,7 +875,11 @@ pub(crate) fn score_span(
     }
 
     // 媒体保护降权：无社交引流、无高风险域名且无反失联信号时保护影视标签
-    if is_protected_media_span(&normalized) && social_hits == 0 && !has_risk_domain && anti_loss_hits == 0 {
+    if is_protected_media_span(&normalized)
+        && social_hits == 0
+        && !has_risk_domain
+        && anti_loss_hits == 0
+    {
         score -= 55;
     }
 
@@ -799,7 +894,10 @@ fn reconstruct_body(spans: &[TitleSpan<'_>], stripped: &[bool]) -> String {
             continue;
         }
         if any_kept {
-            if sp.has_clause_sep_before && !sp.leading_sep.is_empty() && !stripped[idx.saturating_sub(1)] {
+            if sp.has_clause_sep_before
+                && !sp.leading_sep.is_empty()
+                && !stripped[idx.saturating_sub(1)]
+            {
                 if matches!(sp.leading_sep, "," | "，" | "/" | "|") {
                     out.push_str(sp.leading_sep);
                 } else {
@@ -950,7 +1048,12 @@ fn extract_anchor_basename_and_stem(files: &[FileInfo]) -> Option<(&str, &str)> 
         })
         .max_by_key(|f| f.size)?;
 
-    let basename = anchor.path.rsplit('/').next().unwrap_or(&anchor.path).trim();
+    let basename = anchor
+        .path
+        .rsplit('/')
+        .next()
+        .unwrap_or(&anchor.path)
+        .trim();
     let stem = match basename.rsplit_once('.') {
         Some((s, ext)) if ext.len() <= 6 && ext.chars().all(|c| c.is_ascii_alphanumeric()) => s,
         _ => basename,
@@ -1081,7 +1184,12 @@ pub fn cross_clean_with_files(text: &str, files: &[FileInfo]) -> (String, Option
         if overlaps[idx] || is_protected_media_span(sp.inner) {
             break;
         }
-        let (sc, _) = score_span(sp.inner, sp.is_bracketed, idx == 0, sp.has_clause_sep_before);
+        let (sc, _) = score_span(
+            sp.inner,
+            sp.is_bracketed,
+            idx == 0,
+            sp.has_clause_sep_before,
+        );
         if sp.is_bracketed || sc >= 25 {
             stripped[idx] = true;
             peeled_parts.push(sp.raw.to_string());
@@ -1129,7 +1237,7 @@ pub fn cross_clean_with_files(text: &str, files: &[FileInfo]) -> (String, Option
 }
 
 /// 供旁路高频广告模板自发现提取首/尾候选语块及主体签名文本。
-pub(crate) fn extract_edge_discovery_candidates<'a>(raw_name: &'a str) -> Vec<(String, String, u8)> {
+pub(crate) fn extract_edge_discovery_candidates(raw_name: &str) -> Vec<(String, String, u8)> {
     let trimmed = raw_name.trim();
     if trimmed.chars().count() < 6 {
         return Vec::new();
@@ -1172,7 +1280,10 @@ pub(crate) fn extract_edge_discovery_candidates<'a>(raw_name: &'a str) -> Vec<(S
         if is_protected_media_span(cand_text) && sc < 45 && !looks_like_domain {
             continue;
         }
-        if cand_text.chars().all(|c| c.is_ascii_digit() || matches!(c, '-' | '_' | '.')) {
+        if cand_text
+            .chars()
+            .all(|c| c.is_ascii_digit() || matches!(c, '-' | '_' | '.'))
+        {
             continue;
         }
 

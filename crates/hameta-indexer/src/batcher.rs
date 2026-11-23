@@ -159,7 +159,8 @@ impl TorrentBatcher {
 
         match manticore.batch_insert(&records).await {
             Ok(written) => {
-                let latency_ms = u64::try_from(flush_started.elapsed().as_millis()).unwrap_or(u64::MAX);
+                let latency_ms =
+                    u64::try_from(flush_started.elapsed().as_millis()).unwrap_or(u64::MAX);
                 stats
                     .torrent_buffered
                     .fetch_sub(batch_len, Ordering::Relaxed);
@@ -170,7 +171,11 @@ impl TorrentBatcher {
                 );
 
                 if written > 0 {
-                    for record in records.iter().filter(|r| hash_to_id(&r.info_hash) > 0).take(64) {
+                    for record in records
+                        .iter()
+                        .filter(|r| hash_to_id(&r.info_hash) > 0)
+                        .take(64)
+                    {
                         let refine_name = record
                             .refine_name
                             .clone()

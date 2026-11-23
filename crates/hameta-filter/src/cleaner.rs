@@ -1,7 +1,9 @@
 use crate::error::FilterError;
 use crate::preset::{default_ad_phrases, default_ad_regexes};
 use crate::schema::{AdPhraseRule, AdRegexRule, CleanerOptions};
-use crate::smart::{cross_clean_with_files, normalize_confusables_and_noise, strip_scored_ad_spans};
+use crate::smart::{
+    cross_clean_with_files, normalize_confusables_and_noise, strip_scored_ad_spans,
+};
 use aho_corasick::{AhoCorasick, MatchKind};
 use hameta_common::FileInfo;
 use regex::Regex;
@@ -303,8 +305,7 @@ impl TitleCleaner {
             self.options.enable_span_ad_scoring,
             text,
             |input| {
-                let (cleaned, hits) =
-                    strip_scored_ad_spans(input, self.options.span_ad_threshold);
+                let (cleaned, hits) = strip_scored_ad_spans(input, self.options.span_ad_threshold);
                 let detail = if hits.is_empty() {
                     None
                 } else {
@@ -440,7 +441,10 @@ fn should_collapse_bracket_inner(inner: &str) -> bool {
         if bracket_domain_regex().is_match(&collapsed) {
             let lower = collapsed.to_ascii_lowercase();
             let tld = lower.rsplit('.').next().unwrap_or("");
-            if lower.starts_with("http://") || lower.starts_with("https://") || lower.starts_with("www.") {
+            if lower.starts_with("http://")
+                || lower.starts_with("https://")
+                || lower.starts_with("www.")
+            {
                 return iana_tld_set().contains(tld);
             }
             return is_conservative_bare_tld(tld);
@@ -464,7 +468,11 @@ fn collapse_spaced_cjk(text: &str) -> String {
         let mut span_start = m.start();
         let mut span_end = m.end();
 
-        if text[..span_start].chars().next_back().is_some_and(is_cjk_han) {
+        if text[..span_start]
+            .chars()
+            .next_back()
+            .is_some_and(is_cjk_han)
+        {
             let mut it = text[span_start..span_end].char_indices();
             if let Some((_, _first_han)) = it.next()
                 && let Some((after_first, _)) = it.next()
@@ -483,7 +491,8 @@ fn collapse_spaced_cjk(text: &str) -> String {
         }
 
         if text[span_end..].chars().next().is_some_and(is_cjk_han)
-            && let Some((rel_last_idx, _last_han)) = text[span_start..span_end].char_indices().next_back()
+            && let Some((rel_last_idx, _last_han)) =
+                text[span_start..span_end].char_indices().next_back()
         {
             let mut new_end = span_start + rel_last_idx;
             while new_end > span_start
@@ -526,7 +535,11 @@ fn collapse_spaced_domains(text: &str) -> String {
                 return caps[0].to_string();
             }
             let collapsed: String = domain.chars().filter(|c| !c.is_whitespace()).collect();
-            let tld = collapsed.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
+            let tld = collapsed
+                .rsplit('.')
+                .next()
+                .unwrap_or("")
+                .to_ascii_lowercase();
             if iana_tld_set().contains(&tld) {
                 format!("{prefix}{collapsed}")
             } else {

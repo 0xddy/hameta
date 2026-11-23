@@ -12,10 +12,9 @@ use chrono::Utc;
 use hameta_common::{
     CrawlerWorkerConfig, DesiredState, GeoIpConfig, IndexerWorkerConfig, ManticoreServiceConfig,
     RedisServiceConfig, ServiceKind, WorkerBootstrap, WorkerDrainStatus, WorkerIngestEventsRequest,
-    WorkerReadyRequest, WorkerRegisterRequest, WorkerReloadGeoIpRequest,
-    WorkerReloadGeoIpResponse, WorkerReloadRulesRequest, WorkerReloadRulesResponse, WorkerRole,
-    WorkerRuntimeState, WorkerShutdownRequest, WorkerSnapshotEnvelope, generate_token,
-    verify_bearer_token,
+    WorkerReadyRequest, WorkerRegisterRequest, WorkerReloadGeoIpRequest, WorkerReloadGeoIpResponse,
+    WorkerReloadRulesRequest, WorkerReloadRulesResponse, WorkerRole, WorkerRuntimeState,
+    WorkerShutdownRequest, WorkerSnapshotEnvelope, generate_token, verify_bearer_token,
 };
 use hameta_filter::{FilterBundle, default_online_filter_bundle};
 use hameta_storage::Database;

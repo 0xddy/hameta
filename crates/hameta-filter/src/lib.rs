@@ -1104,9 +1104,15 @@ mod tests {
             cleaner.refine("w w w . a d 9 9 . c o m - Movie 2026"),
             "Movie 2026"
         );
-        assert_eq!(cleaner.refine("[ www . yts . mx ] Movie 2026"), "Movie 2026");
+        assert_eq!(
+            cleaner.refine("[ www . yts . mx ] Movie 2026"),
+            "Movie 2026"
+        );
         assert_eq!(cleaner.refine("A B C 1 2 3 Movie"), "A B C 1 2 3 Movie");
-        assert_eq!(cleaner.refine("电影 发 行 测 试 电影"), "电影 发行测试 电影");
+        assert_eq!(
+            cleaner.refine("电影 发 行 测 试 电影"),
+            "电影 发行测试 电影"
+        );
         assert_eq!(cleaner.refine("电影 最 新 地 址 电影"), "电影 电影");
         assert_eq!(cleaner.refine("大神bt最新域名 正常标题"), "正常标题");
     }
@@ -1131,7 +1137,8 @@ mod tests {
     #[test]
     fn engine_rejects_short_refined_name_and_short_circuits_empty() {
         let engine = make_engine(default_online_filter_policy());
-        let too_short = torrent_message_with_file("www.ad99.com - 1", "movie.mkv", 200 * 1024 * 1024);
+        let too_short =
+            torrent_message_with_file("www.ad99.com - 1", "movie.mkv", 200 * 1024 * 1024);
         let outcome = engine.evaluate(&too_short);
         assert!(!outcome.is_accepted());
         assert_eq!(
@@ -1292,7 +1299,13 @@ mod tests {
             .find(|s| s.stage == "span_ad_scoring")
             .unwrap();
         assert!(scoring_step.changed);
-        assert!(scoring_step.detail.as_deref().unwrap_or("").contains("剥离"));
+        assert!(
+            scoring_step
+                .detail
+                .as_deref()
+                .unwrap_or("")
+                .contains("剥离")
+        );
 
         // 零误杀媒体保护列表
         for intact in [
@@ -1306,7 +1319,11 @@ mod tests {
             "[Beatrice-Raws] Mushoku Tensei II - 13 [WEB 1920x1080 HEVC AAC].mkv",
             "【重度BDSM】韩国巅峰女S「Yerin」OF重度调教私拍",
         ] {
-            assert_eq!(cleaner.refine(intact), intact, "should keep intact: {intact}");
+            assert_eq!(
+                cleaner.refine(intact),
+                intact,
+                "should keep intact: {intact}"
+            );
         }
 
         // 关闭 span_ad_scoring 开关后保留原块
@@ -1384,9 +1401,9 @@ mod tests {
         let empty_exclude = std::collections::HashSet::new();
         let cands = tracker.snapshot_candidates(20, &empty_exclude);
         assert!(
-            cands
-                .iter()
-                .any(|c| c.phrase == "[神秘新站888]" && c.distinct_titles == 4 && c.occurrences == 4)
+            cands.iter().any(|c| c.phrase == "[神秘新站888]"
+                && c.distinct_titles == 4
+                && c.occurrences == 4)
         );
         assert!(!cands.iter().any(|c| c.phrase == "[1080p]"));
         assert!(!cands.iter().any(|c| c.phrase == "[单标题重复]"));

@@ -663,24 +663,26 @@ impl MetricsCollector {
                             channels.response_pps +=
                                 (inbound_response.saturating_sub(prev_s.inbound_response)) as f64
                                     / dt_secs;
-                            let prev_fp = prev_s.inbound_ping.saturating_add(prev_s.inbound_find_node);
+                            let prev_fp =
+                                prev_s.inbound_ping.saturating_add(prev_s.inbound_find_node);
                             let cur_fp = inbound_ping.saturating_add(inbound_find_node);
                             channels.find_node_ping_pps +=
                                 (cur_fp.saturating_sub(prev_fp)) as f64 / dt_secs;
                             channels.error_pps +=
-                                (inbound_error.saturating_sub(prev_s.inbound_error)) as f64 / dt_secs;
+                                (inbound_error.saturating_sub(prev_s.inbound_error)) as f64
+                                    / dt_secs;
                             channels.other_pps +=
-                                (inbound_other.saturating_sub(prev_s.inbound_other)) as f64 / dt_secs;
+                                (inbound_other.saturating_sub(prev_s.inbound_other)) as f64
+                                    / dt_secs;
                             channels.parse_error_pps += (inbound_parse_error
                                 .saturating_sub(prev_s.inbound_parse_error))
                                 as f64
                                 / dt_secs;
                             channels.invalid_udp_pps +=
                                 (udp_invalid.saturating_sub(prev_s.udp_invalid)) as f64 / dt_secs;
-                            channels.queue_full_pps += (udp_queue_full
-                                .saturating_sub(prev_s.udp_queue_full))
-                                as f64
-                                / dt_secs;
+                            channels.queue_full_pps +=
+                                (udp_queue_full.saturating_sub(prev_s.udp_queue_full)) as f64
+                                    / dt_secs;
 
                             geo_samples_dropped_pps += (geo_samples_dropped
                                 .saturating_sub(prev_s.geo_samples_dropped))
@@ -853,7 +855,10 @@ impl MetricsCollector {
         let (countries, other_countries_pps, other_countries_bps, active_country_count) =
             finalize_globe_countries(geo_country_agg, &globe_geoip.home_country);
         let globe_snapshot = GlobeTrafficSnapshot {
-            seq: self.globe_seq.fetch_add(1, Ordering::Relaxed).saturating_add(1),
+            seq: self
+                .globe_seq
+                .fetch_add(1, Ordering::Relaxed)
+                .saturating_add(1),
             captured_at: now_secs,
             running_crawlers,
             udp_rx_pps,
@@ -1411,9 +1416,11 @@ fn build_globe_geoip_status(
     let err_opt = if mmdb_loaded {
         None
     } else {
-        crawler_geo_views
-            .iter()
-            .find_map(|v| v.get("error").and_then(Value::as_str).map(ToOwned::to_owned))
+        crawler_geo_views.iter().find_map(|v| {
+            v.get("error")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned)
+        })
     };
 
     let threshold = json_u64(primary, &["adaptive_sample_threshold_pps"]);

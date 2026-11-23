@@ -84,7 +84,10 @@ pub async fn console_ingest_stream_handler(
     let replay_limit = if last_event_id.is_some() {
         MAX_RECENT_LIMIT
     } else {
-        query.replay.unwrap_or(DEFAULT_SSE_REPLAY).min(MAX_RECENT_LIMIT)
+        query
+            .replay
+            .unwrap_or(DEFAULT_SSE_REPLAY)
+            .min(MAX_RECENT_LIMIT)
     };
 
     // 先订阅广播再读取环形缓冲，确保回放与实时流无缝衔接不丢事件

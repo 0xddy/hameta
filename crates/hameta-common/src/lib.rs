@@ -300,7 +300,10 @@ mod tests {
         let legacy_geo: GeoIpConfig =
             serde_json::from_str(r#"{"enabled":true,"home_country":"jp"}"#).unwrap();
         assert_eq!(legacy_geo.normalized_home_country(), "JP");
-        assert_eq!(legacy_geo.effective_download_url(), DEFAULT_GEOIP_DOWNLOAD_URL);
+        assert_eq!(
+            legacy_geo.effective_download_url(),
+            DEFAULT_GEOIP_DOWNLOAD_URL
+        );
 
         let custom_url_cfg = GeoIpConfig {
             download_url: "https://mirror.example.com/GeoLite2-Country.mmdb".to_string(),
@@ -383,7 +386,10 @@ mod tests {
             bearer_token: "  Bearer   tok_live_123  ".to_string(),
             ..ManticoreServiceConfig::default()
         };
-        assert_eq!(bearer_prefixed.effective_auth_mode(), ManticoreAuthMode::Bearer);
+        assert_eq!(
+            bearer_prefixed.effective_auth_mode(),
+            ManticoreAuthMode::Bearer
+        );
         assert_eq!(bearer_prefixed.basic_auth(), None);
         assert_eq!(bearer_prefixed.bearer_token(), Some("tok_live_123"));
         assert!(bearer_prefixed.validate().is_ok());

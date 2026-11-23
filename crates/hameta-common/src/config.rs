@@ -170,7 +170,10 @@ fn is_reserved_transport_header(name: &str) -> bool {
 }
 
 fn is_valid_http_header_value(val: &str) -> bool {
-    !val.is_empty() && val.bytes().all(|b| b == b'\t' || (0x20..=0x7E).contains(&b))
+    !val.is_empty()
+        && val
+            .bytes()
+            .all(|b| b == b'\t' || (0x20..=0x7E).contains(&b))
 }
 
 fn strip_bearer_prefix(raw: &str) -> &str {
