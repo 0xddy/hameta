@@ -1,7 +1,9 @@
 import { createRouter, createWebHistory } from "vue-router";
 import AppLayout from "@/layouts/AppLayout.vue";
 import { useAuthStore } from "@/stores/auth";
+import ConsoleView from "@/views/ConsoleView.vue";
 import FilterWorkbenchView from "@/views/FilterWorkbenchView.vue";
+import GlobeView from "@/views/GlobeView.vue";
 import LoginView from "@/views/LoginView.vue";
 import OverviewView from "@/views/OverviewView.vue";
 import RedisMonitorView from "@/views/RedisMonitorView.vue";
@@ -19,13 +21,13 @@ const router = createRouter({
       path: "/setup",
       name: "setup",
       component: SetupWizardView,
-      meta: { public: true, title: "系统初始化引导" },
+      meta: { public: true, title: "初始化向导", sub: "FIRST-BOOT PROVISIONING" },
     },
     {
       path: "/login",
       name: "login",
       component: LoginView,
-      meta: { public: true, title: "管理员登录" },
+      meta: { public: true, title: "管理员登录", sub: "ADMIN AUTHENTICATION" },
     },
     {
       path: "/",
@@ -35,49 +37,70 @@ const router = createRouter({
           path: "",
           name: "overview",
           component: OverviewView,
-          meta: { title: "系统总览" },
+          meta: { title: "总览态势", sub: "SINGLE-HOST MULTI-PROCESS TELEMETRY" },
         },
         {
-          path: "settings/services",
-          name: "settings-services",
-          component: ServiceSettingsView,
-          meta: { title: "服务配置中心 (Redis / Manticore)" },
+          path: "console",
+          name: "console",
+          component: ConsoleView,
+          meta: {
+            title: "实时 Console",
+            sub: "SSE REALTIME INGEST STREAM · /api/v1/console/ingest-stream",
+          },
+        },
+        {
+          path: "globe",
+          name: "globe",
+          component: GlobeView,
+          meta: { title: "全球 DHT 流量态势", sub: "3D GLOBAL INBOUND DHT UDP TRAFFIC RADAR" },
         },
         {
           path: "workers",
           name: "workers",
           component: WorkersView,
-          meta: { title: "进程与采集调优" },
+          meta: { title: "进程管理", sub: "LOCAL PROCESS GUARD · WORKER LIFECYCLE" },
+        },
+        {
+          path: "diagnostics",
+          name: "diagnostics",
+          component: WorkerDiagnosticsView,
+          meta: { title: "进程诊断", sub: "REALTIME WORKER DIAGNOSTICS" },
         },
         {
           path: "workers/:id/diagnostics",
           name: "worker-diagnostics",
           component: WorkerDiagnosticsView,
-          meta: { title: "节点深度诊断" },
+          meta: { title: "进程诊断", sub: "REALTIME WORKER DIAGNOSTICS" },
         },
         {
           path: "torrents",
           name: "torrents",
           component: TorrentsView,
-          meta: { title: "磁力检索浏览" },
+          meta: { title: "磁力库", sub: "MANTICORE FULL-TEXT INDEX" },
         },
         {
           path: "filter",
           name: "filter",
           component: FilterWorkbenchView,
-          meta: { title: "过滤清洗工作台" },
+          meta: { title: "过滤清洗", sub: "3-STAGE ARCSWAP WORKBENCH" },
         },
         {
           path: "redis",
           name: "redis",
           component: RedisMonitorView,
-          meta: { title: "Redis Streams 监控与排查" },
+          meta: { title: "Redis 队列", sub: "HAMETA STREAMS & LOCK INSPECTOR" },
         },
         {
           path: "sql",
           name: "sql",
           component: SqlConsoleView,
-          meta: { title: "只读 SQL 诊断控制台" },
+          meta: { title: "SQL 控制台", sub: "READ-ONLY MANTICORE CONSOLE" },
+        },
+        {
+          path: "settings/services",
+          name: "settings-services",
+          component: ServiceSettingsView,
+          meta: { title: "服务配置", sub: "REDIS & MANTICORE ENDPOINTS" },
         },
       ],
     },

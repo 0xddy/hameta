@@ -304,7 +304,10 @@ pub async fn test_manticore_connection(cfg: &ManticoreServiceConfig) -> Manticor
                 latency_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(0),
                 schema: None,
                 status: None,
-                message: format!("连接或校验 Manticore 失败: {err}"),
+                message: format!(
+                    "连接或校验 Manticore 失败: {}",
+                    sanitize_secret_in_text(&err.to_string())
+                ),
             };
         }
     };
@@ -353,17 +356,24 @@ pub async fn init_manticore_table_if_absent(
         .map_err(|e| InitTableError::InvalidConfig(e.to_string()))?;
     let client =
         ManticoreClient::new(cfg).map_err(|e| InitTableError::InvalidConfig(e.to_string()))?;
-    let schema = client
-        .describe_torrents()
-        .await
-        .map_err(|e| InitTableError::Backend(format!("检查 torrents 表状态失败: {e}")))?;
+    let schema = client.describe_torrents().await.map_err(|e| {
+        InitTableError::Backend(format!(
+            "检查 torrents 表状态失败: {}",
+            sanitize_secret_in_text(&e.to_string())
+        ))
+    })?;
     if schema.table_exists {
         return Err(InitTableError::AlreadyExists);
     }
     client
         .create_torrents_table_if_missing()
         .await
-        .map_err(|e| InitTableError::Backend(format!("创建 torrents 表失败: {e}")))?;
+        .map_err(|e| {
+            InitTableError::Backend(format!(
+                "创建 torrents 表失败: {}",
+                sanitize_secret_in_text(&e.to_string())
+            ))
+        })?;
     Ok(())
 }
 

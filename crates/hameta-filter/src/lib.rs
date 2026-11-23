@@ -1,4 +1,5 @@
 pub mod cleaner;
+pub mod discovery;
 pub mod engine;
 pub mod error;
 pub mod legacy;
@@ -6,11 +7,13 @@ pub mod playground;
 pub mod preset;
 pub mod runtime;
 pub mod schema;
+pub mod smart;
 
 /// 过滤引擎接口版本号（v2: Gates + Cleaner + Allow/Reject PolicyRule 链）。
 pub const FILTER_ENGINE_API_VERSION: u32 = 2;
 
 pub use cleaner::{CleaningStep, CleaningTrace, TitleCleaner};
+pub use discovery::{AdDiscoveryTracker, DiscoveredAdCandidate, merge_discovered_candidates};
 pub use engine::{CompiledFilterEngine, FilterCategory, FilterOutcome, RuleHit};
 pub use error::FilterError;
 pub use legacy::{
@@ -24,8 +27,9 @@ pub use playground::{
 };
 pub use preset::{
     ExtensionPackInfo, FilterPresetCatalog, KeywordPackInfo, PolicyPresetInfo, RuleTemplateInfo,
-    builtin_preset_catalog, default_ad_phrases, default_ad_regexes, default_online_filter_bundle,
-    default_online_filter_policy, policy_preset_bundle,
+    builtin_ad_phrase_note, builtin_ad_regex_note, builtin_preset_catalog, default_ad_phrases,
+    default_ad_regexes, default_online_filter_bundle, default_online_filter_policy,
+    policy_preset_bundle, upgrade_legacy_builtin_notes,
 };
 pub use runtime::{
     DEFAULT_REJECTED_SAMPLE_CAPACITY, FilterRuntime, FilterStatsSnapshot, RejectedSample,
@@ -37,6 +41,7 @@ pub use schema::{
     KeywordMatchMode, PolicyAction, PolicyRule, RuleMatcher, TextTarget, TitlePatternKind,
     ToggleU64, ToggleUsize, normalize_extension,
 };
+pub use smart::ScoredSpanHit;
 
 #[cfg(test)]
 mod tests {
@@ -1044,5 +1049,400 @@ mod tests {
             AbDiffStatus::RefinedNameChanged
         );
         assert_eq!(report.items[2].diff_status, AbDiffStatus::NewlyRejected);
+    }
+
+    #[test]
+    fn cleaner_preserves_dot_separated_releases_with_ambiguous_tlds() {
+        let cleaner = TitleCleaner::default_baseline();
+        for intact in [
+            "Avengers.2024.1080p.WebRip.CN.mkv",
+            "Concert.2025.Live.1080p.mkv",
+            "Show.S01E01.WEB-DL.CC.mkv",
+            "Album.VIP.2025.flac",
+            "Movie.2025.TOP.1080p.mkv",
+        ] {
+            assert_eq!(cleaner.refine(intact), intact);
+        }
+        assert_eq!(
+            cleaner.refine("Dune.Part.Two.2024.ad99.com.1080p.mkv"),
+            "Dune.Part.Two.2024.1080p.mkv"
+        );
+    }
+
+    #[test]
+    fn cleaner_preserves_file_ext_prefixes_and_strips_multi_layer_site_prefixes() {
+        let cleaner = TitleCleaner::default_baseline();
+        for intact in [
+            "Clip01.mov - Raw Footage",
+            "README.md - Project Guide",
+            "Assets.zip - Part 2",
+        ] {
+            assert_eq!(cleaner.refine(intact), intact);
+        }
+        assert_eq!(
+            cleaner.refine("[www.siteA.com][www.siteB.net] Movie.2026"),
+            "Movie.2026"
+        );
+        assert_eq!(
+            cleaner.refine("www.siteA.com [www.siteB.org] Movie.2026"),
+            "Movie.2026"
+        );
+    }
+
+    #[test]
+    fn cleaner_handles_zero_width_chars_spaced_domains_and_preserves_english() {
+        let cleaner = TitleCleaner::default_baseline();
+        assert_eq!(
+            cleaner.refine("最\u{200b}新\u{200b}地\u{200b}址\u{feff}发布页 Movie 2026"),
+            "Movie 2026"
+        );
+        assert_eq!(
+            cleaner.refine("w\u{200b}w\u{200b}w.ad99.com - Movie.2026"),
+            "Movie.2026"
+        );
+        assert_eq!(
+            cleaner.refine("w w w . a d 9 9 . c o m - Movie 2026"),
+            "Movie 2026"
+        );
+        assert_eq!(cleaner.refine("[ www . yts . mx ] Movie 2026"), "Movie 2026");
+        assert_eq!(cleaner.refine("A B C 1 2 3 Movie"), "A B C 1 2 3 Movie");
+        assert_eq!(cleaner.refine("电影 发 行 测 试 电影"), "电影 发行测试 电影");
+        assert_eq!(cleaner.refine("电影 最 新 地 址 电影"), "电影 电影");
+        assert_eq!(cleaner.refine("大神bt最新域名 正常标题"), "正常标题");
+    }
+
+    #[test]
+    fn cleaner_strips_url_paths_nested_empty_brackets_and_ext_spaces() {
+        let cleaner = TitleCleaner::default_baseline();
+        assert_eq!(
+            cleaner.refine("www.ad99.com/go/123.html: Movie — "),
+            "Movie"
+        );
+        assert_eq!(
+            cleaner.refine("【 - 】[()] 周处除三害 更多资源 .mp4"),
+            "周处除三害.mp4"
+        );
+        assert_eq!(
+            cleaner.refine("[QQ群:88421099] Movie (公众号:影视君)"),
+            "Movie"
+        );
+    }
+
+    #[test]
+    fn engine_rejects_short_refined_name_and_short_circuits_empty() {
+        let engine = make_engine(default_online_filter_policy());
+        let too_short = torrent_message_with_file("www.ad99.com - 1", "movie.mkv", 200 * 1024 * 1024);
+        let outcome = engine.evaluate(&too_short);
+        assert!(!outcome.is_accepted());
+        assert_eq!(
+            outcome.hit().unwrap().rule_id,
+            "cleaner:min_refined_name_length"
+        );
+
+        let ok_msg = torrent_message_with_file("www.ad99.com - AB", "movie.mkv", 200 * 1024 * 1024);
+        assert!(engine.evaluate(&ok_msg).is_accepted());
+
+        let empty_msg = torrent_message_with_file("www.ad99.com", "bad.exe", 1024);
+        let empty_out = engine.evaluate(&empty_msg);
+        assert_eq!(
+            empty_out.hit().unwrap().rule_id,
+            "cleaner:empty_refined_name"
+        );
+    }
+
+    #[test]
+    fn builtin_ad_rules_have_friendly_notes_and_upgrade_legacy_baseline() {
+        let phrases = default_ad_phrases();
+        assert!(!phrases.is_empty());
+        for item in &phrases {
+            assert!(
+                builtin_ad_phrase_note(&item.phrase).is_some(),
+                "missing friendly note for phrase: {}",
+                item.phrase
+            );
+            assert!(!item.note.trim().is_empty());
+            assert_ne!(item.note, "内置基线");
+        }
+
+        let regexes = default_ad_regexes();
+        assert!(!regexes.is_empty());
+        for item in &regexes {
+            assert!(
+                builtin_ad_regex_note(&item.pattern).is_some(),
+                "missing friendly note for regex: {}",
+                item.pattern
+            );
+            assert!(!item.note.trim().is_empty());
+            assert_ne!(item.note, "内置基线");
+        }
+
+        let catalog = builtin_preset_catalog();
+        for tpl in &catalog.rule_templates {
+            assert!(
+                !tpl.rule.note.trim().is_empty(),
+                "template rule {} should carry a non-empty friendly note",
+                tpl.id
+            );
+        }
+
+        let mut legacy_phrases = vec![
+            AdPhraseRule {
+                id: "p1".to_string(),
+                phrase: "收藏不迷路".to_string(),
+                enabled: true,
+                note: "内置基线".to_string(),
+            },
+            AdPhraseRule {
+                id: "p2".to_string(),
+                phrase: "自定义广告".to_string(),
+                enabled: true,
+                note: "我的自定义备注".to_string(),
+            },
+            AdPhraseRule {
+                id: "p3".to_string(),
+                phrase: "故意留空".to_string(),
+                enabled: true,
+                note: String::new(),
+            },
+        ];
+        let mut legacy_regexes = vec![
+            AdRegexRule {
+                id: "r1".to_string(),
+                pattern: regexes[0].pattern.clone(),
+                replacement: " ".to_string(),
+                enabled: true,
+                note: "内置基线".to_string(),
+            },
+            AdRegexRule {
+                id: "r2".to_string(),
+                pattern: "foo.*bar".to_string(),
+                replacement: String::new(),
+                enabled: true,
+                note: "手动备注".to_string(),
+            },
+        ];
+
+        upgrade_legacy_builtin_notes(&mut legacy_phrases, &mut legacy_regexes);
+        assert_eq!(legacy_phrases[0].note, "站点收藏引导语");
+        assert_eq!(legacy_phrases[1].note, "我的自定义备注");
+        assert_eq!(legacy_phrases[2].note, "");
+        assert_eq!(legacy_regexes[0].note, "日期前缀与 BT 最新域名/地址推广");
+        assert_eq!(legacy_regexes[1].note, "手动备注");
+    }
+
+    #[test]
+    fn cleaner_smart_l0_normalizes_confusables_dingbats_emojis_safely() {
+        let cleaner = TitleCleaner::default_baseline();
+
+        // 西里尔同形字伪装域名（a/o/c/m 为西里尔字母）被折叠后交由站点/域名阶段剥离
+        assert_eq!(cleaner.refine("аd99.соm - 流浪地球2"), "流浪地球2");
+        assert_eq!(cleaner.refine("ооо.соm - Movie.2026"), "Movie.2026");
+
+        // 纯正俄文标题保持原样，不误折成 ASCII
+        assert_eq!(
+            smart::normalize_confusables_and_noise("русский фильм"),
+            "русский фильм"
+        );
+
+        // 非 NFKC 带圈/黑底数字符号与营销 Emoji 降噪
+        assert_eq!(
+            cleaner.refine("🔥⭐ ❶号 🅰片 Movie.2026 ✅👇"),
+            "1号 A片 Movie.2026"
+        );
+
+        // 关闭 enable_nfkc 但保留 enable_confusable_norm 时，不破坏原有全角关闭行为
+        let no_nfkc = TitleCleaner::compile_with_options(
+            &[],
+            &[],
+            &CleanerOptions {
+                enable_nfkc: false,
+                enable_confusable_norm: true,
+                enable_span_ad_scoring: false,
+                enable_filename_cross_clean: false,
+                ..CleanerOptions::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            no_nfkc.refine("ＡＶＥＮＧＥＲＳ 🔥 ❶"),
+            "ＡＶＥＮＧＥＲＳ 1"
+        );
+    }
+
+    #[test]
+    fn cleaner_smart_l2a_span_scoring_strips_obfuscated_ads_and_preserves_media() {
+        let cleaner = TitleCleaner::default_baseline();
+
+        assert_eq!(
+            cleaner.refine(
+                "进裙加薇: avbot888 最新地址防失联 新址看完整版 99av88.cc 流浪地球2.2023.1080p.mkv"
+            ),
+            "流浪地球2.2023.1080p.mkv"
+        );
+        assert_eq!(
+            cleaner.refine("流浪地球2.2023.1080p 【新址 9988bt.vip 每日更新 防迷路】.mkv"),
+            "流浪地球2.2023.1080p.mkv"
+        );
+
+        let trace = cleaner.refine_with_trace("Movie.2026 【加薇: avbot888 防迷路】.mkv");
+        assert_eq!(trace.refined_name, "Movie.2026.mkv");
+        let scoring_step = trace
+            .steps
+            .iter()
+            .find(|s| s.stage == "span_ad_scoring")
+            .unwrap();
+        assert!(scoring_step.changed);
+        assert!(scoring_step.detail.as_deref().unwrap_or("").contains("剥离"));
+
+        // 零误杀媒体保护列表
+        for intact in [
+            "Show.S01E01.WEB-DL.CC.mkv",
+            "Album.VIP.2025.flac",
+            "Movie.2025.TOP.1080p.mkv",
+            "Concert.2025.Live.1080p.mkv",
+            "Apple.TV.Original.2025.1080p.mkv",
+            "Avengers.2024.1080p.WebRip.CN.mkv",
+            "[YTS.MX] Movie.2024.1080p.mkv",
+            "[Beatrice-Raws] Mushoku Tensei II - 13 [WEB 1920x1080 HEVC AAC].mkv",
+            "【重度BDSM】韩国巅峰女S「Yerin」OF重度调教私拍",
+        ] {
+            assert_eq!(cleaner.refine(intact), intact, "should keep intact: {intact}");
+        }
+
+        // 关闭 span_ad_scoring 开关后保留原块
+        let no_span = TitleCleaner::compile_with_options(
+            &[],
+            &[],
+            &CleanerOptions {
+                enable_span_ad_scoring: false,
+                ..CleanerOptions::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            no_span.refine("Movie.2026 [进裙加薇: avbot888]"),
+            "Movie.2026 [进裙加薇: avbot888]"
+        );
+    }
+
+    #[test]
+    fn cleaner_smart_l2b_filename_cross_clean_peels_unseen_wrapper_safely() {
+        let cleaner = TitleCleaner::default_baseline();
+        let files = vec![FileInfo {
+            path: "movies/Oppenheimer.2023.2160p.BluRay.x265.mkv".to_string(),
+            size: 4_000_000_000,
+        }];
+        let trace = cleaner.refine_with_files_trace(
+            "🔥 [未知新站水印] 奥本海默.Oppenheimer.2023.2160p.BluRay.mkv",
+            &files,
+        );
+        assert_eq!(
+            trace.refined_name,
+            "奥本海默.Oppenheimer.2023.2160p.BluRay.mkv"
+        );
+        let cross_step = trace
+            .steps
+            .iter()
+            .find(|s| s.stage == "filename_cross_clean")
+            .unwrap();
+        assert!(cross_step.changed);
+        assert!(
+            cross_step
+                .detail
+                .as_deref()
+                .unwrap_or("")
+                .contains("Oppenheimer")
+        );
+
+        // 占位文件路径（sample/video.mkv）不会引发误剥离
+        let placeholder = vec![FileInfo {
+            path: "sample/video.mkv".to_string(),
+            size: 100 * 1024 * 1024,
+        }];
+        assert_eq!(
+            cleaner.refine_with_files("[Sakurato] Frieren - 01 [1080p].mkv", &placeholder),
+            "[Sakurato] Frieren - 01 [1080p].mkv"
+        );
+
+        // 已彻底洗空的纯域名标题绝不会被文件名“复活”
+        assert_eq!(cleaner.refine_with_files("www.example.com", &files), "");
+    }
+
+    #[test]
+    fn discovery_tracker_surfaces_high_df_ads_and_runtime_excludes_known_phrases() {
+        let mut tracker = AdDiscoveryTracker::new();
+        let now = 1_795_400_000;
+        for movie in ["流浪地球2", "消失的她", "奥本海默", "沙丘2"] {
+            tracker.observe(&format!("[神秘新站888] {movie}.2025.1080p.mkv"), now);
+            tracker.observe(&format!("[1080p] {movie}.mkv"), now);
+        }
+        // 单标题重复不构成高文档频次水印
+        for _ in 0..5 {
+            tracker.observe("[单标题重复] SameMovie.2025.mkv", now);
+        }
+
+        let empty_exclude = std::collections::HashSet::new();
+        let cands = tracker.snapshot_candidates(20, &empty_exclude);
+        assert!(
+            cands
+                .iter()
+                .any(|c| c.phrase == "[神秘新站888]" && c.distinct_titles == 4 && c.occurrences == 4)
+        );
+        assert!(!cands.iter().any(|c| c.phrase == "[1080p]"));
+        assert!(!cands.iter().any(|c| c.phrase == "[单标题重复]"));
+
+        // 通过 FilterRuntime 接入时，已录入 ad_phrases 后应自动从候选中排除
+        let mut bundle = default_online_filter_bundle();
+        bundle.version = 1;
+        let runtime = FilterRuntime::new(&bundle).unwrap();
+        for movie in ["流浪地球2", "消失的她", "奥本海默"] {
+            runtime.evaluate_and_record(&torrent_message(&format!(
+                "【自发现新水】 {movie}.2025.1080p"
+            )));
+        }
+        let snap1 = runtime.snapshot_stats(10);
+        assert!(
+            snap1
+                .discovered_ad_candidates
+                .iter()
+                .any(|c| c.phrase == "【自发现新水】")
+        );
+
+        bundle.version = 2;
+        bundle.ad_phrases.push(AdPhraseRule {
+            id: "ad-discovered-1".into(),
+            phrase: "【自发现新水】".into(),
+            enabled: true,
+            note: "智能统计自发现".into(),
+        });
+        runtime.reload(&bundle).unwrap();
+        let snap2 = runtime.snapshot_stats(10);
+        assert!(
+            !snap2
+                .discovered_ad_candidates
+                .iter()
+                .any(|c| c.phrase == "【自发现新水】")
+        );
+    }
+
+    #[test]
+    fn cleaner_options_legacy_json_deserializes_with_smart_defaults() {
+        let legacy_json = json!({
+            "enable_nfkc": true,
+            "enable_deobfuscate_brackets": true,
+            "enable_collapse_spaced_chars": true,
+            "enable_strip_leading_site_prefix": true,
+            "enable_strip_urls_and_domains": true,
+            "enable_ad_regexes": true,
+            "enable_ad_phrases": true,
+            "enable_cleanup": true,
+            "reject_if_empty_after_clean": true,
+            "min_refined_name_length": { "enabled": true, "value": 2 }
+        });
+        let opts: CleanerOptions = serde_json::from_value(legacy_json).unwrap();
+        assert!(opts.enable_confusable_norm);
+        assert!(opts.enable_span_ad_scoring);
+        assert_eq!(opts.span_ad_threshold, 65);
+        assert!(opts.enable_filename_cross_clean);
     }
 }

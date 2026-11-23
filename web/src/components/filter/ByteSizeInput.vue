@@ -1,105 +1,112 @@
 <script setup lang="ts">
 import { computed, ref, watch } from "vue";
-
-type UnitKey = "B" | "KB" | "MB" | "GB" | "TB";
-
-const UNIT_FACTOR: Record<UnitKey, number> = {
-  B: 1,
-  KB: 1024,
-  MB: 1024 * 1024,
-  GB: 1024 * 1024 * 1024,
-  TB: 1024 * 1024 * 1024 * 1024,
-};
+import ObsNumberInput from "@/components/ui/ObsNumberInput.vue";
+import ObsSelect from "@/components/ui/ObsSelect.vue";
 
 const props = withDefaults(
   defineProps<{
-    modelValue: number;
+    modelValue: number | null;
+    allowEmpty?: boolean;
     min?: number;
-    disabled?: boolean;
+    placeholder?: string;
   }>(),
   {
+    allowEmpty: false,
     min: 0,
-    disabled: false,
+    placeholder: "未限制",
   },
 );
 
 const emit = defineEmits<{
-  (e: "update:modelValue", value: number): void;
+  (e: "update:modelValue", value: number | null): void;
 }>();
 
-function pickBestUnit(bytes: number): UnitKey {
-  if (!bytes || bytes <= 0) return "MB";
-  const order: UnitKey[] = ["TB", "GB", "MB", "KB", "B"];
-  for (const unit of order) {
-    const factor = UNIT_FACTOR[unit];
-    if (bytes >= factor && bytes % factor === 0) {
-      return unit;
-    }
-  }
-  if (bytes >= UNIT_FACTOR.TB) return "TB";
-  if (bytes >= UNIT_FACTOR.GB) return "GB";
-  if (bytes >= UNIT_FACTOR.MB) return "MB";
-  if (bytes >= UNIT_FACTOR.KB) return "KB";
+type SizeUnit = "B" | "KB" | "MB" | "GB";
+
+const UNIT_FACTOR: Record<SizeUnit, number> = {
+  B: 1,
+  KB: 1024,
+  MB: 1024 * 1024,
+  GB: 1024 * 1024 * 1024,
+};
+
+const UNIT_OPTIONS = [
+  { label: "B", value: "B" },
+  { label: "KB", value: "KB" },
+  { label: "MB", value: "MB" },
+  { label: "GB", value: "GB" },
+];
+
+function detectBestUnit(bytes: number | null): SizeUnit {
+  if (bytes === null || bytes <= 0) return "MB";
+  if (bytes % UNIT_FACTOR.GB === 0) return "GB";
+  if (bytes % UNIT_FACTOR.MB === 0) return "MB";
+  if (bytes % UNIT_FACTOR.KB === 0) return "KB";
   return "B";
 }
 
-const unit = ref<UnitKey>(pickBestUnit(props.modelValue));
+const unit = ref<SizeUnit>(detectBestUnit(props.modelValue));
+const displayValue = ref<number | undefined>(
+  props.modelValue === null ? undefined : Number((props.modelValue / UNIT_FACTOR[unit.value]).toFixed(2)),
+);
 
 watch(
   () => props.modelValue,
-  (val) => {
-    const currentFactor = UNIT_FACTOR[unit.value];
-    if (val > 0 && (val < currentFactor || val % currentFactor !== 0)) {
-      unit.value = pickBestUnit(val);
+  (next) => {
+    if (next === null) {
+      displayValue.value = undefined;
+      return;
+    }
+    const factor = UNIT_FACTOR[unit.value];
+    const currentBytes = displayValue.value === undefined ? null : Math.round(displayValue.value * factor);
+    if (currentBytes !== next) {
+      unit.value = detectBestUnit(next);
+      displayValue.value = Number((next / UNIT_FACTOR[unit.value]).toFixed(2));
     }
   },
 );
 
-const displayValue = computed<number>({
-  get() {
-    const factor = UNIT_FACTOR[unit.value];
-    return Number((props.modelValue / factor).toFixed(2));
-  },
-  set(val: number) {
-    const safeVal = Number.isFinite(val) ? val : 0;
-    const rawBytes = Math.round(safeVal * UNIT_FACTOR[unit.value]);
-    emit("update:modelValue", Math.max(props.min, rawBytes));
-  },
+const scaledBytes = computed(() => {
+  if (displayValue.value === undefined || !Number.isFinite(displayValue.value)) return null;
+  return Math.max(props.min, Math.round(displayValue.value * UNIT_FACTOR[unit.value]));
 });
 
-function handleUnitChange(nextUnit: UnitKey) {
-  const prevFactor = UNIT_FACTOR[unit.value];
-  const currentNum = props.modelValue / prevFactor;
-  unit.value = nextUnit;
-  const nextBytes = Math.round(currentNum * UNIT_FACTOR[nextUnit]);
-  emit("update:modelValue", Math.max(props.min, nextBytes));
+function emitValue() {
+  if (props.allowEmpty && displayValue.value === undefined) {
+    emit("update:modelValue", null);
+    return;
+  }
+  emit("update:modelValue", scaledBytes.value ?? props.min);
+}
+
+function onUnitChange() {
+  if (props.modelValue !== null) {
+    displayValue.value = Number((props.modelValue / UNIT_FACTOR[unit.value]).toFixed(2));
+  }
+  emitValue();
 }
 </script>
 
 <template>
-  <div class="inline-flex items-center gap-1.5">
-    <el-input-number
-      v-model="displayValue"
-      :min="0"
-      :precision="unit === 'B' ? 0 : 2"
-      :step="1"
-      :disabled="disabled"
-      size="small"
-      controls-position="right"
-      style="width: 118px"
-    />
-    <el-select
-      :model-value="unit"
-      size="small"
-      :disabled="disabled"
-      style="width: 72px"
-      @change="handleUnitChange"
-    >
-      <el-option label="B" value="B" />
-      <el-option label="KB" value="KB" />
-      <el-option label="MB" value="MB" />
-      <el-option label="GB" value="GB" />
-      <el-option label="TB" value="TB" />
-    </el-select>
+  <div class="flex items-center gap-1.5">
+    <div class="flex-1 min-w-[96px]">
+      <ObsNumberInput
+        v-model="displayValue"
+        :min="0"
+        :step="unit === 'B' ? 512 : 1"
+        :allow-empty="allowEmpty"
+        :placeholder="placeholder"
+        @change="emitValue"
+      />
+    </div>
+    <div class="w-20 shrink-0">
+      <ObsSelect
+        v-model="unit"
+        :options="UNIT_OPTIONS"
+        mono
+        trigger-class="text-xs py-1.5"
+        @change="onUnitChange"
+      />
+    </div>
   </div>
 </template>

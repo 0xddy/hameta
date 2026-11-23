@@ -71,14 +71,19 @@ export interface FilterGates {
 
 export interface CleanerOptions {
   enable_nfkc: boolean;
+  enable_confusable_norm: boolean;
   enable_deobfuscate_brackets: boolean;
   enable_collapse_spaced_chars: boolean;
   enable_strip_leading_site_prefix: boolean;
   enable_strip_urls_and_domains: boolean;
   enable_ad_regexes: boolean;
   enable_ad_phrases: boolean;
+  enable_span_ad_scoring: boolean;
+  span_ad_threshold: number;
+  enable_filename_cross_clean: boolean;
   enable_cleanup: boolean;
   reject_if_empty_after_clean: boolean;
+  min_refined_name_length: ToggleUsize;
 }
 
 export type RuleMatcher =
@@ -310,6 +315,21 @@ export interface IndexerStatBrief {
   total_rejected: number;
 }
 
+export interface DiscoveredAdCandidate {
+  phrase: string;
+  occurrences: number;
+  distinct_titles: number;
+  suggested_score: number;
+  sample_titles: string[];
+  last_seen_unix: number;
+}
+
+export interface DiscoverCandidatesResponse {
+  source: string;
+  scanned_titles: number;
+  candidates: DiscoveredAdCandidate[];
+}
+
 export interface FilterStatsResponse {
   total_evaluated: number;
   total_accepted: number;
@@ -317,6 +337,7 @@ export interface FilterStatsResponse {
   rule_hits: RuleHitStat[];
   recent_rejected: WorkerRejectedSampleDto[];
   workers: IndexerStatBrief[];
+  discovered_ad_candidates?: DiscoveredAdCandidate[];
 }
 
 export interface PlaygroundFileInfo {
@@ -336,6 +357,7 @@ export interface CleaningStep {
   before: string;
   after: string;
   changed: boolean;
+  detail?: string | null;
 }
 
 export interface CleaningTrace {
@@ -511,5 +533,12 @@ export function samplePlaygroundTorrents(payload: {
   return apiRequest<PlaygroundSampleResponse>("/api/v1/filter/playground/sample", {
     method: "POST",
     body: JSON.stringify(payload),
+  });
+}
+
+export function discoverAdCandidates(limit = 300): Promise<DiscoverCandidatesResponse> {
+  return apiRequest<DiscoverCandidatesResponse>("/api/v1/filter/discover-candidates", {
+    method: "POST",
+    body: JSON.stringify({ limit }),
   });
 }

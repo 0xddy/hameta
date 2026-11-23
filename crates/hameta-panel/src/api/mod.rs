@@ -1,6 +1,8 @@
 pub mod auth;
+pub mod console;
 pub mod error;
 pub mod filter;
+pub mod globe;
 pub mod overview;
 pub mod redis_monitor;
 pub mod settings;
@@ -18,6 +20,10 @@ pub fn api_v1_router() -> Router<Arc<PanelState>> {
     Router::new()
         // Setup Wizard
         .route("/setup/status", get(setup::setup_status_handler))
+        .route(
+            "/setup/detect-services",
+            get(setup::setup_detect_services_handler),
+        )
         .route("/setup/test-redis", post(setup::setup_test_redis_handler))
         .route(
             "/setup/test-manticore",
@@ -35,6 +41,10 @@ pub fn api_v1_router() -> Router<Arc<PanelState>> {
         .route("/auth/password", post(auth::change_password_handler))
         // Service Settings
         .route("/settings/services", get(settings::get_services_handler))
+        .route(
+            "/settings/detect-services",
+            get(settings::detect_services_handler),
+        )
         .route("/settings/redis/test", post(settings::test_redis_handler))
         .route("/settings/redis", put(settings::update_redis_handler))
         .route(
@@ -61,6 +71,26 @@ pub fn api_v1_router() -> Router<Arc<PanelState>> {
         )
         .route("/overview/history", get(overview::overview_history_handler))
         .route("/overview/stream", get(overview::overview_stream_handler))
+        // Console (SSE Ingest Stream) & Global DHT Traffic Radar
+        .route("/console/recent", get(console::console_recent_handler))
+        .route(
+            "/console/ingest-stream",
+            get(console::console_ingest_stream_handler),
+        )
+        .route("/globe/snapshot", get(globe::globe_snapshot_handler))
+        .route("/globe/stream", get(globe::globe_stream_handler))
+        .route(
+            "/settings/geoip",
+            get(settings::get_geoip_settings_handler).put(settings::update_geoip_settings_handler),
+        )
+        .route(
+            "/settings/geoip/reload",
+            post(settings::reload_geoip_settings_handler),
+        )
+        .route(
+            "/settings/geoip/download",
+            post(settings::download_geoip_mmdb_handler),
+        )
         // Workers & DHT Profiles
         .route("/dht/profiles", get(workers::get_dht_profiles_handler))
         .route("/workers", get(workers::list_workers_handler))
@@ -146,6 +176,10 @@ pub fn api_v1_router() -> Router<Arc<PanelState>> {
         )
         .route("/filter/rollback", post(filter::rollback_filter_handler))
         .route("/filter/stats", get(filter::get_filter_stats_handler))
+        .route(
+            "/filter/discover-candidates",
+            post(filter::discover_ad_candidates_handler),
+        )
         .route(
             "/filter/playground/test",
             post(filter::playground_test_handler),

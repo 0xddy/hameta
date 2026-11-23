@@ -1,6 +1,7 @@
 pub mod log_capture;
 pub mod os_guard;
 
+use crate::ingest_hub::IngestHub;
 use anyhow::{Context, Result};
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
@@ -9,9 +10,10 @@ use axum::routing::post;
 use axum::{Json, Router};
 use chrono::Utc;
 use hameta_common::{
-    CrawlerWorkerConfig, DesiredState, IndexerWorkerConfig, ManticoreServiceConfig,
-    RedisServiceConfig, ServiceKind, WorkerBootstrap, WorkerDrainStatus, WorkerReadyRequest,
-    WorkerRegisterRequest, WorkerReloadRulesRequest, WorkerReloadRulesResponse, WorkerRole,
+    CrawlerWorkerConfig, DesiredState, GeoIpConfig, IndexerWorkerConfig, ManticoreServiceConfig,
+    RedisServiceConfig, ServiceKind, WorkerBootstrap, WorkerDrainStatus, WorkerIngestEventsRequest,
+    WorkerReadyRequest, WorkerRegisterRequest, WorkerReloadGeoIpRequest,
+    WorkerReloadGeoIpResponse, WorkerReloadRulesRequest, WorkerReloadRulesResponse, WorkerRole,
     WorkerRuntimeState, WorkerShutdownRequest, WorkerSnapshotEnvelope, generate_token,
     verify_bearer_token,
 };
@@ -77,11 +79,29 @@ pub struct WorkerStatusView {
     pub snapshot: Option<WorkerSnapshotEnvelope>,
 }
 
+pub const META_GEOIP_CONFIG_KEY: &str = "geoip_config";
+
+pub async fn load_geoip_config(db: &Database) -> GeoIpConfig {
+    match db.get_meta(META_GEOIP_CONFIG_KEY).await {
+        Ok(Some(raw)) => serde_json::from_str(&raw).unwrap_or_default(),
+        _ => GeoIpConfig::default(),
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IndexerReloadResult {
     pub instance_id: String,
     pub ok: bool,
     pub active_rule_version: Option<i64>,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CrawlerGeoIpReloadResult {
+    pub instance_id: String,
+    pub ok: bool,
+    pub mmdb_loaded: bool,
+    pub error: Option<String>,
     pub message: String,
 }
 
@@ -147,11 +167,16 @@ pub struct Supervisor {
     job_guard: ChildJobGuard,
     command_factory: CommandFactory,
     workers: RwLock<HashMap<String, ManagedWorker>>,
+    ingest_hub: Arc<IngestHub>,
     ipc_shutdown: CancellationToken,
     shutting_down: AtomicBool,
 }
 
 impl Supervisor {
+    pub fn data_dir(&self) -> &std::path::Path {
+        &self.data_dir
+    }
+
     pub async fn new(db: Database, data_dir: PathBuf) -> Result<Arc<Self>> {
         Self::with_command_factory(db, data_dir, Arc::new(default_command_factory)).await
     }
@@ -184,6 +209,7 @@ impl Supervisor {
             job_guard: create_job_guard_best_effort(),
             command_factory,
             workers: RwLock::new(HashMap::new()),
+            ingest_hub: IngestHub::new(),
             ipc_shutdown: ipc_shutdown.clone(),
             shutting_down: AtomicBool::new(false),
         });
@@ -204,6 +230,10 @@ impl Supervisor {
 
     pub fn ipc_port(&self) -> u16 {
         self.panel_ipc_port
+    }
+
+    pub fn ingest_hub(&self) -> Arc<IngestHub> {
+        self.ingest_hub.clone()
     }
 
     /// 面板启动时自动同步并拉起数据库中所有 `desired_state = 'running'` 的 Worker。
@@ -678,6 +708,12 @@ impl Supervisor {
             (None, None)
         };
 
+        let geoip = if role == WorkerRole::Crawler {
+            Some(load_geoip_config(&self.db).await)
+        } else {
+            None
+        };
+
         Ok(WorkerBootstrap {
             instance_id: instance_id.to_string(),
             role,
@@ -688,6 +724,7 @@ impl Supervisor {
             manticore,
             worker_config,
             filter_bundle,
+            geoip,
         })
     }
 
@@ -917,6 +954,100 @@ impl Supervisor {
         results
     }
 
+    /// 向所有在线 `crawler` 广播 GeoIP 离线库路径与采样配置热重载。
+    pub async fn reload_all_crawlers_geoip(
+        &self,
+        config: &GeoIpConfig,
+    ) -> Vec<CrawlerGeoIpReloadResult> {
+        let targets: Vec<(String, u16, String)> = {
+            let guard = self
+                .workers
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            guard
+                .values()
+                .filter(|w| {
+                    w.role == WorkerRole::Crawler
+                        && w.runtime_state == WorkerRuntimeState::Running
+                        && w.worker_port.is_some()
+                })
+                .filter_map(|w| {
+                    w.worker_port
+                        .map(|p| (w.instance_id.clone(), p, w.ipc_token.clone()))
+                })
+                .collect()
+        };
+
+        let req = WorkerReloadGeoIpRequest {
+            config: config.clone(),
+        };
+        let mut results = Vec::with_capacity(targets.len());
+        for (instance_id, port, token) in targets {
+            let url = format!("http://127.0.0.1:{port}/internal/v1/geoip/reload");
+            match self
+                .http_client
+                .post(&url)
+                .bearer_auth(&token)
+                .json(&req)
+                .send()
+                .await
+            {
+                Ok(resp) if resp.status().is_success() => {
+                    match resp.json::<WorkerReloadGeoIpResponse>().await {
+                        Ok(parsed) => {
+                            let message = if parsed.mmdb_loaded {
+                                format!(
+                                    "已重载 MMDB（{} · {} 字节）",
+                                    parsed.database_type, parsed.mmdb_size_bytes
+                                )
+                            } else if !parsed.enabled {
+                                "GeoIP 归因已禁用".to_string()
+                            } else {
+                                parsed
+                                    .error
+                                    .clone()
+                                    .unwrap_or_else(|| "MMDB 未加载（降级模式）".to_string())
+                            };
+                            results.push(CrawlerGeoIpReloadResult {
+                                instance_id,
+                                ok: true,
+                                mmdb_loaded: parsed.mmdb_loaded,
+                                error: parsed.error,
+                                message,
+                            });
+                        }
+                        Err(err) => results.push(CrawlerGeoIpReloadResult {
+                            instance_id,
+                            ok: false,
+                            mmdb_loaded: false,
+                            error: Some(err.to_string()),
+                            message: format!("解析 Crawler GeoIP 重载响应失败: {err}"),
+                        }),
+                    }
+                }
+                Ok(resp) => {
+                    let st = resp.status();
+                    let body = resp.text().await.unwrap_or_default();
+                    results.push(CrawlerGeoIpReloadResult {
+                        instance_id,
+                        ok: false,
+                        mmdb_loaded: false,
+                        error: Some(body.clone()),
+                        message: format!("Crawler 返回 HTTP {st}: {body}"),
+                    });
+                }
+                Err(err) => results.push(CrawlerGeoIpReloadResult {
+                    instance_id,
+                    ok: false,
+                    mmdb_loaded: false,
+                    error: Some(err.to_string()),
+                    message: format!("请求 Crawler GeoIP 热重载接口失败: {err}"),
+                }),
+            }
+        }
+        results
+    }
+
     async fn fetch_and_store_snapshot(&self, instance_id: &str, port: u16, token: &str) {
         let url = format!("http://127.0.0.1:{port}/internal/v1/snapshot");
         if let Ok(resp) = self.http_client.get(&url).bearer_auth(token).send().await
@@ -1084,10 +1215,11 @@ pub async fn load_published_filter_bundle(db: &Database) -> Result<FilterBundle>
     })
 }
 
-fn build_panel_ipc_router(supervisor: Arc<Supervisor>) -> Router {
+pub fn build_panel_ipc_router(supervisor: Arc<Supervisor>) -> Router {
     Router::new()
         .route("/internal/v1/register", post(register_handler))
         .route("/internal/v1/ready", post(ready_handler))
+        .route("/internal/v1/ingest-events", post(ingest_events_handler))
         .with_state(supervisor)
 }
 
@@ -1157,6 +1289,44 @@ async fn ready_handler(
         entry.active_rule_version = req.rule_version;
     }
     (StatusCode::OK, Json(json!({ "ok": true }))).into_response()
+}
+
+async fn ingest_events_handler(
+    State(sup): State<Arc<Supervisor>>,
+    headers: HeaderMap,
+    Json(req): Json<WorkerIngestEventsRequest>,
+) -> Response {
+    let auth = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok());
+
+    {
+        let guard = sup
+            .workers
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(entry) = guard.get(&req.instance_id) else {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({ "code": "NOT_FOUND", "message": "未知 Worker 实例" })),
+            )
+                .into_response();
+        };
+        if !verify_bearer_token(auth, &entry.ipc_token) {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(json!({ "code": "UNAUTHORIZED", "message": "Worker 上报令牌无效" })),
+            )
+                .into_response();
+        }
+    }
+
+    let accepted = sup.ingest_hub.publish_batch(req.events);
+    (
+        StatusCode::OK,
+        Json(json!({ "ok": true, "accepted": accepted })),
+    )
+        .into_response()
 }
 
 fn tail_summary(text: &str, max_chars: usize) -> String {

@@ -6,8 +6,9 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use chrono::Utc;
 use hameta_common::{
-    WorkerDrainStatus, WorkerReadyRequest, WorkerRegisterRequest, WorkerRole,
-    WorkerShutdownRequest, WorkerSnapshotEnvelope, verify_bearer_token,
+    GeoIpConfig, WorkerDrainStatus, WorkerReadyRequest, WorkerRegisterRequest,
+    WorkerReloadGeoIpRequest, WorkerReloadGeoIpResponse, WorkerRole, WorkerShutdownRequest,
+    WorkerSnapshotEnvelope, verify_bearer_token,
 };
 use serde_json::json;
 use std::net::SocketAddr;
@@ -17,6 +18,7 @@ use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 
 pub type SnapshotProvider = Arc<dyn Fn() -> serde_json::Value + Send + Sync>;
+pub type GeoIpReloader = Arc<dyn Fn(GeoIpConfig) -> WorkerReloadGeoIpResponse + Send + Sync>;
 
 #[derive(Clone)]
 pub struct CrawlerIpcState {
@@ -28,12 +30,14 @@ pub struct CrawlerIpcState {
     pub queued_items: Arc<dyn Fn() -> usize + Send + Sync>,
     pub in_flight_items: Arc<dyn Fn() -> usize + Send + Sync>,
     pub snapshot_provider: SnapshotProvider,
+    pub geoip_reloader: Option<GeoIpReloader>,
     pub shutdown_token: CancellationToken,
 }
 
 pub fn build_crawler_ipc_router(state: Arc<CrawlerIpcState>) -> Router {
     Router::new()
         .route("/internal/v1/snapshot", get(snapshot_handler))
+        .route("/internal/v1/geoip/reload", post(reload_geoip_handler))
         .route("/internal/v1/drain-status", get(drain_status_handler))
         .route("/internal/v1/shutdown", post(shutdown_handler))
         .with_state(state)
@@ -69,6 +73,38 @@ async fn snapshot_handler(
         payload,
     };
     (StatusCode::OK, Json(env)).into_response()
+}
+
+async fn reload_geoip_handler(
+    State(state): State<Arc<CrawlerIpcState>>,
+    headers: HeaderMap,
+    Json(req): Json<WorkerReloadGeoIpRequest>,
+) -> Response {
+    if !is_authorized(&headers, &state.ipc_token) {
+        return unauthorized_response();
+    }
+    if let Err(err) = req.config.validate() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "code": "INVALID_GEOIP_CONFIG",
+                "message": err.to_string(),
+            })),
+        )
+            .into_response();
+    }
+    let Some(ref reloader) = state.geoip_reloader else {
+        return (
+            StatusCode::NOT_IMPLEMENTED,
+            Json(json!({
+                "code": "GEOIP_UNSUPPORTED",
+                "message": "当前 Crawler 实例未挂载 GeoIP 引擎",
+            })),
+        )
+            .into_response();
+    };
+    let resp = reloader(req.config);
+    (StatusCode::OK, Json(resp)).into_response()
 }
 
 async fn drain_status_handler(
@@ -216,6 +252,15 @@ mod tests {
             queued_items: Arc::new(|| 4),
             in_flight_items: Arc::new(|| 2),
             snapshot_provider: Arc::new(|| json!({ "uptime_secs": 10 })),
+            geoip_reloader: Some(Arc::new(|cfg| WorkerReloadGeoIpResponse {
+                enabled: cfg.enabled,
+                mmdb_loaded: false,
+                mmdb_path: cfg.mmdb_path,
+                mmdb_size_bytes: 0,
+                mmdb_build_epoch: 0,
+                database_type: String::new(),
+                error: Some("missing".to_string()),
+            })),
             shutdown_token: shutdown.clone(),
         });
         let app = build_crawler_ipc_router(state.clone());
@@ -248,6 +293,30 @@ mod tests {
         let env: WorkerSnapshotEnvelope = serde_json::from_slice(&body).unwrap();
         assert_eq!(env.instance_id, "crawler-1");
         assert_eq!(env.payload["uptime_secs"], 10);
+
+        let reload = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/internal/v1/geoip/reload")
+                    .header("authorization", format!("Bearer {token}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&WorkerReloadGeoIpRequest {
+                            config: GeoIpConfig::default(),
+                        })
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(reload.status(), StatusCode::OK);
+        let r_body = to_bytes(reload.into_body(), usize::MAX).await.unwrap();
+        let r_parsed: WorkerReloadGeoIpResponse = serde_json::from_slice(&r_body).unwrap();
+        assert!(r_parsed.enabled);
+        assert!(!r_parsed.mmdb_loaded);
 
         let shut = app
             .clone()

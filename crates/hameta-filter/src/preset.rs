@@ -130,31 +130,119 @@ fn parse_dict_lines(raw: &str) -> Vec<String> {
         .collect()
 }
 
-/// 返回内建默认 `ad-phrases`（19 条中文推广短语基线）。
+const LEGACY_BUILTIN_NOTE: &str = "内置基线";
+
+/// 根据内置广告短语返回面向用户的友好备注说明。
+pub fn builtin_ad_phrase_note(phrase: &str) -> Option<&'static str> {
+    match phrase.trim() {
+        "地址发布页" | "地址发布" => Some("导航站引流词"),
+        "收藏不迷路" | "防走丢" => Some("站点收藏引导语"),
+        "更多资源访问" | "更多合集访问" | "更多资源" | "更多合集" => Some("站点引流话术"),
+        "关注公众号" => Some("公众号关注引流"),
+        "扫码观看" => Some("二维码观看引流"),
+        "薇信首发" => Some("微信谐音首发推广"),
+        "微信首发" => Some("微信首发推广"),
+        "免费观看" | "在线观看" | "免费在线观看" | "免费看片" => Some("视频站引流话术"),
+        "大神BT最新域名" | "BT最新域名" => Some("BT 站点域名推广"),
+        "大神BT最新地址" | "BT最新地址" => Some("BT 站点地址推广"),
+        "大神BT最新网址" | "BT最新网址" => Some("BT 站点网址推广"),
+        "最新地址发布页" | "永久地址发布页" | "最新域名发布页" | "最新网址发布页" => {
+            Some("防屏蔽发布页引流")
+        }
+        "最新网址" => Some("站点最新入口推广"),
+        "永久地址" | "永久域名" => Some("站点永久入口推广"),
+        "备用地址" | "备用网址" => Some("备用入口后缀"),
+        "回家地址" | "防迷路地址" => Some("防屏蔽入口推广"),
+        "高清完整版无删减" => Some("视频站推广后缀"),
+        "无水印完整版" => Some("二次封装水印词"),
+        "扫码加群" | "扫码进群" => Some("私域加群引流"),
+        "欢迎加入电报群" => Some("电报社群引流"),
+        "更多精彩资源" | "更多福利资源" => Some("资源站引流话术"),
+        _ => None,
+    }
+}
+
+/// 根据内置广告正则返回面向用户的友好备注说明。
+pub fn builtin_ad_regex_note(pattern: &str) -> Option<&'static str> {
+    match pattern.trim() {
+        r"(?i)(?:\d{4}年\d{1,2}月(?:\d{1,2}日)?\s*)?(?:大神)?BT最新(?:域名|地址|网址)" => {
+            Some("日期前缀与 BT 最新域名/地址推广")
+        }
+        r"(?i)[\[\(【]\s*(?:(?:QQ|Q|微信|VX|V信|TG|Telegram|电报)(?:群|频道|号)\s*[:：]?|(?:QQ|微信|VX|V信|Telegram|电报)\s*[:：])\s*[A-Za-z0-9_@\-]{4,24}\s*[\]\)】]" => {
+            Some("QQ / 微信 / 电报群号引流标签")
+        }
+        r"【[^【】]{0,24}(?:地址发布|最新地址|最新域名|独家首发|影视网|资源网|电影网|字幕网|论坛首发|福利群)】" => {
+            Some("中文发布站方括号推广标签")
+        }
+        r"(?i)[\[\(【]\s*(?:关注)?(?:公众号|微信号|微信|VX|TG频道)\s*[:：]\s*[^\]\)】]{1,24}\s*[\]\)】]" => {
+            Some("公众号与社交关注引导括号")
+        }
+        r"(?:第\d+备用|最新|永久|防屏蔽|防走丢)(?:地址|域名|网址)(?:发布页?)?(?:\s*[:：]\s*\S+)?" => {
+            Some("备用 / 防屏蔽跳转地址前后缀")
+        }
+        r"(?i)[\[\(【][^\]\)】]{0,16}[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,12}[^\]\)】]{0,16}[\]\)】]" => {
+            Some("括号内邮箱联系方式引流")
+        }
+        _ => None,
+    }
+}
+
+/// 将旧版本持久化数据中仍为“内置基线”的备注自动升级为友好说明（不覆盖用户自定义备注）。
+pub fn upgrade_legacy_builtin_notes(
+    ad_phrases: &mut [AdPhraseRule],
+    ad_regexes: &mut [AdRegexRule],
+) {
+    for item in ad_phrases {
+        if item.note.trim() == LEGACY_BUILTIN_NOTE {
+            item.note = builtin_ad_phrase_note(&item.phrase)
+                .unwrap_or("默认推广短语")
+                .to_string();
+        }
+    }
+    for item in ad_regexes {
+        if item.note.trim() == LEGACY_BUILTIN_NOTE {
+            item.note = builtin_ad_regex_note(&item.pattern)
+                .unwrap_or("默认推广正则")
+                .to_string();
+        }
+    }
+}
+
+/// 返回内建默认 `ad-phrases`（中文推广短语词典）。
 pub fn default_ad_phrases() -> Vec<AdPhraseRule> {
     parse_dict_lines(AD_PHRASES_RAW)
         .into_iter()
         .enumerate()
-        .map(|(idx, phrase)| AdPhraseRule {
-            id: format!("phrase-{}", idx + 1),
-            phrase,
-            enabled: true,
-            note: "内置基线".to_string(),
+        .map(|(idx, phrase)| {
+            let note = builtin_ad_phrase_note(&phrase)
+                .unwrap_or("默认推广短语")
+                .to_string();
+            AdPhraseRule {
+                id: format!("phrase-{}", idx + 1),
+                phrase,
+                enabled: true,
+                note,
+            }
         })
         .collect()
 }
 
-/// 返回内建默认 `ad-regexes`（1 条混淆推广正则基线）。
+/// 返回内建默认 `ad-regexes`（常见推广广告正则规则）。
 pub fn default_ad_regexes() -> Vec<AdRegexRule> {
     parse_dict_lines(AD_REGEXES_RAW)
         .into_iter()
         .enumerate()
-        .map(|(idx, pattern)| AdRegexRule {
-            id: format!("ad-re-{}", idx + 1),
-            pattern,
-            replacement: " ".to_string(),
-            enabled: true,
-            note: "内置基线".to_string(),
+        .map(|(idx, pattern)| {
+            let note = builtin_ad_regex_note(&pattern)
+                .unwrap_or("默认推广正则")
+                .to_string();
+            AdRegexRule {
+                id: format!("ad-re-{}", idx + 1),
+                pattern,
+                replacement: " ".to_string(),
+                enabled: true,
+                note,
+            }
         })
         .collect()
 }
@@ -177,7 +265,10 @@ pub fn default_online_filter_policy() -> FilterPolicy {
             max_total_size: ToggleU64::on(2_199_023_255_552),
             density_check: DensityGate::on(100, 102_400),
         },
-        cleaner: CleanerOptions::default(),
+        cleaner: CleanerOptions {
+            min_refined_name_length: ToggleUsize::on(2),
+            ..CleanerOptions::default()
+        },
         rules: vec![
             PolicyRule {
                 id: "kw-malware".to_string(),
@@ -407,7 +498,10 @@ fn media_focused_policy() -> FilterPolicy {
             max_total_size: ToggleU64::on(2_199_023_255_552),
             density_check: DensityGate::on(100, 204_800),
         },
-        cleaner: CleanerOptions::default(),
+        cleaner: CleanerOptions {
+            min_refined_name_length: ToggleUsize::on(2),
+            ..CleanerOptions::default()
+        },
         rules: vec![
             PolicyRule {
                 id: "ext-file-dangerous".to_string(),
@@ -863,7 +957,7 @@ pub fn builtin_preset_catalog() -> FilterPresetCatalog {
                 enabled: true,
                 action: PolicyAction::Reject,
                 tags: vec!["后缀拦截".to_string(), "标题".to_string()],
-                note: String::new(),
+                note: "拦截单文件压缩包/镜像标题（如 .zip/.rar/.7z/.iso）".to_string(),
                 matcher: RuleMatcher::ExtensionRule {
                     scope: ExtensionScope::TorrentName,
                     extensions: to_vec(ARCHIVE_EXTS),
@@ -881,7 +975,7 @@ pub fn builtin_preset_catalog() -> FilterPresetCatalog {
                 enabled: true,
                 action: PolicyAction::Reject,
                 tags: vec!["后缀拦截".to_string(), "标题".to_string()],
-                note: String::new(),
+                note: "拦截以办公文档/宏文档/电子书后缀结尾的孤立诱饵标题".to_string(),
                 matcher: RuleMatcher::ExtensionRule {
                     scope: ExtensionScope::TorrentName,
                     extensions: to_vec(DOC_EXTS),
@@ -899,7 +993,7 @@ pub fn builtin_preset_catalog() -> FilterPresetCatalog {
                 enabled: true,
                 action: PolicyAction::Reject,
                 tags: vec!["关键词拦截".to_string(), "安全防护".to_string()],
-                note: String::new(),
+                note: "拦截病毒、木马、勒索与挖矿词汇（整词边界避免误杀正常片名）".to_string(),
                 matcher: RuleMatcher::KeywordGroup {
                     target: TextTarget::RawName,
                     match_mode: KeywordMatchMode::WordBoundary,
@@ -919,7 +1013,7 @@ pub fn builtin_preset_catalog() -> FilterPresetCatalog {
                 enabled: true,
                 action: PolicyAction::Reject,
                 tags: vec!["关键词拦截".to_string()],
-                note: String::new(),
+                note: "拦截破解版、注册机、激活器与外挂类词汇".to_string(),
                 matcher: RuleMatcher::KeywordGroup {
                     target: TextTarget::RawName,
                     match_mode: KeywordMatchMode::WordBoundary,
@@ -939,7 +1033,7 @@ pub fn builtin_preset_catalog() -> FilterPresetCatalog {
                 enabled: true,
                 action: PolicyAction::Reject,
                 tags: vec!["关键词拦截".to_string()],
-                note: String::new(),
+                note: "拦截解压密码、网址发布器与安装说明类引流诱饵".to_string(),
                 matcher: RuleMatcher::KeywordGroup {
                     target: TextTarget::RawName,
                     match_mode: KeywordMatchMode::Contains,
@@ -959,7 +1053,7 @@ pub fn builtin_preset_catalog() -> FilterPresetCatalog {
                 enabled: true,
                 action: PolicyAction::Reject,
                 tags: vec!["标题特征".to_string()],
-                note: String::new(),
+                note: "拦截纯数字、哈希、UUID、URL/磁力前缀、西里尔与分卷垃圾标题".to_string(),
                 matcher: RuleMatcher::TitlePatternPreset {
                     patterns: vec![
                         TitlePatternKind::Cyrillic,
@@ -987,7 +1081,7 @@ pub fn builtin_preset_catalog() -> FilterPresetCatalog {
                 enabled: true,
                 action: PolicyAction::Reject,
                 tags: vec!["文件约束".to_string(), "影视".to_string()],
-                note: String::new(),
+                note: "至少有 1 个视频主文件 >= 50 MB，兼容原盘预告片/花絮".to_string(),
                 matcher: RuleMatcher::FileConstraint {
                     extensions: to_vec(VIDEO_EXTS),
                     extra_regexes: Vec::new(),
@@ -1010,7 +1104,7 @@ pub fn builtin_preset_catalog() -> FilterPresetCatalog {
                 enabled: true,
                 action: PolicyAction::Reject,
                 tags: vec!["整种质检".to_string()],
-                note: String::new(),
+                note: "剔除系统残留与说明/快捷方式后，至少保留 1 个 >= 1 MiB 的实质文件".to_string(),
                 matcher: RuleMatcher::SubstantiveContent {
                     junk_extensions: to_vec(SHORTCUT_JUNK_EXTS),
                     include_system_junk: true,
@@ -1031,7 +1125,7 @@ pub fn builtin_preset_catalog() -> FilterPresetCatalog {
                 enabled: true,
                 action: PolicyAction::Reject,
                 tags: vec!["整种质检".to_string()],
-                note: String::new(),
+                note: "压缩包及分卷体积累计占总大小 >= 70% 时拦截".to_string(),
                 matcher: RuleMatcher::SizeRatio {
                     extensions: to_vec(ARCHIVE_EXTS),
                     include_split_archives: true,
@@ -1113,7 +1207,7 @@ pub fn builtin_preset_catalog() -> FilterPresetCatalog {
                 enabled: true,
                 action: PolicyAction::Allow,
                 tags: vec!["白名单".to_string(), "音乐".to_string()],
-                note: String::new(),
+                note: "每首无损音频文件均 >= 10 MB 时豁免后续普通拦截规则".to_string(),
                 matcher: RuleMatcher::FileConstraint {
                     extensions: vec![
                         "flac".to_string(),
@@ -1143,7 +1237,7 @@ pub fn builtin_preset_catalog() -> FilterPresetCatalog {
                 enabled: true,
                 action: PolicyAction::Reject,
                 tags: vec!["正则".to_string()],
-                note: String::new(),
+                note: "按自定义 Rust 正则匹配清洗后标题并拦截 sample/trailer 合集".to_string(),
                 matcher: RuleMatcher::CustomRegex {
                     target: TextTarget::RefinedName,
                     match_all: false,

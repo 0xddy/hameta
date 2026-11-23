@@ -1,0 +1,60 @@
+services:
+  redis:
+    image: redis:7.4-alpine
+    container_name: hameta-redis
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "6379:6379"
+    volumes:
+      - hameta_redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  manticore:
+    image: manticoresearch/manticore:latest
+    container_name: hameta-manticore
+    ports:
+      - "9308:9308"
+      - "9306:9306"
+    volumes:
+      - hameta_manticore_data:/var/lib/manticore
+    restart: unless-stopped
+
+  hameta:
+    container_name: hameta-panel
+    build:
+      context: .
+      dockerfile: Dockerfile
+      additional_contexts:
+        dht-crawler: ../Rust磁力爬虫/dht-crawler
+    ports:
+      - "8080:8080"
+      - "12313:12313/udp"
+    environment:
+      HAMETA_BIND: 0.0.0.0:8080
+      HAMETA_DATA_DIR: /opt/hameta/data
+      RUST_LOG: info
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      MANTICORE_URL: http://manticore:9308
+    volumes:
+      - hameta_panel_data:/opt/hameta/data
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
+    depends_on:
+      redis:
+        condition: service_healthy
+      manticore:
+        condition: service_started
+    restart: unless-stopped
+
+volumes:
+  hameta_redis_data:
+  hameta_manticore_data:
+  hameta_panel_data:

@@ -1,3 +1,4 @@
+use crate::geoip::GeoTrafficSnapshot;
 use dht_crawler::{
     DhtObservabilitySnapshot, DhtRuntimeSnapshot, DhtRuntimeStats, FixedHistogramSnapshot,
     MetadataConnectionErrorsSnapshot, MetadataTimeoutStagesSnapshot,
@@ -319,6 +320,10 @@ impl From<DhtRuntimeSnapshot> for DhtRuntimeMetrics {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DhtObservabilityMetrics {
     pub udp_rx_packets: u64,
+    #[serde(default)]
+    pub udp_rx_ipv4_packets: u64,
+    #[serde(default)]
+    pub udp_rx_ipv6_packets: u64,
     pub udp_rx_bytes: u64,
     pub udp_tx_packets: u64,
     pub udp_tx_bytes: u64,
@@ -327,6 +332,12 @@ pub struct DhtObservabilityMetrics {
     pub inbound_get_peers: u64,
     pub inbound_announce_peer: u64,
     pub inbound_other: u64,
+    #[serde(default)]
+    pub inbound_response: u64,
+    #[serde(default)]
+    pub inbound_error: u64,
+    #[serde(default)]
+    pub inbound_parse_error: u64,
     pub response_normal: u64,
     pub response_fallback: u64,
     pub response_rate_limited: u64,
@@ -368,6 +379,8 @@ impl From<DhtObservabilitySnapshot> for DhtObservabilityMetrics {
     fn from(s: DhtObservabilitySnapshot) -> Self {
         Self {
             udp_rx_packets: s.udp_rx_packets,
+            udp_rx_ipv4_packets: s.udp_rx_ipv4_packets,
+            udp_rx_ipv6_packets: s.udp_rx_ipv6_packets,
             udp_rx_bytes: s.udp_rx_bytes,
             udp_tx_packets: s.udp_tx_packets,
             udp_tx_bytes: s.udp_tx_bytes,
@@ -376,6 +389,9 @@ impl From<DhtObservabilitySnapshot> for DhtObservabilityMetrics {
             inbound_get_peers: s.inbound_get_peers,
             inbound_announce_peer: s.inbound_announce_peer,
             inbound_other: s.inbound_other,
+            inbound_response: s.inbound_response,
+            inbound_error: s.inbound_error,
+            inbound_parse_error: s.inbound_parse_error,
             response_normal: s.response_normal,
             response_fallback: s.response_fallback,
             response_rate_limited: s.response_rate_limited,
@@ -428,6 +444,8 @@ pub struct CrawlerSnapshot {
     pub app: AppStatsSnapshot,
     pub dht: DhtRuntimeMetrics,
     pub observability: DhtObservabilityMetrics,
+    #[serde(default)]
+    pub geo: GeoTrafficSnapshot,
     pub yield_counters: BTreeMap<String, u64>,
     pub yield_gauges: BTreeMap<String, u64>,
 }
@@ -441,6 +459,7 @@ pub struct CrawlerSnapshotInput<'a> {
     pub redis_pool_available: usize,
     pub app_stats: &'a CrawlerAppStats,
     pub dht_stats: &'a DhtRuntimeStats,
+    pub geo_snapshot: GeoTrafficSnapshot,
 }
 
 pub fn build_crawler_snapshot(input: CrawlerSnapshotInput<'_>) -> CrawlerSnapshot {
@@ -455,6 +474,7 @@ pub fn build_crawler_snapshot(input: CrawlerSnapshotInput<'_>) -> CrawlerSnapsho
         app: input.app_stats.snapshot(),
         dht: input.dht_stats.snapshot().into(),
         observability: input.dht_stats.observability_snapshot().into(),
+        geo: input.geo_snapshot,
         yield_counters: input.dht_stats.yield_stats().snapshot(),
         yield_gauges: input.dht_stats.yield_stats().gauges_snapshot(),
     }

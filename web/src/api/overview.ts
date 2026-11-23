@@ -49,6 +49,8 @@ export interface OverviewKpi {
   total_rss_bytes: number;
   udp_rx_bps: number;
   udp_tx_bps: number;
+  udp_rx_pps?: number;
+  udp_tx_pps?: number;
   metadata_rx_bps: number;
   system_soft_nofile: number | null;
 }

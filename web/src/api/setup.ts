@@ -21,10 +21,16 @@ export interface RedisServiceConfig {
   max_message_size: number;
 }
 
+export type ManticoreAuthMode = "none" | "basic" | "bearer" | "header";
+
 export interface ManticoreServiceConfig {
   url: string;
+  auth_mode: ManticoreAuthMode;
   username: string;
   password: string;
+  bearer_token: string;
+  header_name: string;
+  header_value: string;
   table_name: string;
   request_timeout_secs: number;
   max_connections: number;
@@ -56,12 +62,40 @@ export function defaultRedisConfig(): RedisServiceConfig {
 export function defaultManticoreConfig(): ManticoreServiceConfig {
   return {
     url: "http://127.0.0.1:9308",
+    auth_mode: "none",
     username: "",
     password: "",
+    bearer_token: "",
+    header_name: "X-API-Key",
+    header_value: "",
     table_name: "torrents",
     request_timeout_secs: 10,
     max_connections: 1280,
   };
+}
+
+export function normalizeManticoreConfig(
+  raw?: Partial<ManticoreServiceConfig> | null,
+): ManticoreServiceConfig {
+  const base = defaultManticoreConfig();
+  if (!raw) return base;
+  const merged: ManticoreServiceConfig = {
+    ...base,
+    ...raw,
+    auth_mode: raw.auth_mode ?? base.auth_mode,
+    username: raw.username ?? "",
+    password: raw.password ?? "",
+    bearer_token: raw.bearer_token ?? "",
+    header_name: raw.header_name ?? "X-API-Key",
+    header_value: raw.header_value ?? "",
+    table_name: raw.table_name || "torrents",
+    request_timeout_secs: raw.request_timeout_secs ?? base.request_timeout_secs,
+    max_connections: raw.max_connections ?? base.max_connections,
+  };
+  if (merged.auth_mode === "none" && (merged.username.trim() !== "" || merged.password !== "")) {
+    merged.auth_mode = "basic";
+  }
+  return merged;
 }
 
 export interface SetupStatusResponse {
@@ -131,8 +165,43 @@ export interface SetupInitResponse {
   created_workers: string[];
 }
 
+export interface DetectedRedisService {
+  source: string;
+  label: string;
+  host: string;
+  port: number;
+  container_name: string | null;
+  container_image: string | null;
+  reachable: boolean;
+  requires_auth: boolean;
+  version: string | null;
+  latency_ms: number | null;
+}
+
+export interface DetectedManticoreService {
+  source: string;
+  label: string;
+  url: string;
+  container_name: string | null;
+  container_image: string | null;
+  reachable: boolean;
+  requires_auth: boolean;
+  has_torrents_table: boolean | null;
+  latency_ms: number | null;
+}
+
+export interface ServiceDiscoveryReport {
+  docker_available: boolean;
+  redis: DetectedRedisService[];
+  manticore: DetectedManticoreService[];
+}
+
 export function getSetupStatus(): Promise<SetupStatusResponse> {
   return apiRequest("/api/v1/setup/status");
+}
+
+export function detectSetupServices(): Promise<ServiceDiscoveryReport> {
+  return apiRequest("/api/v1/setup/detect-services");
 }
 
 export function testSetupRedis(redis: RedisServiceConfig): Promise<RedisTestReport> {

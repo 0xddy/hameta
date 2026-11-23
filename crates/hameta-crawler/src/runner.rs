@@ -1,5 +1,6 @@
 use crate::cache::MetadataCache;
 use crate::dht::build_dht_options;
+use crate::geoip::GeoIpEngine;
 use crate::ipc::{CrawlerIpcState, notify_panel_ready, notify_panel_register, start_ipc_server};
 use crate::metadata::MetadataHandler;
 use crate::redis_streams::RedisStreamsClient;
@@ -8,6 +9,7 @@ use anyhow::{Context, Result};
 use chrono::Utc;
 use dht_crawler::DHTServer;
 use hameta_common::{CrawlerWorkerConfig, WorkerBootstrap};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -93,11 +95,19 @@ pub async fn run_crawler_worker(bootstrap: WorkerBootstrap) -> Result<()> {
         .context("初始化 DHTServer 失败（请检查 UDP 端口是否被占用）")?;
     let dht_stats = dht_server.runtime_stats();
 
+    let data_dir_path = PathBuf::from(&bootstrap.data_dir);
+    let geo_cfg = bootstrap.geoip.clone().unwrap_or_default();
+    let geoip = GeoIpEngine::new(&geo_cfg, &data_dir_path);
+    let geoip_handle = geoip.spawn_worker(worker_shutdown.clone());
+
     let stats_for_snap = app_stats.clone();
     let dht_stats_for_snap = dht_stats.clone();
     let cache_for_snap = cache.clone();
     let redis_for_snap = redis_client.clone();
     let profile_for_snap = worker_cfg.crawl_profile.clone();
+    let geoip_for_snap = geoip.clone();
+    let geoip_for_reload = geoip.clone();
+    let reload_data_dir = data_dir_path.clone();
 
     let ipc_state = Arc::new(CrawlerIpcState {
         instance_id: bootstrap.instance_id.clone(),
@@ -124,9 +134,11 @@ pub async fn run_crawler_worker(bootstrap: WorkerBootstrap) -> Result<()> {
                 redis_pool_available: pool_avail,
                 app_stats: &stats_for_snap,
                 dht_stats: &dht_stats_for_snap,
+                geo_snapshot: geoip_for_snap.snapshot(),
             });
             serde_json::to_value(snap).unwrap_or_default()
         }),
+        geoip_reloader: Some(Arc::new(move |cfg| geoip_for_reload.reload(&cfg, &reload_data_dir))),
         shutdown_token: worker_shutdown.clone(),
     });
 
@@ -219,6 +231,11 @@ pub async fn run_crawler_worker(bootstrap: WorkerBootstrap) -> Result<()> {
         tracing::warn!("DHT 内核运行异常: {err}");
     });
 
+    let geoip_hook = geoip.clone();
+    dht_server.on_inbound_dht_packet(move |sample| {
+        geoip_hook.observe_packet(sample);
+    });
+
     let mut dht_handle = {
         let srv = dht_server.clone();
         tokio::spawn(async move { srv.start().await })
@@ -258,10 +275,13 @@ pub async fn run_crawler_worker(bootstrap: WorkerBootstrap) -> Result<()> {
 
     // 优雅停机与排空流程
     draining.store(true, Ordering::Relaxed);
+    worker_shutdown.cancel();
+    dht_server.clear_inbound_dht_packet_observer();
     dht_server.shutdown();
     if !dht_handle.is_finished() {
         let _ = tokio::time::timeout(Duration::from_secs(5), dht_handle).await;
     }
+    let _ = tokio::time::timeout(Duration::from_secs(1), geoip_handle).await;
 
     torrent_tx.close();
     let deadline = Duration::from_secs(graceful_timeout_secs.load(Ordering::Relaxed).clamp(1, 300));

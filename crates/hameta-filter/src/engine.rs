@@ -508,8 +508,37 @@ impl CompiledFilterEngine {
             }
         }
 
-        // 阶段 2：标题清洗
-        let refined = self.cleaner.refine(&msg.name);
+        // 阶段 2：标题清洗与后置短标题剪枝（在构造文件索引与执行策略链之前快速拦截）
+        let refined = self.cleaner.refine_with_files(&msg.name, &msg.files);
+
+        if self.cleaner_options.reject_if_empty_after_clean && refined.is_empty() {
+            return rejected(
+                Some(String::new()),
+                FilterCategory::EmptyRefinedName,
+                "cleaner:empty_refined_name",
+                "清洗后有效标题为空",
+                "标题经清洗剥离站点广告与域名后无剩余有效内容",
+            );
+        }
+
+        if self.cleaner_options.min_refined_name_length.enabled
+            && self.cleaner_options.min_refined_name_length.value > 0
+            && !refined.is_empty()
+        {
+            let refined_len = refined.chars().count();
+            if refined_len < self.cleaner_options.min_refined_name_length.value {
+                return rejected(
+                    Some(refined),
+                    FilterCategory::TitleLength,
+                    "cleaner:min_refined_name_length",
+                    "清洗后最小标题长度限制",
+                    format!(
+                        "清洗后标题字符数 {refined_len} 小于最小限制 {}",
+                        self.cleaner_options.min_refined_name_length.value
+                    ),
+                );
+            }
+        }
 
         // 阶段 3：单遍预索引文件列表 + 按优先级执行 Allow / Reject 规则链
         let mut allowed_by: Option<RuleHit> = None;
@@ -538,16 +567,6 @@ impl CompiledFilterEngine {
                     }
                 }
             }
-        }
-
-        if self.cleaner_options.reject_if_empty_after_clean && refined.is_empty() {
-            return rejected(
-                Some(String::new()),
-                FilterCategory::EmptyRefinedName,
-                "cleaner:empty_refined_name",
-                "清洗后有效标题为空",
-                "标题经清洗剥离站点广告与域名后无剩余有效内容",
-            );
         }
 
         FilterOutcome::Accepted {

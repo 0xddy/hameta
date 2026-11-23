@@ -384,6 +384,7 @@ async fn service_settings_echo_all_fields_rollback_and_restart_affected_workers(
     .await;
     assert_eq!(st, StatusCode::OK);
     assert_eq!(svc_body["redis"]["config"]["password"], "redis_demo_pw_1");
+    assert_eq!(svc_body["manticore"]["config"]["auth_mode"], "basic");
     assert_eq!(svc_body["manticore"]["config"]["username"], "mc_user");
     assert_eq!(svc_body["manticore"]["config"]["password"], "mc_demo_pw_1");
 
@@ -544,6 +545,171 @@ async fn service_settings_echo_all_fields_rollback_and_restart_affected_workers(
     for a in &audits {
         assert!(!a.detail_json.contains("redis_demo_pw"));
         assert!(!a.detail_json.contains("mc_demo_pw"));
+    }
+
+    state.supervisor.shutdown_all().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn manticore_reverse_proxy_auth_modes_settings_and_audit() {
+    let (app, state, dir) = make_app(false).await;
+
+    let init_manticore = ManticoreServiceConfig {
+        url: "https://proxy.example.com/manticore".to_string(),
+        username: "legacy_user".to_string(),
+        password: "legacy_secret_pw".to_string(),
+        ..ManticoreServiceConfig::default()
+    };
+
+    let (st, _, cookie_opt) = send_json(
+        &app,
+        "POST",
+        "/api/v1/setup/init",
+        None,
+        Some(json!({
+            "admin_username": "ops",
+            "admin_password": "ops_password_123",
+            "redis": RedisServiceConfig::default(),
+            "manticore": init_manticore,
+            "create_default_workers": false
+        })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let cookie = cookie_opt.unwrap();
+
+    // 旧版仅填 username/password 应自动归一化为 basic
+    let (st, svc_body, _) = send_json(
+        &app,
+        "GET",
+        "/api/v1/settings/services",
+        Some(&cookie),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(svc_body["manticore"]["config"]["auth_mode"], "basic");
+    assert_eq!(svc_body["manticore"]["config"]["username"], "legacy_user");
+
+    // 切换为 Bearer Token 鉴权（含 Nginx Bearer 令牌）
+    let (st, upd_bearer, _) = send_json(
+        &app,
+        "PUT",
+        "/api/v1/settings/manticore",
+        Some(&cookie),
+        Some(json!({
+            "config": {
+                "url": "https://proxy.example.com/manticore",
+                "auth_mode": "bearer",
+                "bearer_token": "tok_secret_live_1",
+                "table_name": "torrents",
+                "request_timeout_secs": 10,
+                "max_connections": 1280
+            },
+            "note": "Nginx Bearer 反向代理"
+        })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(upd_bearer["config"]["auth_mode"], "bearer");
+    assert_eq!(
+        upd_bearer["config"]["bearer_token"],
+        "tok_secret_live_1"
+    );
+
+    // 切换为自定义请求头 API Key（如 X-API-Key）
+    let (st, upd_hdr, _) = send_json(
+        &app,
+        "PUT",
+        "/api/v1/settings/manticore",
+        Some(&cookie),
+        Some(json!({
+            "config": {
+                "url": "https://proxy.example.com/manticore",
+                "auth_mode": "header",
+                "header_name": "X-API-Key",
+                "header_value": "hdr_secret_value_2",
+                "table_name": "torrents",
+                "request_timeout_secs": 10,
+                "max_connections": 1280
+            },
+            "note": "Nginx Header 反向代理"
+        })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(upd_hdr["config"]["auth_mode"], "header");
+    assert_eq!(upd_hdr["config"]["header_name"], "X-API-Key");
+    assert_eq!(upd_hdr["config"]["header_value"], "hdr_secret_value_2");
+
+    let (st, svc_after, _) = send_json(
+        &app,
+        "GET",
+        "/api/v1/settings/services",
+        Some(&cookie),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(svc_after["manticore"]["config"]["auth_mode"], "header");
+    assert_eq!(svc_after["manticore"]["config"]["header_name"], "X-API-Key");
+    assert_eq!(
+        svc_after["manticore"]["config"]["header_value"],
+        "hdr_secret_value_2"
+    );
+
+    // 拒绝空 Bearer Token 与非法 Header 名
+    let (st, _, _) = send_json(
+        &app,
+        "PUT",
+        "/api/v1/settings/manticore",
+        Some(&cookie),
+        Some(json!({
+            "config": {
+                "url": "https://proxy.example.com/manticore",
+                "auth_mode": "bearer",
+                "bearer_token": "   "
+            }
+        })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+
+    let (st, _, _) = send_json(
+        &app,
+        "PUT",
+        "/api/v1/settings/manticore",
+        Some(&cookie),
+        Some(json!({
+            "config": {
+                "url": "https://proxy.example.com/manticore",
+                "auth_mode": "header",
+                "header_name": "Bad Header",
+                "header_value": "v"
+            }
+        })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+
+    // 验证审计日志包含 auth_mode / header_name 且绝不泄露任何密钥明文
+    let audits = state.db.list_audits(20).await.unwrap();
+    let update_audits: Vec<&str> = audits
+        .iter()
+        .filter(|a| a.action == "settings.manticore.update")
+        .map(|a| a.detail_json.as_str())
+        .collect();
+    assert!(update_audits.iter().any(|d| d.contains("\"bearer\"")));
+    assert!(
+        update_audits
+            .iter()
+            .any(|d| d.contains("\"header\"") && d.contains("X-API-Key"))
+    );
+    for a in &audits {
+        assert!(!a.detail_json.contains("legacy_secret_pw"));
+        assert!(!a.detail_json.contains("tok_secret_live_1"));
+        assert!(!a.detail_json.contains("hdr_secret_value_2"));
     }
 
     state.supervisor.shutdown_all().await;

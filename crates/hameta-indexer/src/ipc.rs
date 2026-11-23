@@ -6,17 +6,152 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use chrono::Utc;
 use hameta_common::{
-    WorkerDrainStatus, WorkerReadyRequest, WorkerRegisterRequest, WorkerReloadRulesRequest,
-    WorkerReloadRulesResponse, WorkerRole, WorkerShutdownRequest, WorkerSnapshotEnvelope,
-    verify_bearer_token,
+    IngestEventItem, WorkerDrainStatus, WorkerIngestEventsRequest, WorkerReadyRequest,
+    WorkerRegisterRequest, WorkerReloadRulesRequest, WorkerReloadRulesResponse, WorkerRole,
+    WorkerShutdownRequest, WorkerSnapshotEnvelope, verify_bearer_token,
 };
 use hameta_filter::{FilterBundle, FilterRuntime};
 use serde_json::json;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::Duration;
 use tokio::net::TcpListener;
+use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
+
+/// 非阻塞批量入库事件上报器：将 Manticore 写库成功记录通过有界通道异步推送给 Panel SSE Hub。
+#[derive(Clone, Default)]
+pub struct IngestEventReporter {
+    tx: Option<mpsc::Sender<IngestEventItem>>,
+}
+
+impl IngestEventReporter {
+    pub fn disabled() -> Self {
+        Self { tx: None }
+    }
+
+    pub fn try_emit(&self, item: IngestEventItem) {
+        if let Some(ref tx) = self.tx {
+            let _ = tx.try_send(item);
+        }
+    }
+
+    pub fn spawn(
+        panel_ipc_port: u16,
+        ipc_token: &str,
+        instance_id: &str,
+        shutdown: CancellationToken,
+    ) -> (Self, tokio::task::JoinHandle<()>) {
+        Self::spawn_to_url(
+            if panel_ipc_port == 0 || ipc_token.is_empty() {
+                None
+            } else {
+                Some(format!(
+                    "http://127.0.0.1:{panel_ipc_port}/internal/v1/ingest-events"
+                ))
+            },
+            ipc_token,
+            instance_id,
+            shutdown,
+        )
+    }
+
+    fn spawn_to_url(
+        url_opt: Option<String>,
+        ipc_token: &str,
+        instance_id: &str,
+        shutdown: CancellationToken,
+    ) -> (Self, tokio::task::JoinHandle<()>) {
+        let Some(url) = url_opt else {
+            return (Self::disabled(), tokio::spawn(async {}));
+        };
+        let token = ipc_token.to_string();
+        let inst_id = instance_id.to_string();
+        let (tx, mut rx) = mpsc::channel::<IngestEventItem>(2_048);
+
+        let handle = tokio::spawn(async move {
+            let Ok(client) = reqwest::Client::builder()
+                .timeout(Duration::from_secs(2))
+                .connect_timeout(Duration::from_secs(1))
+                .build()
+            else {
+                tracing::warn!("初始化 IngestEventReporter HTTP 客户端失败");
+                return;
+            };
+
+            let mut buffer = Vec::<IngestEventItem>::with_capacity(64);
+            let mut flush_tick = tokio::time::interval(Duration::from_millis(200));
+            flush_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+            loop {
+                tokio::select! {
+                    _ = shutdown.cancelled() => {
+                        while let Ok(item) = rx.try_recv() {
+                            buffer.push(item);
+                            if buffer.len() >= 64 {
+                                post_ingest_batch(&client, &url, &token, &inst_id, &mut buffer).await;
+                            }
+                        }
+                        if !buffer.is_empty() {
+                            post_ingest_batch(&client, &url, &token, &inst_id, &mut buffer).await;
+                        }
+                        break;
+                    }
+                    maybe_item = rx.recv() => {
+                        match maybe_item {
+                            Some(item) => {
+                                buffer.push(item);
+                                while buffer.len() < 64 {
+                                    match rx.try_recv() {
+                                        Ok(more) => buffer.push(more),
+                                        Err(_) => break,
+                                    }
+                                }
+                                if buffer.len() >= 64 {
+                                    post_ingest_batch(&client, &url, &token, &inst_id, &mut buffer).await;
+                                }
+                            }
+                            None => {
+                                if !buffer.is_empty() {
+                                    post_ingest_batch(&client, &url, &token, &inst_id, &mut buffer).await;
+                                }
+                                break;
+                            }
+                        }
+                    }
+                    _ = flush_tick.tick() => {
+                        if !buffer.is_empty() {
+                            post_ingest_batch(&client, &url, &token, &inst_id, &mut buffer).await;
+                        }
+                    }
+                }
+            }
+        });
+
+        (Self { tx: Some(tx) }, handle)
+    }
+}
+
+async fn post_ingest_batch(
+    client: &reqwest::Client,
+    url: &str,
+    ipc_token: &str,
+    instance_id: &str,
+    buffer: &mut Vec<IngestEventItem>,
+) {
+    if buffer.is_empty() {
+        return;
+    }
+    let events = std::mem::take(buffer);
+    let req = WorkerIngestEventsRequest {
+        instance_id: instance_id.to_string(),
+        events,
+    };
+    if let Err(err) = client.post(url).bearer_auth(ipc_token).json(&req).send().await {
+        tracing::debug!("上报入库事件批次到 Panel 失败: {err}");
+    }
+}
 
 pub type SnapshotProvider = Arc<dyn Fn() -> serde_json::Value + Send + Sync>;
 
@@ -247,8 +382,6 @@ pub async fn notify_panel_ready(
     Ok(())
 }
 
-use std::time::Duration;
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -354,5 +487,81 @@ mod tests {
         let parsed: WorkerReloadRulesResponse = serde_json::from_slice(&body).unwrap();
         assert_eq!(parsed.active_rule_version, 2);
         assert_eq!(runtime.active_version(), 2);
+    }
+
+    #[tokio::test]
+    async fn ingest_event_reporter_batches_and_authenticates() {
+        use axum::routing::post;
+        use std::sync::Mutex;
+
+        let received: Arc<Mutex<Vec<WorkerIngestEventsRequest>>> = Arc::new(Mutex::new(Vec::new()));
+        let rec_clone = received.clone();
+        let expected_token = "indexer-ingest-token".to_string();
+        let tok_clone = expected_token.clone();
+
+        let mock_app = Router::new().route(
+            "/internal/v1/ingest-events",
+            post(
+                move |headers: HeaderMap, Json(req): Json<WorkerIngestEventsRequest>| {
+                    let rec = rec_clone.clone();
+                    let expected = tok_clone.clone();
+                    async move {
+                        let auth = headers
+                            .get(axum::http::header::AUTHORIZATION)
+                            .and_then(|v| v.to_str().ok());
+                        if !verify_bearer_token(auth, &expected) {
+                            return StatusCode::UNAUTHORIZED;
+                        }
+                        rec.lock().unwrap().push(req);
+                        StatusCode::OK
+                    }
+                },
+            ),
+        );
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server_shutdown = CancellationToken::new();
+        let srv_cancel = server_shutdown.clone();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, mock_app)
+                .with_graceful_shutdown(async move { srv_cancel.cancelled().await })
+                .await;
+        });
+
+        let reporter_shutdown = CancellationToken::new();
+        let (reporter, handle) = IngestEventReporter::spawn(
+            port,
+            &expected_token,
+            "indexer-1",
+            reporter_shutdown.clone(),
+        );
+        reporter.try_emit(IngestEventItem {
+            info_hash: "0123456789abcdef0123456789abcdef01234567".to_string(),
+            event_type: hameta_common::IngestEventType::Indexed,
+            worker_id: "indexer-1".to_string(),
+            manticore_id: 12345,
+            batch_id: 1,
+            raw_name: "raw".to_string(),
+            refine_name: "clean".to_string(),
+            cleaned: true,
+            total_size: 1024,
+            file_count: 1,
+            files_preview: Vec::new(),
+            hot: 1,
+            hot_delta: 1,
+            latency_ms: 8,
+            updated_at: 1_763_800_000,
+        });
+
+        reporter_shutdown.cancel();
+        handle.await.unwrap();
+        server_shutdown.cancel();
+
+        let guard = received.lock().unwrap();
+        assert_eq!(guard.len(), 1);
+        assert_eq!(guard[0].instance_id, "indexer-1");
+        assert_eq!(guard[0].events.len(), 1);
+        assert_eq!(guard[0].events[0].manticore_id, 12345);
     }
 }

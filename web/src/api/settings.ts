@@ -4,6 +4,7 @@ import type {
   ManticoreTestReport,
   RedisServiceConfig,
   RedisTestReport,
+  ServiceDiscoveryReport,
 } from "./setup";
 
 export interface AffectedWorkerItem {
@@ -68,6 +69,10 @@ export function getServicesSettings(): Promise<ServicesOverviewResponse> {
   return apiRequest("/api/v1/settings/services");
 }
 
+export function detectSettingsServices(): Promise<ServiceDiscoveryReport> {
+  return apiRequest("/api/v1/settings/detect-services");
+}
+
 export function testRedisSettings(config?: RedisServiceConfig): Promise<RedisTestReport> {
   return apiRequest("/api/v1/settings/redis/test", {
     method: "POST",
@@ -130,5 +135,123 @@ export function rollbackSettings(
   return apiRequest("/api/v1/settings/rollback", {
     method: "POST",
     body: JSON.stringify({ kind, target_version, restart_affected_workers }),
+  });
+}
+
+export const DEFAULT_GEOIP_RELEASES_URL = "https://github.com/P3TERX/GeoLite.mmdb/releases";
+export const DEFAULT_GEOIP_DOWNLOAD_URL =
+  "https://github.com/P3TERX/GeoLite.mmdb/releases/latest/download/GeoLite2-Country.mmdb";
+
+export interface GeoIpConfig {
+  enabled: boolean;
+  mmdb_path: string;
+  download_url: string;
+  home_country: string;
+  prefix_cache_slots: number;
+  adaptive_sample_threshold_pps: number;
+  sample_queue_capacity: number;
+}
+
+export function defaultGeoIpConfig(): GeoIpConfig {
+  return {
+    enabled: true,
+    mmdb_path: "GeoLite2-Country.mmdb",
+    download_url: DEFAULT_GEOIP_DOWNLOAD_URL,
+    home_country: "CN",
+    prefix_cache_slots: 65_536,
+    adaptive_sample_threshold_pps: 30_000,
+    sample_queue_capacity: 8_192,
+  };
+}
+
+export interface GeoIpInspectSummary {
+  resolved_path: string;
+  mmdb_exists: boolean;
+  mmdb_valid: boolean;
+  mmdb_size_bytes: number;
+  mmdb_build_epoch: number | null;
+  database_type: string | null;
+  node_count: number | null;
+  status_message: string;
+}
+
+export interface GeoIpSettingsResponse {
+  config: GeoIpConfig;
+  resolved_path: string;
+  mmdb_exists: boolean;
+  mmdb_valid: boolean;
+  mmdb_size_bytes: number;
+  mmdb_build_epoch: number | null;
+  database_type: string | null;
+  node_count: number | null;
+  status_message: string;
+  running_crawlers: AffectedWorkerItem[];
+}
+
+export interface CrawlerGeoIpReloadResult {
+  instance_id: string;
+  ok: boolean;
+  mmdb_loaded: boolean;
+  error: string | null;
+  message: string;
+}
+
+export interface UpdateGeoIpResponse {
+  config: GeoIpConfig;
+  inspect: GeoIpInspectSummary;
+  reload_results: CrawlerGeoIpReloadResult[];
+}
+
+export interface ReloadGeoIpResponse {
+  config: GeoIpConfig;
+  inspect: GeoIpInspectSummary;
+  reload_results: CrawlerGeoIpReloadResult[];
+}
+
+export interface DownloadGeoIpResponse {
+  config: GeoIpConfig;
+  inspect: GeoIpInspectSummary;
+  reload_results: CrawlerGeoIpReloadResult[];
+  downloaded_bytes: number;
+  duration_ms: number;
+  source_url: string;
+  release_tag: string | null;
+  previous_build_epoch: number | null;
+  changed: boolean;
+  message: string;
+}
+
+export function getGeoIpSettings(): Promise<GeoIpSettingsResponse> {
+  return apiRequest<GeoIpSettingsResponse>("/api/v1/settings/geoip");
+}
+
+export function updateGeoIpSettings(
+  config: GeoIpConfig,
+  reload_crawlers = true,
+): Promise<UpdateGeoIpResponse> {
+  return apiRequest<UpdateGeoIpResponse>("/api/v1/settings/geoip", {
+    method: "PUT",
+    body: JSON.stringify({ config, reload_crawlers }),
+  });
+}
+
+export function reloadGeoIpSettings(): Promise<ReloadGeoIpResponse> {
+  return apiRequest<ReloadGeoIpResponse>("/api/v1/settings/geoip/reload", {
+    method: "POST",
+  });
+}
+
+export function downloadGeoIpMmdb(params?: {
+  mmdb_path?: string;
+  download_url?: string;
+  reload_crawlers?: boolean;
+}): Promise<DownloadGeoIpResponse> {
+  return apiRequest<DownloadGeoIpResponse>("/api/v1/settings/geoip/download", {
+    method: "POST",
+    body: JSON.stringify({
+      mmdb_path: params?.mmdb_path,
+      download_url: params?.download_url,
+      reload_crawlers: params?.reload_crawlers ?? true,
+    }),
   });
 }

@@ -2,6 +2,7 @@ use crate::error::CommonError;
 use crate::hash::TABLE_TORRENTS;
 use crate::profiles::crawl_profile_defaults;
 use serde::{Deserialize, Serialize};
+use std::path::{Path, PathBuf};
 
 fn is_valid_log_level(level: &str) -> bool {
     matches!(
@@ -116,12 +117,85 @@ impl RedisServiceConfig {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ManticoreAuthMode {
+    #[default]
+    None,
+    Basic,
+    Bearer,
+    Header,
+}
+
+impl ManticoreAuthMode {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Basic => "basic",
+            Self::Bearer => "bearer",
+            Self::Header => "header",
+        }
+    }
+}
+
+fn is_valid_http_header_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.bytes().all(|b| {
+            b.is_ascii_alphanumeric()
+                || matches!(
+                    b,
+                    b'!' | b'#'
+                        | b'$'
+                        | b'%'
+                        | b'&'
+                        | b'\''
+                        | b'*'
+                        | b'+'
+                        | b'-'
+                        | b'.'
+                        | b'^'
+                        | b'_'
+                        | b'`'
+                        | b'|'
+                        | b'~'
+                )
+        })
+}
+
+fn is_reserved_transport_header(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "host" | "content-length" | "transfer-encoding" | "connection"
+    )
+}
+
+fn is_valid_http_header_value(val: &str) -> bool {
+    !val.is_empty() && val.bytes().all(|b| b == b'\t' || (0x20..=0x7E).contains(&b))
+}
+
+fn strip_bearer_prefix(raw: &str) -> &str {
+    let trimmed = raw.trim();
+    if trimmed
+        .as_bytes()
+        .get(..7)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(b"bearer "))
+    {
+        trimmed[7..].trim()
+    } else {
+        trimmed
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ManticoreServiceConfig {
     pub url: String,
+    pub auth_mode: ManticoreAuthMode,
     pub username: String,
     pub password: String,
+    pub bearer_token: String,
+    pub header_name: String,
+    pub header_value: String,
     /// 存量表名锁定为 `torrents`
     pub table_name: String,
     pub request_timeout_secs: u64,
@@ -132,8 +206,12 @@ impl Default for ManticoreServiceConfig {
     fn default() -> Self {
         Self {
             url: "http://127.0.0.1:9308".to_string(),
+            auth_mode: ManticoreAuthMode::None,
             username: String::new(),
             password: String::new(),
+            bearer_token: String::new(),
+            header_name: String::new(),
+            header_value: String::new(),
             table_name: TABLE_TORRENTS.to_string(),
             request_timeout_secs: 10,
             max_connections: 1280,
@@ -142,11 +220,57 @@ impl Default for ManticoreServiceConfig {
 }
 
 impl ManticoreServiceConfig {
+    /// 兼容未显式设置 `auth_mode` 的历史配置：若存在 `username`/`password` 则自动视为 `Basic`。
+    pub fn effective_auth_mode(&self) -> ManticoreAuthMode {
+        if self.auth_mode == ManticoreAuthMode::None
+            && (!self.username.trim().is_empty() || !self.password.is_empty())
+        {
+            ManticoreAuthMode::Basic
+        } else {
+            self.auth_mode
+        }
+    }
+
+    /// 返回归一化 `auth_mode` 后的配置副本。
+    pub fn normalized(&self) -> Self {
+        let mut cloned = self.clone();
+        cloned.auth_mode = self.effective_auth_mode();
+        cloned
+    }
+
+    pub fn has_auth(&self) -> bool {
+        self.effective_auth_mode() != ManticoreAuthMode::None
+    }
+
     pub fn basic_auth(&self) -> Option<(&str, &str)> {
-        if !self.username.trim().is_empty() && !self.password.is_empty() {
+        if self.effective_auth_mode() == ManticoreAuthMode::Basic
+            && !self.username.trim().is_empty()
+            && !self.password.is_empty()
+        {
             Some((self.username.trim(), self.password.as_str()))
         } else {
             None
+        }
+    }
+
+    pub fn bearer_token(&self) -> Option<&str> {
+        if self.effective_auth_mode() != ManticoreAuthMode::Bearer {
+            return None;
+        }
+        let token = strip_bearer_prefix(&self.bearer_token);
+        if token.is_empty() { None } else { Some(token) }
+    }
+
+    pub fn custom_header_auth(&self) -> Option<(&str, &str)> {
+        if self.effective_auth_mode() != ManticoreAuthMode::Header {
+            return None;
+        }
+        let name = self.header_name.trim();
+        let val = self.header_value.trim();
+        if name.is_empty() || val.is_empty() {
+            None
+        } else {
+            Some((name, val))
         }
     }
 
@@ -157,12 +281,62 @@ impl ManticoreServiceConfig {
                 "Manticore URL 必须以 http:// 或 https:// 开头".to_string(),
             ));
         }
-        let has_user = !self.username.trim().is_empty();
-        let has_pass = !self.password.is_empty();
-        if has_user ^ has_pass {
-            return Err(CommonError::InvalidConfig(
-                "Manticore HTTP Basic Auth 用户名和密码必须同时填写或同时留空".to_string(),
-            ));
+        match self.effective_auth_mode() {
+            ManticoreAuthMode::None => {}
+            ManticoreAuthMode::Basic => {
+                let user = self.username.trim();
+                if user.is_empty() || self.password.is_empty() {
+                    return Err(CommonError::InvalidConfig(
+                        "Manticore HTTP Basic Auth 用户名和密码必须同时填写".to_string(),
+                    ));
+                }
+                if user.contains(':') {
+                    return Err(CommonError::InvalidConfig(
+                        "Manticore HTTP Basic Auth 用户名不能包含冒号 ':'".to_string(),
+                    ));
+                }
+                if self.username.contains(['\r', '\n']) || self.password.contains(['\r', '\n']) {
+                    return Err(CommonError::InvalidConfig(
+                        "Manticore HTTP Basic Auth 凭据不能包含换行符".to_string(),
+                    ));
+                }
+            }
+            ManticoreAuthMode::Bearer => {
+                let Some(token) = self.bearer_token() else {
+                    return Err(CommonError::InvalidConfig(
+                        "已选择 Bearer Token 鉴权，请填写有效的 Token".to_string(),
+                    ));
+                };
+                if !is_valid_http_header_value(token) {
+                    return Err(CommonError::InvalidConfig(
+                        "Manticore Bearer Token 包含非法 HTTP 请求头字符".to_string(),
+                    ));
+                }
+            }
+            ManticoreAuthMode::Header => {
+                let name = self.header_name.trim();
+                let val = self.header_value.trim();
+                if name.is_empty() || val.is_empty() {
+                    return Err(CommonError::InvalidConfig(
+                        "已选择自定义请求头鉴权，请同时填写请求头名称和值".to_string(),
+                    ));
+                }
+                if !is_valid_http_header_name(name) {
+                    return Err(CommonError::InvalidConfig(
+                        "Manticore 自定义鉴权请求头名称格式无效".to_string(),
+                    ));
+                }
+                if is_reserved_transport_header(name) {
+                    return Err(CommonError::InvalidConfig(
+                        "Manticore 自定义鉴权请求头不能覆盖 HTTP 传输保留头".to_string(),
+                    ));
+                }
+                if !is_valid_http_header_value(val) {
+                    return Err(CommonError::InvalidConfig(
+                        "Manticore 自定义鉴权请求头值包含非法字符".to_string(),
+                    ));
+                }
+            }
         }
         if self.table_name.trim() != TABLE_TORRENTS {
             return Err(CommonError::InvalidConfig(format!(
@@ -514,5 +688,110 @@ impl IndexerWorkerConfig {
             )));
         }
         Ok(())
+    }
+}
+
+/// P3TERX GeoLite.mmdb 仓库 Release 页面与直链下载地址。
+pub const DEFAULT_GEOIP_RELEASES_URL: &str = "https://github.com/P3TERX/GeoLite.mmdb/releases";
+pub const DEFAULT_GEOIP_DOWNLOAD_URL: &str =
+    "https://github.com/P3TERX/GeoLite.mmdb/releases/latest/download/GeoLite2-Country.mmdb";
+
+/// GeoLite2 离线 IP 库配置（用于 DHT 入站流量的国家维度统计与热重载）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct GeoIpConfig {
+    pub enabled: bool,
+    pub mmdb_path: String,
+    pub download_url: String,
+    pub home_country: String,
+    pub prefix_cache_slots: usize,
+    pub adaptive_sample_threshold_pps: u64,
+    pub sample_queue_capacity: usize,
+}
+
+impl Default for GeoIpConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            mmdb_path: "GeoLite2-Country.mmdb".to_string(),
+            download_url: DEFAULT_GEOIP_DOWNLOAD_URL.to_string(),
+            home_country: "CN".to_string(),
+            prefix_cache_slots: 65_536,
+            adaptive_sample_threshold_pps: 30_000,
+            sample_queue_capacity: 8_192,
+        }
+    }
+}
+
+impl GeoIpConfig {
+    pub fn validate(&self) -> Result<(), CommonError> {
+        let home = self.home_country.trim();
+        if home.len() != 2 || !home.bytes().all(|b| b.is_ascii_alphabetic()) {
+            return Err(CommonError::InvalidConfig(
+                "home_country 必须为 2 位 ISO 国家代码（例如 CN / US）".to_string(),
+            ));
+        }
+        let url = self.download_url.trim();
+        if !url.is_empty()
+            && ((!url.starts_with("https://") && !url.starts_with("http://"))
+                || url.chars().any(char::is_whitespace))
+        {
+            return Err(CommonError::InvalidConfig(
+                "download_url 必须为有效的 http:// 或 https:// 下载地址".to_string(),
+            ));
+        }
+        if !(4_096..=1_048_576).contains(&self.prefix_cache_slots) {
+            return Err(CommonError::InvalidConfig(
+                "GeoIP 前缀缓存槽位数必须在 4096 ~ 1048576 之间".to_string(),
+            ));
+        }
+        if self.adaptive_sample_threshold_pps < 1_000 {
+            return Err(CommonError::InvalidConfig(
+                "GeoIP 自适应采样触发阈值必须 >= 1000 pkt/s".to_string(),
+            ));
+        }
+        if !(512..=131_072).contains(&self.sample_queue_capacity) {
+            return Err(CommonError::InvalidConfig(
+                "GeoIP 样本队列容量必须在 512 ~ 131072 之间".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn effective_download_url(&self) -> &str {
+        let trimmed = self.download_url.trim();
+        if trimmed.is_empty() {
+            DEFAULT_GEOIP_DOWNLOAD_URL
+        } else {
+            trimmed
+        }
+    }
+
+    pub fn normalized_home_country(&self) -> String {
+        let trimmed = self.home_country.trim();
+        if trimmed.len() == 2 && trimmed.bytes().all(|b| b.is_ascii_alphabetic()) {
+            trimmed.to_ascii_uppercase()
+        } else {
+            "CN".to_string()
+        }
+    }
+
+    /// 返回收敛到 `[4096, 1_048_576]` 区间内的 2 的幂缓存槽位数。
+    pub fn normalized_prefix_cache_slots(&self) -> usize {
+        let clamped = self.prefix_cache_slots.clamp(4_096, 1_048_576);
+        clamped.next_power_of_two().min(1_048_576)
+    }
+
+    pub fn resolve_mmdb_path(&self, data_dir: &Path) -> PathBuf {
+        let trimmed = self.mmdb_path.trim();
+        if trimmed.is_empty() {
+            return data_dir.join("GeoLite2-Country.mmdb");
+        }
+        let candidate = PathBuf::from(trimmed);
+        if candidate.is_absolute() || candidate.exists() {
+            candidate
+        } else {
+            data_dir.join(candidate)
+        }
     }
 }

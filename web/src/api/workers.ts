@@ -24,7 +24,7 @@ export interface CrawlProfileDefaults {
 
 export interface CrawlProfileInfo {
   name: string;
-  level: string;
+  level: number;
   recommended_nofile: number;
   defaults: CrawlProfileDefaults;
 }

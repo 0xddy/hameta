@@ -10,16 +10,19 @@ pub mod sql_guard;
 pub use config::{
     CrawlerBootstrapConfig, CrawlerCrawlConfig, CrawlerDiscoveryConfig, CrawlerMetadataConfig,
     CrawlerPeerLookupConfig, CrawlerPoolConfig, CrawlerRateLimitConfig, CrawlerSchedulerConfig,
-    CrawlerTargetConfig, CrawlerWorkerConfig, IndexerWorkerConfig, ManticoreServiceConfig,
-    NetModeConfig, RedisServiceConfig,
+    CrawlerTargetConfig, CrawlerWorkerConfig, DEFAULT_GEOIP_DOWNLOAD_URL,
+    DEFAULT_GEOIP_RELEASES_URL, GeoIpConfig, IndexerWorkerConfig, ManticoreAuthMode,
+    ManticoreServiceConfig, NetModeConfig, RedisServiceConfig,
 };
 pub use error::CommonError;
 pub use hash::{TABLE_TORRENTS, hash_to_id, is_valid_info_hash, normalize_info_hash};
 pub use ipc::{
-    WorkerBootstrap, WorkerDrainStatus, WorkerReadyRequest, WorkerRegisterRequest,
-    WorkerReloadRulesRequest, WorkerReloadRulesResponse, WorkerShutdownRequest,
-    WorkerSnapshotEnvelope, current_process_rss_bytes, current_soft_open_file_limit,
-    parse_worker_bootstrap_str, read_worker_bootstrap, verify_bearer_token,
+    IngestEventItem, IngestEventType, WorkerBootstrap, WorkerDrainStatus,
+    WorkerIngestEventsRequest, WorkerReadyRequest, WorkerRegisterRequest, WorkerReloadGeoIpRequest,
+    WorkerReloadGeoIpResponse, WorkerReloadRulesRequest, WorkerReloadRulesResponse,
+    WorkerShutdownRequest, WorkerSnapshotEnvelope, current_process_rss_bytes,
+    current_soft_open_file_limit, parse_worker_bootstrap_str, read_worker_bootstrap,
+    verify_bearer_token,
 };
 pub use models::{
     AuditLogEntry, DesiredState, FileInfo, FilterVersionStatus, MetricsHourPoint,
@@ -282,5 +285,150 @@ mod tests {
         assert!(!verify_bearer_token(Some("Basic secret-1"), "secret-1"));
         assert!(!verify_bearer_token(None, "secret-1"));
         assert!(!verify_bearer_token(Some("Bearer "), ""));
+    }
+
+    #[test]
+    fn geoip_config_validation_and_path_resolution() {
+        let cfg = GeoIpConfig::default();
+        assert!(cfg.validate().is_ok());
+        assert_eq!(cfg.normalized_home_country(), "CN");
+        assert_eq!(cfg.normalized_prefix_cache_slots(), 65_536);
+        assert_eq!(cfg.effective_download_url(), DEFAULT_GEOIP_DOWNLOAD_URL);
+        assert!(DEFAULT_GEOIP_DOWNLOAD_URL.starts_with(DEFAULT_GEOIP_RELEASES_URL));
+
+        // 兼容未持久化 download_url 的历史配置 JSON
+        let legacy_geo: GeoIpConfig =
+            serde_json::from_str(r#"{"enabled":true,"home_country":"jp"}"#).unwrap();
+        assert_eq!(legacy_geo.normalized_home_country(), "JP");
+        assert_eq!(legacy_geo.effective_download_url(), DEFAULT_GEOIP_DOWNLOAD_URL);
+
+        let custom_url_cfg = GeoIpConfig {
+            download_url: "https://mirror.example.com/GeoLite2-Country.mmdb".to_string(),
+            ..GeoIpConfig::default()
+        };
+        assert!(custom_url_cfg.validate().is_ok());
+
+        let bad_url_cfg = GeoIpConfig {
+            download_url: "file:///etc/passwd".to_string(),
+            ..GeoIpConfig::default()
+        };
+        assert!(bad_url_cfg.validate().is_err());
+
+        let data_dir = std::path::Path::new("/tmp/hameta-data");
+        assert_eq!(
+            cfg.resolve_mmdb_path(data_dir),
+            std::path::PathBuf::from("/tmp/hameta-data/GeoLite2-Country.mmdb")
+        );
+
+        let non_pow2 = GeoIpConfig {
+            home_country: "us".to_string(),
+            prefix_cache_slots: 50_000,
+            ..GeoIpConfig::default()
+        };
+        assert_eq!(non_pow2.normalized_home_country(), "US");
+        assert_eq!(non_pow2.normalized_prefix_cache_slots(), 65_536);
+
+        let bad_country = GeoIpConfig {
+            home_country: "CHN".to_string(),
+            ..GeoIpConfig::default()
+        };
+        assert!(bad_country.validate().is_err());
+
+        let bad_threshold = GeoIpConfig {
+            adaptive_sample_threshold_pps: 100,
+            ..GeoIpConfig::default()
+        };
+        assert!(bad_threshold.validate().is_err());
+    }
+
+    #[test]
+    fn manticore_reverse_proxy_auth_modes_and_legacy_compat() {
+        // 1. 兼容旧版未带 auth_mode 的持久化 JSON（含 username/password 时自动识别为 Basic）
+        let legacy_json = r#"{
+            "url": "https://proxy.example.com/manticore",
+            "username": "ops_user",
+            "password": "ops_password"
+        }"#;
+        let legacy_cfg: ManticoreServiceConfig = serde_json::from_str(legacy_json).unwrap();
+        assert_eq!(legacy_cfg.effective_auth_mode(), ManticoreAuthMode::Basic);
+        assert!(legacy_cfg.has_auth());
+        assert_eq!(legacy_cfg.basic_auth(), Some(("ops_user", "ops_password")));
+        assert_eq!(legacy_cfg.bearer_token(), None);
+        assert_eq!(legacy_cfg.custom_header_auth(), None);
+        assert!(legacy_cfg.validate().is_ok());
+
+        let normalized = legacy_cfg.normalized();
+        assert_eq!(normalized.auth_mode, ManticoreAuthMode::Basic);
+
+        // 2. 显式 Basic Auth 校验（空字段 / 含冒号 / 含换行）
+        let empty_basic = ManticoreServiceConfig {
+            auth_mode: ManticoreAuthMode::Basic,
+            ..ManticoreServiceConfig::default()
+        };
+        assert!(empty_basic.validate().is_err());
+
+        let colon_user = ManticoreServiceConfig {
+            auth_mode: ManticoreAuthMode::Basic,
+            username: "bad:user".to_string(),
+            password: "secret".to_string(),
+            ..ManticoreServiceConfig::default()
+        };
+        assert!(colon_user.validate().is_err());
+
+        // 3. Bearer Token（自动剥离 Bearer 前缀，防多字节切片 panic，拒绝空值与换行）
+        let bearer_prefixed = ManticoreServiceConfig {
+            auth_mode: ManticoreAuthMode::Bearer,
+            username: "stale_user".to_string(),
+            password: "stale_password".to_string(),
+            bearer_token: "  Bearer   tok_live_123  ".to_string(),
+            ..ManticoreServiceConfig::default()
+        };
+        assert_eq!(bearer_prefixed.effective_auth_mode(), ManticoreAuthMode::Bearer);
+        assert_eq!(bearer_prefixed.basic_auth(), None);
+        assert_eq!(bearer_prefixed.bearer_token(), Some("tok_live_123"));
+        assert!(bearer_prefixed.validate().is_ok());
+
+        let bad_bearer_utf8 = ManticoreServiceConfig {
+            auth_mode: ManticoreAuthMode::Bearer,
+            bearer_token: "中文令牌".to_string(),
+            ..ManticoreServiceConfig::default()
+        };
+        assert!(bad_bearer_utf8.validate().is_err());
+
+        let bad_bearer_crlf = ManticoreServiceConfig {
+            auth_mode: ManticoreAuthMode::Bearer,
+            bearer_token: "tok\r\nX-Injected: 1".to_string(),
+            ..ManticoreServiceConfig::default()
+        };
+        assert!(bad_bearer_crlf.validate().is_err());
+
+        // 4. 自定义请求头 API Key（如 X-API-Key / X-Auth-Token）
+        let header_cfg = ManticoreServiceConfig {
+            auth_mode: ManticoreAuthMode::Header,
+            header_name: " X-API-Key ".to_string(),
+            header_value: " secret_key_99 ".to_string(),
+            ..ManticoreServiceConfig::default()
+        };
+        assert!(header_cfg.validate().is_ok());
+        assert_eq!(
+            header_cfg.custom_header_auth(),
+            Some(("X-API-Key", "secret_key_99"))
+        );
+
+        let bad_header_name = ManticoreServiceConfig {
+            auth_mode: ManticoreAuthMode::Header,
+            header_name: "Invalid Header".to_string(),
+            header_value: "secret".to_string(),
+            ..ManticoreServiceConfig::default()
+        };
+        assert!(bad_header_name.validate().is_err());
+
+        let reserved_header = ManticoreServiceConfig {
+            auth_mode: ManticoreAuthMode::Header,
+            header_name: "Host".to_string(),
+            header_value: "evil.internal".to_string(),
+            ..ManticoreServiceConfig::default()
+        };
+        assert!(reserved_header.validate().is_err());
     }
 }

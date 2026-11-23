@@ -1,17 +1,21 @@
 <script setup lang="ts">
 import { computed, ref, watch } from "vue";
-import { Lock, Unlock } from "lucide-vue-next";
+import { CheckCircle2, ChevronDown, Lock, Unlock, XCircle } from "lucide-vue-next";
 import type { RedisServiceConfig, RedisTestReport } from "@/api/setup";
+import ObsNumberInput from "@/components/ui/ObsNumberInput.vue";
+import { fmtCount } from "@/utils/format";
 
 const props = withDefaults(
   defineProps<{
     modelValue: RedisServiceConfig;
     testReport?: RedisTestReport | null;
     lockIndexedPrefix?: boolean;
+    compact?: boolean;
   }>(),
   {
     testReport: null,
     lockIndexedPrefix: true,
+    compact: false,
   },
 );
 
@@ -21,20 +25,20 @@ const emit = defineEmits<{
 
 const inputMode = ref<"fields" | "url">(props.modelValue.url.trim() ? "url" : "fields");
 const prefixUnlocked = ref(false);
+const advancedOpen = ref(!props.compact);
 
 watch(
   () => props.modelValue.url,
   (next) => {
     if (next.trim() && inputMode.value !== "url") {
       inputMode.value = "url";
+    } else if (!next.trim() && inputMode.value === "url") {
+      inputMode.value = "fields";
     }
   },
 );
 
-const model = computed({
-  get: () => props.modelValue,
-  set: (v) => emit("update:modelValue", v),
-});
+const model = computed(() => props.modelValue);
 
 function switchMode(next: "fields" | "url") {
   inputMode.value = next;
@@ -60,229 +64,286 @@ function updateField<K extends keyof RedisServiceConfig>(key: K, value: RedisSer
 </script>
 
 <template>
-  <div class="space-y-4">
+  <div class="space-y-4 text-xs">
     <div class="flex items-center justify-between gap-3">
-      <div class="text-sm font-medium text-slate-700">连接配置模式</div>
-      <el-radio-group
-        :model-value="inputMode"
-        size="small"
-        @update:model-value="(val: 'fields' | 'url') => switchMode(val)"
-      >
-        <el-radio-button value="fields">分段表单</el-radio-button>
-        <el-radio-button value="url">Redis URL 模式</el-radio-button>
-      </el-radio-group>
+      <span class="font-medium text-slate-400">连接方式</span>
+      <div class="inline-flex p-0.5 rounded-lg bg-[#070a11] border border-slate-800 text-[11px]">
+        <button
+          type="button"
+          class="px-3 py-1 rounded-md cursor-pointer transition"
+          :class="
+            inputMode === 'fields'
+              ? 'bg-emerald-500/20 text-emerald-300 font-semibold'
+              : 'text-slate-400 hover:text-slate-200'
+          "
+          @click="switchMode('fields')"
+        >
+          表单参数
+        </button>
+        <button
+          type="button"
+          class="px-3 py-1 rounded-md cursor-pointer transition"
+          :class="
+            inputMode === 'url'
+              ? 'bg-emerald-500/20 text-emerald-300 font-semibold'
+              : 'text-slate-400 hover:text-slate-200'
+          "
+          @click="switchMode('url')"
+        >
+          连接 URL
+        </button>
+      </div>
     </div>
 
     <template v-if="inputMode === 'url'">
-      <el-form-item label="完整连接 URL">
-        <el-input
-          :model-value="model.url"
+      <div>
+        <label class="text-slate-400 block mb-1.5">Redis URL</label>
+        <input
+          :value="model.url"
           type="password"
-          show-password
-          placeholder="redis://:password@127.0.0.1:6379/0 或 rediss://..."
-          @update:model-value="(v: string) => updateField('url', v)"
+          placeholder="redis://:password@127.0.0.1:6379/0"
+          class="obs-input w-full rounded-lg px-3 py-2 font-mono-num"
+          @input="updateField('url', ($event.target as HTMLInputElement).value)"
         />
-        <div class="mt-1 text-xs text-slate-500">
-          支持随时点击右侧眼睛图标明文查看或直接修改密码。填写显式 URL 时将优先使用该连接串。
-        </div>
-      </el-form-item>
+      </div>
     </template>
 
     <template v-else>
-      <div class="grid grid-cols-1 gap-4 md:grid-cols-3">
-        <el-form-item label="主机地址 (Host)" class="md:col-span-2">
-          <el-input
-            :model-value="model.host"
+      <div class="grid grid-cols-1 sm:grid-cols-12 gap-3">
+        <div class="sm:col-span-6">
+          <label class="text-slate-400 block mb-1.5">主机</label>
+          <input
+            :value="model.host"
+            type="text"
             placeholder="127.0.0.1"
-            @update:model-value="(v: string) => updateField('host', v)"
+            class="obs-input w-full rounded-lg px-3 py-2 font-mono-num"
+            @input="updateField('host', ($event.target as HTMLInputElement).value)"
           />
-        </el-form-item>
-        <el-form-item label="端口 (Port)">
-          <el-input-number
+        </div>
+        <div class="sm:col-span-3">
+          <label class="text-slate-400 block mb-1.5">端口</label>
+          <ObsNumberInput
             :model-value="model.port"
             :min="1"
             :max="65535"
-            class="w-full!"
-            @update:model-value="(v: number | undefined) => updateField('port', v ?? 6379)"
+            @update:model-value="(v) => updateField('port', v ?? 6379)"
           />
-        </el-form-item>
+        </div>
+        <div class="sm:col-span-3">
+          <label class="text-slate-400 block mb-1.5">DB</label>
+          <ObsNumberInput
+            :model-value="model.db"
+            :min="0"
+            :max="15"
+            @update:model-value="(v) => updateField('db', v ?? 0)"
+          />
+        </div>
       </div>
 
-      <div class="grid grid-cols-1 gap-4 md:grid-cols-4">
-        <el-form-item label="用户名 (ACL 可留空)">
-          <el-input
-            :model-value="model.username"
-            placeholder="默认空"
-            @update:model-value="(v: string) => updateField('username', v)"
-          />
-        </el-form-item>
-        <el-form-item label="连接密码 (完整回显)" class="md:col-span-2">
-          <el-input
-            :model-value="model.password"
+      <div class="grid grid-cols-1 sm:grid-cols-12 gap-3 items-end">
+        <div class="sm:col-span-5">
+          <label class="text-slate-400 block mb-1.5">密码</label>
+          <input
+            :value="model.password"
             type="password"
-            show-password
-            placeholder="无密码可留空"
-            @update:model-value="(v: string) => updateField('password', v)"
+            placeholder="无密码留空"
+            class="obs-input w-full rounded-lg px-3 py-2 font-mono-num"
+            @input="updateField('password', ($event.target as HTMLInputElement).value)"
           />
-        </el-form-item>
-        <el-form-item label="DB 索引 / TLS">
-          <div class="flex items-center gap-3 w-full">
-            <el-input-number
-              :model-value="model.db"
-              :min="0"
-              :max="15"
-              class="w-24!"
-              @update:model-value="(v: number | undefined) => updateField('db', v ?? 0)"
-            />
-            <el-switch
-              :model-value="model.tls"
-              inline-prompt
-              active-text="TLS"
-              inactive-text="TCP"
-              @update:model-value="(v: boolean) => updateField('tls', v)"
-            />
-          </div>
-        </el-form-item>
+        </div>
+        <div class="sm:col-span-4">
+          <label class="text-slate-400 block mb-1.5">用户名 (ACL)</label>
+          <input
+            :value="model.username"
+            type="text"
+            placeholder="默认空"
+            class="obs-input w-full rounded-lg px-3 py-2 font-mono-num"
+            @input="updateField('username', ($event.target as HTMLInputElement).value)"
+          />
+        </div>
+        <div class="sm:col-span-3">
+          <button
+            type="button"
+            class="w-full px-3 py-2 rounded-lg border flex items-center justify-between cursor-pointer transition"
+            :class="
+              model.tls
+                ? 'bg-emerald-500/15 text-emerald-300 border-emerald-500/35'
+                : 'bg-[#070a10] text-slate-400 border-slate-800 hover:text-slate-200'
+            "
+            @click="updateField('tls', !model.tls)"
+          >
+            <span>TLS 加密</span>
+            <span class="font-mono-num font-semibold">{{ model.tls ? "ON" : "OFF" }}</span>
+          </button>
+        </div>
       </div>
     </template>
 
-    <el-divider content-position="left">连接池与超时参数</el-divider>
+    <!-- 高级参数 -->
+    <div class="obs-inset rounded-xl overflow-hidden">
+      <button
+        type="button"
+        class="w-full flex items-center justify-between px-3.5 py-2.5 text-xs font-medium text-slate-300 hover:text-slate-100 transition cursor-pointer"
+        @click="advancedOpen = !advancedOpen"
+      >
+        <span>高级参数（连接池、超时、Streams 与存量前缀）</span>
+        <ChevronDown
+          class="h-3.5 w-3.5 text-slate-500 transition-transform"
+          :class="{ 'rotate-180': advancedOpen }"
+        />
+      </button>
 
-    <div class="grid grid-cols-2 gap-4 md:grid-cols-5">
-      <el-form-item label="Crawler 连接池">
-        <el-input-number
-          :model-value="model.crawler_pool_size"
-          :min="1"
-          :max="2048"
-          class="w-full!"
-          @update:model-value="(v: number | undefined) => updateField('crawler_pool_size', v ?? 100)"
-        />
-      </el-form-item>
-      <el-form-item label="Indexer 连接池">
-        <el-input-number
-          :model-value="model.indexer_pool_size"
-          :min="1"
-          :max="2048"
-          class="w-full!"
-          @update:model-value="(v: number | undefined) => updateField('indexer_pool_size', v ?? 128)"
-        />
-      </el-form-item>
-      <el-form-item label="建连超时 (s)">
-        <el-input-number
-          :model-value="model.conn_timeout_secs"
-          :min="1"
-          :max="60"
-          class="w-full!"
-          @update:model-value="(v: number | undefined) => updateField('conn_timeout_secs', v ?? 3)"
-        />
-      </el-form-item>
-      <el-form-item label="等待超时 (s)">
-        <el-input-number
-          :model-value="model.wait_timeout_secs"
-          :min="1"
-          :max="60"
-          class="w-full!"
-          @update:model-value="(v: number | undefined) => updateField('wait_timeout_secs', v ?? 2)"
-        />
-      </el-form-item>
-      <el-form-item label="回收超时 (s)">
-        <el-input-number
-          :model-value="model.recycle_timeout_secs"
-          :min="1"
-          :max="60"
-          class="w-full!"
-          @update:model-value="(v: number | undefined) => updateField('recycle_timeout_secs', v ?? 3)"
-        />
-      </el-form-item>
+      <div v-show="advancedOpen" class="p-4 border-t border-slate-800/80 space-y-3.5">
+        <div class="grid grid-cols-2 sm:grid-cols-5 gap-3">
+          <div>
+            <label class="text-slate-400 block mb-1.5">Crawler 池</label>
+            <ObsNumberInput
+              :model-value="model.crawler_pool_size"
+              :min="1"
+              :max="2048"
+              @update:model-value="(v) => updateField('crawler_pool_size', v ?? 100)"
+            />
+          </div>
+          <div>
+            <label class="text-slate-400 block mb-1.5">Indexer 池</label>
+            <ObsNumberInput
+              :model-value="model.indexer_pool_size"
+              :min="1"
+              :max="2048"
+              @update:model-value="(v) => updateField('indexer_pool_size', v ?? 128)"
+            />
+          </div>
+          <div>
+            <label class="text-slate-400 block mb-1.5">建连超时 (s)</label>
+            <ObsNumberInput
+              :model-value="model.conn_timeout_secs"
+              :min="1"
+              :max="60"
+              @update:model-value="(v) => updateField('conn_timeout_secs', v ?? 3)"
+            />
+          </div>
+          <div>
+            <label class="text-slate-400 block mb-1.5">等待超时 (s)</label>
+            <ObsNumberInput
+              :model-value="model.wait_timeout_secs"
+              :min="1"
+              :max="60"
+              @update:model-value="(v) => updateField('wait_timeout_secs', v ?? 2)"
+            />
+          </div>
+          <div>
+            <label class="text-slate-400 block mb-1.5">回收超时 (s)</label>
+            <ObsNumberInput
+              :model-value="model.recycle_timeout_secs"
+              :min="1"
+              :max="60"
+              @update:model-value="(v) => updateField('recycle_timeout_secs', v ?? 3)"
+            />
+          </div>
+        </div>
+
+        <div class="grid grid-cols-1 sm:grid-cols-2 gap-3 font-mono-num">
+          <div>
+            <label class="text-slate-400 font-sans block mb-1.5">存量去重键前缀</label>
+            <div class="flex items-center gap-2">
+              <input
+                :value="model.indexed_key_prefix"
+                type="text"
+                :disabled="lockIndexedPrefix && !prefixUnlocked"
+                class="obs-input w-full rounded-lg px-2.5 py-1.5"
+                @input="updateField('indexed_key_prefix', ($event.target as HTMLInputElement).value)"
+              />
+              <button
+                v-if="lockIndexedPrefix"
+                type="button"
+                class="obs-btn-ghost p-1.5 rounded-lg cursor-pointer shrink-0"
+                :class="prefixUnlocked ? 'border-amber-500/40! text-amber-300!' : ''"
+                :title="prefixUnlocked ? '点击锁定前缀' : '点击解锁修改'"
+                @click="prefixUnlocked = !prefixUnlocked"
+              >
+                <component :is="prefixUnlocked ? Unlock : Lock" class="h-3.5 w-3.5" />
+              </button>
+            </div>
+          </div>
+
+          <div>
+            <label class="text-slate-400 font-sans block mb-1.5">Consumer Group</label>
+            <input
+              :value="model.consumer_group"
+              type="text"
+              class="obs-input w-full rounded-lg px-2.5 py-1.5"
+              @input="updateField('consumer_group', ($event.target as HTMLInputElement).value)"
+            />
+          </div>
+
+          <div>
+            <label class="text-slate-400 font-sans block mb-1.5">新种子 Stream</label>
+            <input
+              :value="model.torrent_stream"
+              type="text"
+              class="obs-input w-full rounded-lg px-2.5 py-1.5"
+              @input="updateField('torrent_stream', ($event.target as HTMLInputElement).value)"
+            />
+          </div>
+
+          <div>
+            <label class="text-slate-400 font-sans block mb-1.5">热度 Stream</label>
+            <input
+              :value="model.hot_stream"
+              type="text"
+              class="obs-input w-full rounded-lg px-2.5 py-1.5"
+              @input="updateField('hot_stream', ($event.target as HTMLInputElement).value)"
+            />
+          </div>
+
+          <div>
+            <label class="text-slate-400 font-sans block mb-1.5">Stream MAXLEN</label>
+            <ObsNumberInput
+              :model-value="model.max_stream_len"
+              :min="1000"
+              :max="100000000"
+              :step="100000"
+              @update:model-value="(v) => updateField('max_stream_len', v ?? 3000000)"
+            />
+          </div>
+
+          <div>
+            <label class="text-slate-400 font-sans block mb-1.5">单条上限 (Bytes)</label>
+            <ObsNumberInput
+              :model-value="model.max_message_size"
+              :min="1024"
+              :max="67108864"
+              :step="65536"
+              @update:model-value="(v) => updateField('max_message_size', v ?? 1048576)"
+            />
+          </div>
+        </div>
+      </div>
     </div>
 
-    <el-divider content-position="left">去重键前缀与 Streams 队列配置</el-divider>
-
-    <div class="grid grid-cols-1 gap-4 md:grid-cols-2">
-      <el-form-item label="存量去重键前缀 (兼容线上已索引数据)">
-        <div class="flex items-center gap-2 w-full">
-          <el-input
-            :model-value="model.indexed_key_prefix"
-            :disabled="lockIndexedPrefix && !prefixUnlocked"
-            @update:model-value="(v: string) => updateField('indexed_key_prefix', v)"
-          />
-          <el-button
-            v-if="lockIndexedPrefix"
-            size="small"
-            :type="prefixUnlocked ? 'warning' : 'default'"
-            @click="prefixUnlocked = !prefixUnlocked"
-          >
-            <component :is="prefixUnlocked ? Unlock : Lock" class="h-3.5 w-3.5 mr-1" />
-            {{ prefixUnlocked ? "锁定" : "解锁编辑" }}
-          </el-button>
-        </div>
-        <div v-if="prefixUnlocked" class="mt-1 text-xs text-amber-600">
-          高危提示：修改前缀将导致无法命中存量 metadata:indexed:* 标记，引发存量种子重复抓取！
-        </div>
-      </el-form-item>
-
-      <el-form-item label="Consumer Group 名称">
-        <el-input
-          :model-value="model.consumer_group"
-          @update:model-value="(v: string) => updateField('consumer_group', v)"
-        />
-      </el-form-item>
-
-      <el-form-item label="新种子 Stream 键名">
-        <el-input
-          :model-value="model.torrent_stream"
-          @update:model-value="(v: string) => updateField('torrent_stream', v)"
-        />
-      </el-form-item>
-
-      <el-form-item label="热度更新 Stream 键名">
-        <el-input
-          :model-value="model.hot_stream"
-          @update:model-value="(v: string) => updateField('hot_stream', v)"
-        />
-      </el-form-item>
-
-      <el-form-item label="Stream MAXLEN ~ 裁剪上限">
-        <el-input-number
-          :model-value="model.max_stream_len"
-          :min="1000"
-          :max="100000000"
-          :step="100000"
-          class="w-full!"
-          @update:model-value="(v: number | undefined) => updateField('max_stream_len', v ?? 3000000)"
-        />
-      </el-form-item>
-
-      <el-form-item label="单条消息最大字节 (Bytes)">
-        <el-input-number
-          :model-value="model.max_message_size"
-          :min="1024"
-          :max="67108864"
-          :step="65536"
-          class="w-full!"
-          @update:model-value="(v: number | undefined) => updateField('max_message_size', v ?? 1048576)"
-        />
-      </el-form-item>
-    </div>
-
-    <el-alert
+    <!-- 检测结果 -->
+    <div
       v-if="testReport"
-      :type="testReport.ok ? 'success' : 'error'"
-      show-icon
-      :closable="false"
-      :title="testReport.message"
+      class="rounded-xl border px-3.5 py-2.5 text-xs space-y-1.5"
+      :class="
+        testReport.ok
+          ? 'border-emerald-500/30 bg-emerald-950/30 text-emerald-200'
+          : 'border-rose-500/35 bg-rose-950/35 text-rose-200'
+      "
     >
-      <template #default>
-        <div class="mt-1 flex flex-wrap gap-4 text-xs">
-          <span>延迟: {{ testReport.latency_ms }} ms</span>
-          <span v-if="testReport.redis_version">版本: v{{ testReport.redis_version }}</span>
-          <span v-if="testReport.used_memory_human">内存: {{ testReport.used_memory_human }}</span>
-          <span v-if="testReport.dbsize !== null">Keys: {{ testReport.dbsize }}</span>
-          <span>Streams: {{ testReport.streams_supported ? "支持" : "不支持" }}</span>
-          <span>XAUTOCLAIM: {{ testReport.xautoclaim_supported ? "原生" : "XPENDING 回退" }}</span>
-          <span>读写探针: {{ testReport.rw_probe_ok ? "通过" : "失败" }}</span>
-        </div>
-      </template>
-    </el-alert>
+      <div class="flex items-center gap-2 font-medium">
+        <CheckCircle2 v-if="testReport.ok" class="h-4 w-4 text-emerald-400 shrink-0" />
+        <XCircle v-else class="h-4 w-4 text-rose-400 shrink-0" />
+        <span>{{ testReport.message }}</span>
+      </div>
+      <div class="flex flex-wrap gap-4 font-mono-num text-[11px] opacity-90 pl-6">
+        <span>{{ testReport.latency_ms }}ms</span>
+        <span v-if="testReport.redis_version">v{{ testReport.redis_version }}</span>
+        <span v-if="testReport.used_memory_human">{{ testReport.used_memory_human }}</span>
+        <span v-if="testReport.dbsize !== null">{{ fmtCount(testReport.dbsize) }} keys</span>
+        <span>Streams: {{ testReport.streams_supported ? "OK" : "不支持" }}</span>
+        <span>读写探针: {{ testReport.rw_probe_ok ? "OK" : "失败" }}</span>
+      </div>
+    </div>
   </div>
 </template>

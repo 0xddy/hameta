@@ -1,16 +1,13 @@
 <script setup lang="ts">
-import { computed, nextTick, onMounted, onUnmounted, ref, watch } from "vue";
-import { useRoute, useRouter } from "vue-router";
-import * as echarts from "echarts";
+import { computed, onMounted, onUnmounted, ref, watch } from "vue";
+import { RouterLink, useRoute, useRouter } from "vue-router";
 import {
   Activity,
-  ArrowLeft,
   Cpu,
   HardDrive,
   RefreshCw,
-  Wifi,
+  Stethoscope,
 } from "lucide-vue-next";
-import { ElMessage } from "element-plus";
 import {
   getWorkerDiagnostics,
   type CrawlerSnapshot,
@@ -19,30 +16,35 @@ import {
   type WorkerDiagnosticsResponse,
 } from "@/api/diagnostics";
 import { listWorkers, type WorkerSummaryItem } from "@/api/workers";
-import type { WorkerRuntimeState } from "@/api/overview";
+import ObsHistogram, { type HistogramBarItem } from "@/components/ui/ObsHistogram.vue";
+import ObsHorizontalBars, { type HorizontalBarItem } from "@/components/ui/ObsHorizontalBars.vue";
+import ObsSelect from "@/components/ui/ObsSelect.vue";
+import {
+  fmtBytes,
+  fmtCount,
+  fmtDurMs,
+  fmtDurSecs,
+  fmtExact,
+  fmtRate,
+} from "@/utils/format";
 
 const route = useRoute();
 const router = useRouter();
 
-const loading = ref(true);
-const workers = ref<WorkerSummaryItem[]>([]);
-const selectedId = ref(String(route.params.id ?? ""));
+const workersList = ref<WorkerSummaryItem[]>([]);
+const selectedId = ref<string>("");
 const diag = ref<WorkerDiagnosticsResponse | null>(null);
-const autoRefresh = ref(true);
+const loading = ref(false);
+const loadError = ref("");
+const autoPoll = ref(true);
 let pollTimer: number | null = null;
 
-// 5 个 ECharts 实例与 DOM 引用
-const queueHistRef = ref<HTMLDivElement | null>(null);
-const fetchHistRef = ref<HTMLDivElement | null>(null);
-const sizeHistRef = ref<HTMLDivElement | null>(null);
-const timeoutStagesRef = ref<HTMLDivElement | null>(null);
-const connErrorsRef = ref<HTMLDivElement | null>(null);
-
-let queueHistChart: echarts.ECharts | null = null;
-let fetchHistChart: echarts.ECharts | null = null;
-let sizeHistChart: echarts.ECharts | null = null;
-let timeoutStagesChart: echarts.ECharts | null = null;
-let connErrorsChart: echarts.ECharts | null = null;
+const workerOptions = computed(() =>
+  workersList.value.map((w) => ({
+    value: w.id,
+    label: `${w.display_name} (${w.id}) · ${w.runtime_state}`,
+  })),
+);
 
 const crawlerSnap = computed<CrawlerSnapshot | null>(() => {
   if (!diag.value || diag.value.role !== "crawler" || !diag.value.snapshot) return null;
@@ -54,620 +56,548 @@ const indexerSnap = computed<IndexerSnapshot | null>(() => {
   return diag.value.snapshot as IndexerSnapshot;
 });
 
-const yieldCounterRows = computed(() => {
-  const c = crawlerSnap.value?.yield_counters;
+function buildHistBars(hist: HistogramMetrics | undefined, isBytes = false): HistogramBarItem[] {
+  if (!hist || !hist.bounds || hist.counts.length === 0) return [];
+  const fmtBound = (b: number) => (isBytes ? fmtBytes(b) : b >= 1000 ? `${(b / 1000).toFixed(1)}s` : `${b}ms`);
+  const bars: HistogramBarItem[] = [];
+  for (let i = 0; i < hist.counts.length; i += 1) {
+    const label = i < hist.bounds.length ? `≤${fmtBound(hist.bounds[i])}` : `>${fmtBound(hist.bounds[hist.bounds.length - 1])}`;
+    bars.push({ label, value: hist.counts[i] });
+  }
+  if (hist.overflow > 0 && hist.bounds.length > 0) {
+    bars.push({
+      label: `>${fmtBound(hist.bounds[hist.bounds.length - 1])}`,
+      value: hist.overflow,
+    });
+  }
+  return bars;
+}
+
+const queueWaitBars = computed(() => buildHistBars(crawlerSnap.value?.observability.queue_wait_ms));
+const fetchDurationBars = computed(() => buildHistBars(crawlerSnap.value?.observability.fetch_duration_ms));
+const metaSizeBars = computed(() => buildHistBars(crawlerSnap.value?.observability.metadata_size_bytes, true));
+
+const timeoutStageItems = computed<HorizontalBarItem[]>(() => {
+  const s = crawlerSnap.value?.observability.metadata_timeout_stages;
+  if (!s) return [];
+  return [
+    { label: "tcp_connect", value: s.tcp_connect },
+    { label: "connect_handshake", value: s.connect_handshake },
+    { label: "base_handshake", value: s.base_handshake },
+    { label: "ext_hs_send", value: s.extension_handshake_send },
+    { label: "ext_hs_recv", value: s.extension_handshake_receive },
+    { label: "piece_req_send", value: s.piece_request_send },
+    { label: "piece_receive", value: s.piece_receive },
+    { label: "validation", value: s.validation },
+  ];
+});
+
+const connErrorItems = computed<HorizontalBarItem[]>(() => {
+  const c = crawlerSnap.value?.observability.metadata_connection_errors;
   if (!c) return [];
-  return Object.entries(c).map(([key, value]) => ({ key, value }));
+  return [
+    { label: "refused", value: c.refused },
+    { label: "timeout", value: c.timeout },
+    { label: "reset", value: c.reset },
+    { label: "closed", value: c.closed },
+    { label: "aborted", value: c.aborted },
+    { label: "invalid_handshake", value: c.invalid_handshake },
+    { label: "info_hash_mismatch", value: c.info_hash_mismatch },
+    { label: "io_other", value: c.io_other },
+    { label: "other", value: c.other },
+  ];
 });
 
-const yieldGaugeRows = computed(() => {
-  const g = crawlerSnap.value?.yield_gauges;
-  if (!g) return [];
-  return Object.entries(g).map(([key, value]) => ({ key, value }));
-});
-
-const appStatRows = computed(() => {
-  const app = crawlerSnap.value?.app;
-  if (!app) return [];
-  return Object.entries(app).map(([key, value]) => ({ key, value }));
-});
-
-function formatBytes(bytes: number | null | undefined): string {
-  if (bytes === null || bytes === undefined || Number.isNaN(bytes)) return "-";
-  if (bytes < 1024) return `${bytes} B`;
-  const units = ["KB", "MB", "GB", "TB"];
-  let val = bytes / 1024;
-  let idx = 0;
-  while (val >= 1024 && idx < units.length - 1) {
-    val /= 1024;
-    idx += 1;
-  }
-  return `${val.toFixed(val >= 100 ? 0 : 2)} ${units[idx]}`;
-}
-
-function formatDuration(secs: number | null | undefined): string {
-  if (secs === null || secs === undefined) return "-";
-  const h = Math.floor(secs / 3600);
-  const m = Math.floor((secs % 3600) / 60);
-  const s = secs % 60;
-  if (h > 0) return `${h}h ${m}m ${s}s`;
-  if (m > 0) return `${m}m ${s}s`;
-  return `${s}s`;
-}
-
-function formatTs(ts: number | null | undefined): string {
-  if (!ts) return "-";
-  return new Date(ts * 1000).toLocaleString("zh-CN", { hour12: false });
-}
-
-function pct(used: number | undefined, max: number | undefined): number {
-  if (!used || !max || max <= 0) return 0;
-  return Math.min(100, Math.round((used / max) * 100));
-}
-
-function stateLabel(state: WorkerRuntimeState): string {
-  switch (state) {
-    case "running":
-      return "运行中";
-    case "starting":
-      return "启动中";
-    case "draining":
-      return "排空停机中";
-    case "crashed":
-      return "异常熔断";
-    default:
-      return "已停止";
-  }
-}
-
-function stateTagType(
-  state: WorkerRuntimeState,
-): "success" | "warning" | "danger" | "info" | "primary" {
-  switch (state) {
-    case "running":
-      return "success";
-    case "starting":
-      return "primary";
-    case "draining":
-      return "warning";
-    case "crashed":
-      return "danger";
-    default:
-      return "info";
-  }
-}
-
-function buildHistogramLabels(hist: HistogramMetrics, byteMode = false): string[] {
-  const labels = hist.bounds.map((b) => (byteMode ? `≤${formatBytes(b)}` : `≤${b}`));
-  if (hist.counts.length > hist.bounds.length || hist.overflow > 0) {
-    const last = hist.bounds[hist.bounds.length - 1] ?? 0;
-    labels.push(byteMode ? `>${formatBytes(last)}` : `>${last}`);
-  }
-  return labels;
-}
-
-function buildHistogramSeriesData(hist: HistogramMetrics): number[] {
-  const data = [...hist.counts];
-  if (hist.counts.length <= hist.bounds.length && hist.overflow > 0) {
-    data.push(hist.overflow);
-  }
-  return data;
-}
-
-function renderBarChart(
-  chart: echarts.ECharts,
-  labels: string[],
-  values: number[],
-  color: string,
-) {
-  chart.setOption(
+const crawlerSaturationMeters = computed(() => {
+  const s = crawlerSnap.value;
+  if (!s) return [];
+  const d = s.dht ?? {};
+  const def = diag.value?.profile_defaults;
+  const rows = [
     {
-      tooltip: { trigger: "axis" },
-      grid: { left: 45, right: 16, top: 20, bottom: 28 },
-      xAxis: {
-        type: "category",
-        data: labels,
-        axisLabel: { fontSize: 10, color: "#64748b" },
-      },
-      yAxis: {
-        type: "value",
-        splitLine: { lineStyle: { color: "#f1f5f9" } },
-        axisLabel: { fontSize: 10, color: "#64748b" },
-      },
-      series: [
-        {
-          type: "bar",
-          barMaxWidth: 32,
-          itemStyle: { color, borderRadius: [4, 4, 0, 0] },
-          data: values,
-        },
-      ],
+      label: "Metadata 队列",
+      cur: Number(d.metadata_queue_depth ?? 0),
+      max: Math.max(1, Number(d.metadata_queue_max ?? 1)),
+      cls: "bg-cyan-400",
     },
-    { notMerge: true },
-  );
-}
-
-function renderHorizontalChart(
-  chart: echarts.ECharts,
-  items: Array<{ name: string; value: number }>,
-  color: string,
-) {
-  chart.setOption(
     {
-      tooltip: { trigger: "axis" },
-      grid: { left: 140, right: 24, top: 12, bottom: 24 },
-      xAxis: {
-        type: "value",
-        splitLine: { lineStyle: { color: "#f1f5f9" } },
-        axisLabel: { fontSize: 10, color: "#64748b" },
-      },
-      yAxis: {
-        type: "category",
-        data: items.map((i) => i.name),
-        axisLabel: { fontSize: 11, color: "#475569" },
-      },
-      series: [
-        {
-          type: "bar",
-          barMaxWidth: 20,
-          itemStyle: { color, borderRadius: [0, 4, 4, 0] },
-          data: items.map((i) => i.value),
-        },
-      ],
+      label: "Metadata 并发",
+      cur: Number(d.metadata_in_flight ?? 0),
+      max: Math.max(1, Number(s.effective_metadata_workers ?? 1)),
+      cls: "bg-emerald-400",
     },
-    { notMerge: true },
-  );
-}
+    {
+      label: "find_node 在途",
+      cur: Number(d.find_node_in_flight ?? 0),
+      max: Math.max(1, Number(d.find_node_in_flight_max || def?.find_node_max_in_flight || 1)),
+      cls: "bg-amber-400",
+    },
+    {
+      label: "DHT 路由 Peer 池",
+      cur: Number(d.node_pool_size ?? 0),
+      max: Math.max(1, Number(d.node_pool_capacity || def?.pool_capacity || 1)),
+      cls: "bg-indigo-400",
+    },
+    {
+      label: "入口 Hash 队列",
+      cur: Number(d.hash_ingress_queue_depth ?? 0),
+      max: Math.max(1, Number(d.hash_ingress_queue_capacity || 1)),
+      cls: "bg-sky-400",
+    },
+  ];
+  return rows.map((m) => ({
+    ...m,
+    pct: Math.min(100, Math.round((m.cur / m.max) * 100)),
+  }));
+});
 
-function renderCrawlerCharts() {
-  const obs = crawlerSnap.value?.observability;
-  if (!obs) return;
+const dhtProtocolItems = computed<HorizontalBarItem[]>(() => {
+  const o = crawlerSnap.value?.observability;
+  if (!o) return [];
+  return [
+    { label: "inbound_get_peers", value: o.inbound_get_peers },
+    { label: "inbound_announce", value: o.inbound_announce_peer },
+    { label: "inbound_find_node", value: o.inbound_find_node },
+    { label: "inbound_ping", value: o.inbound_ping },
+    { label: "inbound_other", value: o.inbound_other },
+  ];
+});
 
-  if (queueHistRef.value && obs.queue_wait_ms) {
-    if (!queueHistChart) queueHistChart = echarts.init(queueHistRef.value);
-    renderBarChart(
-      queueHistChart,
-      buildHistogramLabels(obs.queue_wait_ms, false),
-      buildHistogramSeriesData(obs.queue_wait_ms),
-      "#6366f1",
-    );
+async function loadWorkerCatalogAndSelect() {
+  try {
+    workersList.value = await listWorkers();
+  } catch {
+    workersList.value = [];
   }
-  if (fetchHistRef.value && obs.fetch_duration_ms) {
-    if (!fetchHistChart) fetchHistChart = echarts.init(fetchHistRef.value);
-    renderBarChart(
-      fetchHistChart,
-      buildHistogramLabels(obs.fetch_duration_ms, false),
-      buildHistogramSeriesData(obs.fetch_duration_ms),
-      "#0ea5e9",
-    );
+  const paramId = typeof route.params.id === "string" ? route.params.id : "";
+  if (paramId) {
+    selectedId.value = paramId;
+    return;
   }
-  if (sizeHistRef.value && obs.metadata_size_bytes) {
-    if (!sizeHistChart) sizeHistChart = echarts.init(sizeHistRef.value);
-    renderBarChart(
-      sizeHistChart,
-      buildHistogramLabels(obs.metadata_size_bytes, true),
-      buildHistogramSeriesData(obs.metadata_size_bytes),
-      "#10b981",
-    );
-  }
-  if (timeoutStagesRef.value && obs.metadata_timeout_stages) {
-    if (!timeoutStagesChart) timeoutStagesChart = echarts.init(timeoutStagesRef.value);
-    const t = obs.metadata_timeout_stages;
-    renderHorizontalChart(
-      timeoutStagesChart,
-      [
-        { name: "tcp_connect", value: t.tcp_connect },
-        { name: "connect_handshake", value: t.connect_handshake },
-        { name: "base_handshake", value: t.base_handshake },
-        { name: "ext_send", value: t.extension_handshake_send },
-        { name: "ext_receive", value: t.extension_handshake_receive },
-        { name: "piece_request", value: t.piece_request_send },
-        { name: "piece_receive", value: t.piece_receive },
-        { name: "validation", value: t.validation },
-      ],
-      "#f59e0b",
-    );
-  }
-  if (connErrorsRef.value && obs.metadata_connection_errors) {
-    if (!connErrorsChart) connErrorsChart = echarts.init(connErrorsRef.value);
-    const e = obs.metadata_connection_errors;
-    renderHorizontalChart(
-      connErrorsChart,
-      [
-        { name: "timeout", value: e.timeout },
-        { name: "refused", value: e.refused },
-        { name: "reset", value: e.reset },
-        { name: "closed", value: e.closed },
-        { name: "invalid_handshake", value: e.invalid_handshake },
-        { name: "info_hash_mismatch", value: e.info_hash_mismatch },
-        { name: "aborted", value: e.aborted },
-        { name: "io_other", value: e.io_other },
-        { name: "other", value: e.other },
-      ],
-      "#ef4444",
-    );
+  if (!selectedId.value && workersList.value.length > 0) {
+    const runningFirst = workersList.value.find((w) => w.runtime_state === "running") ?? workersList.value[0];
+    selectedId.value = runningFirst.id;
   }
 }
 
-function disposeAllCharts() {
-  queueHistChart?.dispose();
-  fetchHistChart?.dispose();
-  sizeHistChart?.dispose();
-  timeoutStagesChart?.dispose();
-  connErrorsChart?.dispose();
-  queueHistChart = null;
-  fetchHistChart = null;
-  sizeHistChart = null;
-  timeoutStagesChart = null;
-  connErrorsChart = null;
-}
-
-function handleResize() {
-  queueHistChart?.resize();
-  fetchHistChart?.resize();
-  sizeHistChart?.resize();
-  timeoutStagesChart?.resize();
-  connErrorsChart?.resize();
-}
-
-async function fetchDiagnostics(silent = false) {
+async function fetchDiag(silent = false) {
   if (!selectedId.value) return;
   if (!silent) loading.value = true;
+  loadError.value = "";
   try {
     diag.value = await getWorkerDiagnostics(selectedId.value);
-    await nextTick();
-    renderCrawlerCharts();
-  } catch (err) {
-    if (!silent) {
-      ElMessage.error(err instanceof Error ? err.message : "加载节点诊断数据失败");
-    }
+  } catch (e) {
+    loadError.value = e instanceof Error ? e.message : "加载诊断数据失败";
   } finally {
     loading.value = false;
   }
 }
 
-function handleWorkerChange(nextId: string) {
-  disposeAllCharts();
-  void router.push(`/workers/${encodeURIComponent(nextId)}/diagnostics`);
+function onSelectWorker(nextId: string | number) {
+  const id = String(nextId);
+  selectedId.value = id;
+  if (route.path.startsWith("/workers/")) {
+    void router.push(`/workers/${encodeURIComponent(id)}/diagnostics`);
+  } else {
+    void fetchDiag();
+  }
 }
 
 watch(
   () => route.params.id,
-  (newId) => {
-    const id = String(newId ?? "");
-    if (id && id !== selectedId.value) {
-      selectedId.value = id;
-      disposeAllCharts();
-      void fetchDiagnostics();
+  (next) => {
+    if (typeof next === "string" && next) {
+      selectedId.value = next;
+      void fetchDiag();
     }
   },
 );
 
 onMounted(async () => {
-  window.addEventListener("resize", handleResize);
-  try {
-    workers.value = await listWorkers();
-  } catch {
-    workers.value = [];
-  }
-  await fetchDiagnostics();
+  await loadWorkerCatalogAndSelect();
+  if (selectedId.value) await fetchDiag();
   pollTimer = window.setInterval(() => {
-    if (autoRefresh.value) {
-      void fetchDiagnostics(true);
+    if (autoPoll.value && selectedId.value) {
+      void fetchDiag(true);
     }
   }, 3000);
 });
 
 onUnmounted(() => {
-  window.removeEventListener("resize", handleResize);
   if (pollTimer !== null) {
     window.clearInterval(pollTimer);
     pollTimer = null;
   }
-  disposeAllCharts();
 });
 </script>
 
 <template>
-  <div class="max-w-7xl mx-auto space-y-5" v-loading="loading">
-    <!-- 顶部栏 -->
-    <div class="rounded-xl border border-slate-200 bg-white px-5 py-4 shadow-sm flex flex-wrap items-center justify-between gap-3">
-      <div class="flex flex-wrap items-center gap-3">
-        <el-button size="small" @click="router.push('/workers')">
-          <ArrowLeft class="h-3.5 w-3.5 mr-1" />
-          返回节点管理
-        </el-button>
-        <el-select
+  <div class="space-y-4">
+    <!-- Top Header & Selector Bar -->
+    <div class="obs-card rounded-xl px-4 py-3 flex flex-wrap items-center justify-between gap-3">
+      <div class="flex flex-wrap items-center gap-2.5 text-xs">
+        <RouterLink to="/workers" class="obs-btn-ghost px-2.5 py-1.5 rounded-lg cursor-pointer">
+          ← 返回
+        </RouterLink>
+
+        <ObsSelect
+          v-if="workerOptions.length > 0"
           :model-value="selectedId"
-          size="small"
-          style="width: 240px"
-          @change="handleWorkerChange"
-        >
-          <el-option
-            v-for="w in workers"
-            :key="w.id"
-            :label="`${w.display_name} (${w.id})`"
-            :value="w.id"
-          />
-        </el-select>
+          :options="workerOptions"
+          mono
+          class="w-72 max-w-full"
+          trigger-class="px-3! py-1.5! text-xs!"
+          @update:model-value="onSelectWorker"
+        />
+        <span v-else class="text-xs font-mono-num text-slate-500">暂无可用 Worker 实例</span>
+
         <template v-if="diag">
-          <el-tag size="small" :type="diag.role === 'crawler' ? 'primary' : 'success'" effect="plain">
+          <span
+            class="px-2 py-0.5 rounded font-mono-num"
+            :class="diag.role === 'crawler' ? 'bg-cyan-500/15 text-cyan-300' : 'bg-emerald-500/15 text-emerald-300'"
+          >
             {{ diag.role === "crawler" ? "Crawler" : "Indexer" }}
-          </el-tag>
-          <el-tag size="small" :type="stateTagType(diag.runtime_state)">
-            {{ stateLabel(diag.runtime_state) }}
-          </el-tag>
-          <span class="text-xs font-mono text-slate-500">
-            PID: {{ diag.pid ?? "-" }} · cfg v{{ diag.active_config_version }}
-            <span v-if="diag.captured_at_unix">· 快照: {{ formatTs(diag.captured_at_unix) }}</span>
+          </span>
+          <span
+            class="px-2 py-0.5 rounded font-mono-num"
+            :class="
+              diag.runtime_state === 'running'
+                ? 'bg-emerald-500/15 text-emerald-300'
+                : diag.runtime_state === 'crashed'
+                  ? 'bg-rose-500/15 text-rose-300'
+                  : 'bg-slate-800 text-slate-400'
+            "
+          >
+            {{ diag.runtime_state === "running" ? "运行中" : diag.runtime_state }} · PID {{ diag.pid ?? "-" }}
           </span>
         </template>
       </div>
 
-      <div class="flex items-center gap-3">
-        <el-switch
-          v-model="autoRefresh"
-          size="small"
-          active-text="3s 自动刷新"
-          inactive-text="已暂停"
-        />
-        <el-button size="small" :loading="loading" @click="fetchDiagnostics()">
-          <RefreshCw class="h-3.5 w-3.5 mr-1" />
-          刷新诊断
-        </el-button>
+      <div class="flex flex-wrap items-center gap-2.5">
+        <button
+          type="button"
+          class="text-xs font-mono-num cursor-pointer transition"
+          :class="autoPoll ? 'text-cyan-400 hover:text-cyan-300' : 'text-amber-400 hover:text-amber-300'"
+          :title="autoPoll ? '点击暂停 3s 自动轮询' : '点击恢复 3s 自动轮询'"
+          @click="autoPoll = !autoPoll"
+        >
+          {{ autoPoll ? "● 3s 自动采样中" : "○ 自动采样已暂停" }}
+        </button>
+        <RouterLink
+          v-if="selectedId"
+          :to="`/workers?tune=${encodeURIComponent(selectedId)}`"
+          class="obs-btn-ghost px-2.5 py-1.5 rounded-lg text-xs text-emerald-300 cursor-pointer"
+        >
+          调优
+        </RouterLink>
+        <button
+          type="button"
+          class="obs-btn-ghost px-2.5 py-1.5 rounded-lg text-xs inline-flex items-center gap-1 cursor-pointer"
+          @click="fetchDiag()"
+        >
+          <RefreshCw class="w-3.5 h-3.5" :class="loading ? 'animate-spin text-emerald-400' : ''" />
+          刷新
+        </button>
       </div>
     </div>
 
-    <el-alert
-      v-if="diag && !diag.snapshot"
-      type="info"
-      show-icon
-      :closable="false"
-      title="当前节点尚未产生运行态快照（请确认 Worker 已处于运行中 Running 状态）。"
-    />
+    <div v-if="loadError" class="obs-card rounded-xl p-4 border-rose-500/35 text-xs text-rose-300 font-mono-num">
+      {{ loadError }}
+    </div>
 
-    <!-- Crawler 深度诊断视图 -->
-    <template v-if="crawlerSnap">
-      <!-- 关键指标卡 -->
-      <div class="grid grid-cols-2 sm:grid-cols-4 gap-4">
-        <div class="rounded-xl border border-slate-200 bg-white p-4 shadow-sm space-y-1">
-          <div class="text-xs text-slate-500">采集档位 & 运行时长</div>
-          <div class="text-lg font-bold font-mono text-slate-900">
-            {{ crawlerSnap.crawl_profile }} · {{ formatDuration(crawlerSnap.uptime_secs) }}
+    <div v-else-if="!diag" class="obs-card rounded-xl p-12 text-center text-xs text-slate-500 font-mono-num">
+      <Stethoscope class="w-8 h-8 text-slate-600 mx-auto mb-2" />
+      请选择或创建一个受管 Worker 实例以查看内核深度诊断指标
+    </div>
+
+    <div v-else-if="!diag.snapshot" class="obs-card rounded-xl p-10 text-center space-y-2">
+      <Cpu class="w-8 h-8 text-slate-600 mx-auto" />
+      <div class="text-sm font-medium text-slate-200">暂无实时 IPC 诊断快照</div>
+      <div class="text-xs text-slate-500">
+        当前进程状态为 <span class="font-mono-num text-slate-300">{{ diag.runtime_state }}</span>。如刚启动进程，请等待下一秒内核心跳上报。
+      </div>
+      <div v-if="diag.last_error" class="text-xs font-mono-num text-rose-300 pt-2">
+        {{ diag.last_error }}
+      </div>
+    </div>
+
+    <!-- CRAWLER DIAGNOSTICS -->
+    <template v-else-if="crawlerSnap">
+      <!-- 4 Top KPIs -->
+      <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
+        <div class="obs-card rounded-xl p-4 space-y-1.5 min-w-0">
+          <div class="text-xs text-slate-400">档位与运行时长</div>
+          <div class="text-lg font-semibold font-mono-num text-slate-50 truncate">
+            {{ crawlerSnap.crawl_profile }} · {{ fmtDurSecs(crawlerSnap.uptime_secs) }}
           </div>
-          <div class="text-[11px] text-slate-500 font-mono">
-            生效并发: {{ crawlerSnap.effective_metadata_workers }} · QPS上限: {{ crawlerSnap.dht.find_node_effective_rate_per_sec ?? "-" }}/s
+          <div class="text-[11px] font-mono-num text-slate-400 truncate">
+            并发 {{ fmtCount(crawlerSnap.effective_metadata_workers) }} · 探测 {{ fmtRate(crawlerSnap.dht.find_node_effective_rate_per_sec) }}/s
           </div>
         </div>
 
-        <div class="rounded-xl border border-slate-200 bg-white p-4 shadow-sm space-y-1">
-          <div class="text-xs text-slate-500">内存 RSS & 本地 Moka 缓存</div>
-          <div class="text-lg font-bold font-mono text-slate-900">
-            {{ formatBytes(crawlerSnap.rss_bytes) }}
+        <div class="obs-card rounded-xl p-4 space-y-1.5 min-w-0">
+          <div class="text-xs text-slate-400">内存 RSS &amp; 去重缓存</div>
+          <div class="text-lg font-semibold font-mono-num text-slate-50 truncate">
+            {{ fmtBytes(crawlerSnap.rss_bytes) }}
           </div>
-          <div class="text-[11px] text-slate-500 font-mono">
-            Moka 缓存条目: {{ crawlerSnap.local_cache_entries.toLocaleString("zh-CN") }}
-          </div>
-        </div>
-
-        <div class="rounded-xl border border-slate-200 bg-white p-4 shadow-sm space-y-1">
-          <div class="text-xs text-slate-500">Redis 连接池 & 推送统计</div>
-          <div class="text-lg font-bold font-mono text-slate-900">
-            {{ crawlerSnap.redis_pool_available }} / {{ crawlerSnap.redis_pool_size }} 空闲
-          </div>
-          <div class="text-[11px] text-slate-500 font-mono">
-            元数据成功: {{ crawlerSnap.app.torrents_downloaded ?? 0 }} · 推流: {{ crawlerSnap.app.torrents_pushed ?? 0 }}
+          <div
+            class="text-[11px] font-mono-num text-slate-400 truncate"
+            :title="fmtExact(crawlerSnap.local_cache_entries)"
+          >
+            本地缓存 {{ fmtCount(crawlerSnap.local_cache_entries) }}
           </div>
         </div>
 
-        <div class="rounded-xl border border-slate-200 bg-white p-4 shadow-sm space-y-1">
-          <div class="text-xs text-slate-500">UDP 收发流量与丢包</div>
-          <div class="text-lg font-bold font-mono text-slate-900">
-            RX {{ formatBytes(crawlerSnap.observability.udp_rx_bytes) }}
+        <div class="obs-card rounded-xl p-4 space-y-1.5 min-w-0">
+          <div class="text-xs text-slate-400">Redis 池与累计推流</div>
+          <div class="text-lg font-semibold font-mono-num text-slate-50 truncate">
+            {{ crawlerSnap.redis_pool_available }} / {{ crawlerSnap.redis_pool_size }}
           </div>
-          <div class="text-[11px] text-slate-500 font-mono">
-            TX {{ formatBytes(crawlerSnap.observability.udp_tx_bytes) }} · 队列满丢包 {{ crawlerSnap.dht.udp_queue_full ?? 0 }}
+          <div
+            class="text-[11px] font-mono-num text-slate-400 truncate"
+            :title="`下载 ${fmtExact(crawlerSnap.app.torrents_downloaded)} / 推流 ${fmtExact(crawlerSnap.app.torrents_pushed)}`"
+          >
+            下载 {{ fmtCount(crawlerSnap.app.torrents_downloaded) }} · 推流 {{ fmtCount(crawlerSnap.app.torrents_pushed) }}
+          </div>
+        </div>
+
+        <div class="obs-card rounded-xl p-4 space-y-1.5 min-w-0">
+          <div class="text-xs text-slate-400">UDP 累计流量与丢包</div>
+          <div class="text-lg font-semibold font-mono-num text-slate-50 truncate">
+            RX {{ fmtBytes(crawlerSnap.observability.udp_rx_bytes) }}
+          </div>
+          <div class="text-[11px] font-mono-num text-slate-400 truncate">
+            TX {{ fmtBytes(crawlerSnap.observability.udp_tx_bytes) }} · 丢包 {{ fmtCount(crawlerSnap.dht.udp_queue_full) }}
           </div>
         </div>
       </div>
 
       <!-- 队列与并发饱和度 -->
-      <div class="rounded-xl border border-slate-200 bg-white p-5 shadow-sm space-y-3">
-        <div class="text-sm font-semibold text-slate-900 flex items-center gap-2">
-          <Activity class="h-4 w-4 text-indigo-600" />
-          核心队列与并发饱和度
-        </div>
+      <div class="obs-card rounded-xl p-5 space-y-4">
+        <h2 class="text-sm font-semibold text-slate-100">队列与并发饱和度</h2>
         <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4 text-xs">
-          <div class="space-y-1">
-            <div class="flex justify-between">
-              <span>Metadata 排队深度</span>
-              <span class="font-mono">{{ crawlerSnap.dht.metadata_queue_depth ?? 0 }} / {{ crawlerSnap.dht.metadata_queue_max ?? 0 }}</span>
+          <div v-for="m in crawlerSaturationMeters" :key="m.label" class="space-y-1.5">
+            <div class="flex justify-between text-slate-300">
+              <span>{{ m.label }}</span>
+              <span class="font-mono-num" :title="`${fmtExact(m.cur)} / ${fmtExact(m.max)}`">
+                {{ fmtCount(m.cur) }} / {{ fmtCount(m.max) }} ({{ m.pct }}%)
+              </span>
             </div>
-            <el-progress :percentage="pct(crawlerSnap.dht.metadata_queue_depth, crawlerSnap.dht.metadata_queue_max)" />
+            <div class="h-1.5 rounded-full bg-slate-800 overflow-hidden">
+              <div class="h-full rounded-full transition-all duration-300" :class="m.cls" :style="{ width: `${m.pct}%` }"></div>
+            </div>
           </div>
-
           <div class="space-y-1">
-            <div class="flex justify-between">
-              <span>Metadata Worker 并发</span>
-              <span class="font-mono">{{ crawlerSnap.dht.metadata_in_flight ?? 0 }} / {{ crawlerSnap.effective_metadata_workers }}</span>
+            <div class="flex justify-between text-slate-300">
+              <span>已下载元数据</span>
+              <span class="font-mono-num font-semibold text-emerald-300">
+                {{ fmtBytes(crawlerSnap.observability.metadata_bytes_downloaded) }}
+              </span>
             </div>
-            <el-progress :percentage="pct(crawlerSnap.dht.metadata_in_flight, crawlerSnap.effective_metadata_workers)" status="success" />
-          </div>
-
-          <div class="space-y-1">
-            <div class="flex justify-between">
-              <span>find_node 在途并发</span>
-              <span class="font-mono">{{ crawlerSnap.dht.find_node_in_flight ?? 0 }} / {{ crawlerSnap.dht.find_node_in_flight_max ?? 0 }}</span>
-            </div>
-            <el-progress :percentage="pct(crawlerSnap.dht.find_node_in_flight, crawlerSnap.dht.find_node_in_flight_max)" status="warning" />
-          </div>
-
-          <div class="space-y-1">
-            <div class="flex justify-between">
-              <span>DHT 路由节点池</span>
-              <span class="font-mono">{{ crawlerSnap.dht.node_pool_size ?? 0 }} / {{ crawlerSnap.dht.node_pool_capacity ?? 0 }}</span>
-            </div>
-            <el-progress :percentage="pct(crawlerSnap.dht.node_pool_size, crawlerSnap.dht.node_pool_capacity)" />
-          </div>
-
-          <div class="space-y-1">
-            <div class="flex justify-between">
-              <span>入口 Hash 队列</span>
-              <span class="font-mono">{{ crawlerSnap.dht.hash_ingress_queue_depth ?? 0 }} / {{ crawlerSnap.dht.hash_ingress_queue_capacity ?? 0 }}</span>
-            </div>
-            <el-progress :percentage="pct(crawlerSnap.dht.hash_ingress_queue_depth, crawlerSnap.dht.hash_ingress_queue_capacity)" />
-          </div>
-
-          <div class="space-y-1">
-            <div class="flex justify-between">
-              <span>已下载元数据体积</span>
-              <span class="font-mono">{{ formatBytes(crawlerSnap.observability.metadata_bytes_downloaded) }}</span>
-            </div>
-            <div class="text-[11px] text-slate-500 font-mono">
-              坏 Peer 缓存命中: T={{ crawlerSnap.observability.peer_cache_timeout_hits }} / C={{ crawlerSnap.observability.peer_cache_connect_hits }}
+            <div class="text-[11px] font-mono-num text-slate-500">
+              坏 Peer 命中 T={{ fmtCount(crawlerSnap.observability.peer_cache_timeout_hits) }} / C={{ fmtCount(crawlerSnap.observability.peer_cache_connect_hits) }}
             </div>
           </div>
         </div>
       </div>
 
-      <!-- 三个直方图 -->
+      <!-- Histograms Row -->
       <div class="grid grid-cols-1 lg:grid-cols-3 gap-4">
-        <div class="rounded-xl border border-slate-200 bg-white p-4 shadow-sm">
-          <div class="flex items-center justify-between text-xs mb-2">
-            <span class="font-semibold text-slate-800">排队等待耗时 (ms)</span>
-            <span class="font-mono text-indigo-700">
-              P50: {{ crawlerSnap.observability.queue_wait_ms.p50 ?? "-" }} · P95: {{ crawlerSnap.observability.queue_wait_ms.p95 ?? "-" }}
+        <div class="obs-card rounded-xl p-4 space-y-2">
+          <div class="flex justify-between text-xs">
+            <span class="text-slate-300 font-medium">排队等待</span>
+            <span class="font-mono-num text-indigo-400">
+              P50 {{ fmtDurMs(crawlerSnap.observability.queue_wait_ms.p50) }} · P95 {{ fmtDurMs(crawlerSnap.observability.queue_wait_ms.p95) }}
             </span>
           </div>
-          <div ref="queueHistRef" class="h-56 w-full" />
+          <ObsHistogram :bars="queueWaitBars" color="#818cf8" />
         </div>
 
-        <div class="rounded-xl border border-slate-200 bg-white p-4 shadow-sm">
-          <div class="flex items-center justify-between text-xs mb-2">
-            <span class="font-semibold text-slate-800">Metadata 抓取耗时 (ms)</span>
-            <span class="font-mono text-sky-700">
-              P50: {{ crawlerSnap.observability.fetch_duration_ms.p50 ?? "-" }} · P95: {{ crawlerSnap.observability.fetch_duration_ms.p95 ?? "-" }}
+        <div class="obs-card rounded-xl p-4 space-y-2">
+          <div class="flex justify-between text-xs">
+            <span class="text-slate-300 font-medium">抓取耗时</span>
+            <span class="font-mono-num text-sky-400">
+              P50 {{ fmtDurMs(crawlerSnap.observability.fetch_duration_ms.p50) }} · P95 {{ fmtDurMs(crawlerSnap.observability.fetch_duration_ms.p95) }}
             </span>
           </div>
-          <div ref="fetchHistRef" class="h-56 w-full" />
+          <ObsHistogram :bars="fetchDurationBars" color="#38bdf8" />
         </div>
 
-        <div class="rounded-xl border border-slate-200 bg-white p-4 shadow-sm">
-          <div class="flex items-center justify-between text-xs mb-2">
-            <span class="font-semibold text-slate-800">Metadata 体积分布</span>
-            <span class="font-mono text-emerald-700">
-              P50: {{ formatBytes(crawlerSnap.observability.metadata_size_bytes.p50) }} · P95: {{ formatBytes(crawlerSnap.observability.metadata_size_bytes.p95) }}
+        <div class="obs-card rounded-xl p-4 space-y-2">
+          <div class="flex justify-between text-xs">
+            <span class="text-slate-300 font-medium">元数据体积</span>
+            <span class="font-mono-num text-emerald-400">
+              P50 {{ fmtBytes(crawlerSnap.observability.metadata_size_bytes.p50) }} · P95 {{ fmtBytes(crawlerSnap.observability.metadata_size_bytes.p95) }}
             </span>
           </div>
-          <div ref="sizeHistRef" class="h-56 w-full" />
+          <ObsHistogram :bars="metaSizeBars" color="#10b981" />
         </div>
       </div>
 
-      <!-- 超时阶段与连接错误拆解 -->
+      <!-- Failure Attribution -->
       <div class="grid grid-cols-1 lg:grid-cols-2 gap-4">
-        <div class="rounded-xl border border-slate-200 bg-white p-4 shadow-sm">
-          <div class="text-xs font-semibold text-slate-800 mb-2">
-            Metadata 分阶段超时拆解 (`metadata_timeout_stages`)
+        <div class="obs-card rounded-xl p-4 space-y-3">
+          <div class="flex items-center justify-between">
+            <div class="text-xs font-semibold text-slate-200">超时阶段分布</div>
+            <span class="text-[11px] font-mono-num text-amber-300">
+              总超时 {{ fmtCount(crawlerSnap.observability.metadata_failure_timeout) }}
+            </span>
           </div>
-          <div ref="timeoutStagesRef" class="h-64 w-full" />
+          <ObsHorizontalBars :items="timeoutStageItems" color="#f59e0b" />
         </div>
 
-        <div class="rounded-xl border border-slate-200 bg-white p-4 shadow-sm">
-          <div class="text-xs font-semibold text-slate-800 mb-2">
-            TCP / 握手错误原因拆解 (`metadata_connection_errors`)
+        <div class="obs-card rounded-xl p-4 space-y-3">
+          <div class="flex items-center justify-between">
+            <div class="text-xs font-semibold text-slate-200">连接错误原因</div>
+            <span class="text-[11px] font-mono-num text-rose-300">
+              建连失败 {{ fmtCount(crawlerSnap.observability.metadata_failure_connect) }}
+            </span>
           </div>
-          <div ref="connErrorsRef" class="h-64 w-full" />
+          <ObsHorizontalBars :items="connErrorItems" color="#f43f5e" />
         </div>
       </div>
 
-      <!-- 渠道产出与应用计数器明细 -->
-      <div class="grid grid-cols-1 lg:grid-cols-2 gap-4">
-        <div class="rounded-xl border border-slate-200 bg-white p-4 shadow-sm space-y-3">
-          <div class="text-xs font-semibold text-slate-800">发现渠道收益与状态指标 (`yield_counters` / `yield_gauges`)</div>
-          <el-table :data="yieldCounterRows" size="small" border stripe max-height="250">
-            <el-table-column prop="key" label="渠道指标" min-width="200">
-              <template #default="{ row }"><span class="font-mono text-xs">{{ row.key }}</span></template>
-            </el-table-column>
-            <el-table-column prop="value" label="累计计数" width="120">
-              <template #default="{ row }"><span class="font-mono text-xs font-semibold">{{ row.value.toLocaleString("zh-CN") }}</span></template>
-            </el-table-column>
-          </el-table>
-          <el-table v-if="yieldGaugeRows.length > 0" :data="yieldGaugeRows" size="small" border stripe max-height="180">
-            <el-table-column prop="key" label="瞬时指标 (Gauge)" min-width="200">
-              <template #default="{ row }"><span class="font-mono text-xs">{{ row.key }}</span></template>
-            </el-table-column>
-            <el-table-column prop="value" label="当前值" width="120">
-              <template #default="{ row }"><span class="font-mono text-xs">{{ row.value.toLocaleString("zh-CN") }}</span></template>
-            </el-table-column>
-          </el-table>
+      <!-- DHT Inbound + Raw Kernel Counter Tables -->
+      <div class="grid grid-cols-1 lg:grid-cols-4 gap-4">
+        <div class="obs-card rounded-xl p-4 space-y-3">
+          <div class="flex items-center justify-between">
+            <h3 class="text-xs font-semibold text-slate-200">DHT UDP 入站动作</h3>
+            <span class="text-[11px] font-mono-num text-cyan-300">
+              入池 {{ fmtCount(crawlerSnap.observability.node_admitted) }}
+            </span>
+          </div>
+          <ObsHorizontalBars :items="dhtProtocolItems" color="#22d3ee" />
+          <div class="obs-inset p-2.5 rounded-lg grid grid-cols-2 gap-1.5 text-[11px] font-mono-num">
+            <span class="text-slate-400">替换 <b class="text-slate-200">{{ fmtCount(crawlerSnap.observability.node_replaced) }}</b></span>
+            <span class="text-slate-400">重复丢弃 <b class="text-slate-200">{{ fmtCount(crawlerSnap.observability.node_dropped_duplicate) }}</b></span>
+            <span class="text-slate-400">限流 <b class="text-amber-300">{{ fmtCount(crawlerSnap.observability.node_dropped_rate_limited) }}</b></span>
+            <span class="text-slate-400">回包限流 <b class="text-amber-300">{{ fmtCount(crawlerSnap.observability.response_rate_limited) }}</b></span>
+          </div>
         </div>
 
-        <div class="rounded-xl border border-slate-200 bg-white p-4 shadow-sm space-y-3">
-          <div class="text-xs font-semibold text-slate-800">Crawler 应用层原子计数器 (`app`)</div>
-          <el-table :data="appStatRows" size="small" border stripe max-height="360">
-            <el-table-column prop="key" label="计数器名称" min-width="220">
-              <template #default="{ row }"><span class="font-mono text-xs">{{ row.key }}</span></template>
-            </el-table-column>
-            <el-table-column prop="value" label="数值" width="130">
-              <template #default="{ row }"><span class="font-mono text-xs font-semibold">{{ row.value.toLocaleString("zh-CN") }}</span></template>
-            </el-table-column>
-          </el-table>
+        <div class="obs-card rounded-xl p-4 space-y-2.5">
+          <h3 class="text-xs font-semibold text-slate-200">应用层计数器 (app)</h3>
+          <div class="obs-inset rounded-lg divide-y divide-slate-800/60 max-h-60 overflow-auto obs-scroll text-[11px] font-mono-num">
+            <div v-for="(val, key) in crawlerSnap.app" :key="key" class="px-3 py-1.5 flex items-center justify-between gap-2">
+              <span class="text-slate-400 truncate">{{ key }}</span>
+              <span class="text-slate-100">{{ fmtExact(val) }}</span>
+            </div>
+          </div>
+        </div>
+
+        <div class="obs-card rounded-xl p-4 space-y-2.5">
+          <h3 class="text-xs font-semibold text-slate-200">DHT 引擎状态 (dht)</h3>
+          <div class="obs-inset rounded-lg divide-y divide-slate-800/60 max-h-60 overflow-auto obs-scroll text-[11px] font-mono-num">
+            <div v-for="(val, key) in crawlerSnap.dht" :key="key" class="px-3 py-1.5 flex items-center justify-between gap-2">
+              <span class="text-slate-400 truncate">{{ key }}</span>
+              <span class="text-slate-100">{{ fmtExact(val) }}</span>
+            </div>
+          </div>
+        </div>
+
+        <div class="obs-card rounded-xl p-4 space-y-2.5">
+          <h3 class="text-xs font-semibold text-slate-200">产出漏斗计数 (yield)</h3>
+          <div class="obs-inset rounded-lg divide-y divide-slate-800/60 max-h-60 overflow-auto obs-scroll text-[11px] font-mono-num">
+            <div v-for="(val, key) in crawlerSnap.yield_gauges" :key="`g:${key}`" class="px-3 py-1.5 flex items-center justify-between gap-2">
+              <span class="text-emerald-400/90 truncate">{{ key }}</span>
+              <span class="text-emerald-200">{{ fmtExact(val) }}</span>
+            </div>
+            <div v-for="(val, key) in crawlerSnap.yield_counters" :key="`c:${key}`" class="px-3 py-1.5 flex items-center justify-between gap-2">
+              <span class="text-slate-400 truncate">{{ key }}</span>
+              <span class="text-slate-100">{{ fmtExact(val) }}</span>
+            </div>
+          </div>
         </div>
       </div>
     </template>
 
-    <!-- Indexer 深度诊断视图 -->
+    <!-- INDEXER DIAGNOSTICS -->
     <template v-else-if="indexerSnap">
       <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
-        <div class="rounded-xl border border-slate-200 bg-white p-4 shadow-sm space-y-1">
-          <div class="flex items-center justify-between text-xs text-slate-500">
-            <span>运行时长 & 规则版本</span>
-            <Cpu class="h-4 w-4 text-indigo-500" />
+        <div class="obs-card rounded-xl p-4 space-y-1.5 min-w-0">
+          <div class="text-xs text-slate-400">规则版本与运行时长</div>
+          <div class="text-lg font-semibold font-mono-num text-emerald-300">
+            v{{ indexerSnap.active_rule_version }} · {{ fmtDurSecs(indexerSnap.uptime_secs) }}
           </div>
-          <div class="text-lg font-bold font-mono text-slate-900">
-            v{{ indexerSnap.active_rule_version }} · {{ formatDuration(indexerSnap.uptime_secs) }}
-          </div>
-          <div class="text-[11px] text-slate-500 font-mono">
-            内存 RSS: {{ formatBytes(indexerSnap.rss_bytes) }}
+          <div class="text-[11px] font-mono-num text-slate-400">
+            RSS {{ fmtBytes(indexerSnap.rss_bytes) }} · Redis {{ indexerSnap.redis_pool_available }}/{{ indexerSnap.redis_pool_size }}
           </div>
         </div>
 
-        <div class="rounded-xl border border-slate-200 bg-white p-4 shadow-sm space-y-1">
-          <div class="flex items-center justify-between text-xs text-slate-500">
-            <span>Redis Stream 读取与 ACK</span>
-            <Wifi class="h-4 w-4 text-sky-500" />
+        <div class="obs-card rounded-xl p-4 space-y-1.5 min-w-0">
+          <div class="text-xs text-slate-400">Stream 读取 (new / hot)</div>
+          <div
+            class="text-lg font-semibold font-mono-num text-slate-50 truncate"
+            :title="`${fmtExact(indexerSnap.app.torrent_messages_read)} / ${fmtExact(indexerSnap.app.hot_messages_read)}`"
+          >
+            {{ fmtCount(indexerSnap.app.torrent_messages_read) }} / {{ fmtCount(indexerSnap.app.hot_messages_read) }}
           </div>
-          <div class="text-lg font-bold font-mono text-slate-900">
-            读取 {{ indexerSnap.app.torrent_messages_read }} / {{ indexerSnap.app.hot_messages_read }}
-          </div>
-          <div class="text-[11px] text-slate-500 font-mono">
-            XAUTOCLAIM: new={{ indexerSnap.app.reclaimed_new }} hot={{ indexerSnap.app.reclaimed_hot }} · 毒丸={{ indexerSnap.app.poison_messages_acked }}
-          </div>
-        </div>
-
-        <div class="rounded-xl border border-slate-200 bg-white p-4 shadow-sm space-y-1">
-          <div class="flex items-center justify-between text-xs text-slate-500">
-            <span>过滤判定汇总</span>
-            <Activity class="h-4 w-4 text-amber-500" />
-          </div>
-          <div class="text-lg font-bold font-mono text-slate-900">
-            放行 {{ indexerSnap.app.filter_accepted }} / 拦截 {{ indexerSnap.app.filter_rejected }}
-          </div>
-          <div class="text-[11px] text-slate-500 font-mono">
-            在途待刷盘: buf={{ indexerSnap.app.torrent_buffered }} · inflight={{ indexerSnap.app.torrent_in_flight }}
+          <div class="text-[11px] font-mono-num text-slate-400 truncate">
+            reclaim {{ fmtCount(indexerSnap.app.reclaimed_new) }}/{{ fmtCount(indexerSnap.app.reclaimed_hot) }} · 毒丸 {{ fmtCount(indexerSnap.app.poison_messages_acked) }}
           </div>
         </div>
 
-        <div class="rounded-xl border border-slate-200 bg-white p-4 shadow-sm space-y-1">
-          <div class="flex items-center justify-between text-xs text-slate-500">
-            <span>Manticore 写库 & Redis 回写</span>
-            <HardDrive class="h-4 w-4 text-emerald-500" />
+        <div class="obs-card rounded-xl p-4 space-y-1.5 min-w-0">
+          <div class="text-xs text-slate-400">过滤判定 (放行 / 拦截)</div>
+          <div
+            class="text-lg font-semibold font-mono-num text-slate-50 truncate"
+            :title="`${fmtExact(indexerSnap.filter.total_accepted)} / ${fmtExact(indexerSnap.filter.total_rejected)}`"
+          >
+            {{ fmtCount(indexerSnap.filter.total_accepted) }} / {{ fmtCount(indexerSnap.filter.total_rejected) }}
           </div>
-          <div class="text-lg font-bold font-mono text-slate-900">
-            入库 {{ indexerSnap.app.records_written }} · Hot {{ indexerSnap.app.hot_records_updated }}
+          <div class="text-[11px] font-mono-num text-slate-400">
+            buf {{ indexerSnap.app.torrent_buffered }} · inflight {{ indexerSnap.app.torrent_in_flight }}
           </div>
-          <div class="text-[11px] text-slate-500 font-mono">
-            批次 成功={{ indexerSnap.app.batches_written }} 失败={{ indexerSnap.app.batches_failed }}
+        </div>
+
+        <div class="obs-card rounded-xl p-4 space-y-1.5 min-w-0">
+          <div class="text-xs text-slate-400">Manticore 写库统计</div>
+          <div
+            class="text-lg font-semibold font-mono-num text-emerald-300 truncate"
+            :title="`${fmtExact(indexerSnap.app.records_written)} · Hot ${fmtExact(indexerSnap.app.hot_records_updated)}`"
+          >
+            {{ fmtCount(indexerSnap.app.records_written) }} · Hot {{ fmtCount(indexerSnap.app.hot_records_updated) }}
+          </div>
+          <div class="text-[11px] font-mono-num text-slate-400">
+            成功 {{ fmtCount(indexerSnap.app.batches_written) }} · 失败 {{ fmtCount(indexerSnap.app.batches_failed) }}
+          </div>
+        </div>
+      </div>
+
+      <div class="grid grid-cols-1 lg:grid-cols-2 gap-4">
+        <div class="obs-card rounded-xl p-5 space-y-3">
+          <div class="flex items-center gap-2">
+            <Activity class="w-4 h-4 text-emerald-400" />
+            <h3 class="text-xs font-semibold text-slate-100">内存缓冲与在途积压</h3>
+          </div>
+          <div class="obs-inset p-3.5 rounded-xl grid grid-cols-3 gap-3 text-xs font-mono-num">
+            <div>
+              <span class="text-[11px] text-slate-500 block font-sans">Torrent 攒批缓冲</span>
+              <span class="text-lg font-bold text-slate-100">{{ indexerSnap.app.torrent_buffered }}</span>
+            </div>
+            <div>
+              <span class="text-[11px] text-slate-500 block font-sans">正在写入在途批次</span>
+              <span class="text-lg font-bold text-cyan-300">{{ indexerSnap.app.torrent_in_flight }}</span>
+            </div>
+            <div>
+              <span class="text-[11px] text-slate-500 block font-sans">Hot 更新缓冲</span>
+              <span class="text-lg font-bold text-amber-300">{{ indexerSnap.app.hot_buffered }}</span>
+            </div>
+          </div>
+        </div>
+
+        <div class="obs-card rounded-xl p-5 space-y-3">
+          <div class="flex items-center gap-2">
+            <HardDrive class="w-4 h-4 text-sky-400" />
+            <h3 class="text-xs font-semibold text-slate-100">Stream 消费确认与 XAUTOCLAIM 故障回收</h3>
+          </div>
+          <div class="obs-inset p-3.5 rounded-xl grid grid-cols-2 sm:grid-cols-3 gap-3 text-[11px] font-mono-num">
+            <div><span class="text-slate-500 block">读取 New / Hot</span><span class="text-slate-200">{{ fmtExact(indexerSnap.app.torrent_messages_read) }} / {{ fmtExact(indexerSnap.app.hot_messages_read) }}</span></div>
+            <div><span class="text-slate-500 block">XACK New / Hot</span><span class="text-emerald-300">{{ fmtExact(indexerSnap.app.stream_xacked_new) }} / {{ fmtExact(indexerSnap.app.stream_xacked_hot) }}</span></div>
+            <div><span class="text-slate-500 block">认领 Reclaim New / Hot</span><span class="text-sky-300">{{ indexerSnap.app.reclaimed_new }} / {{ indexerSnap.app.reclaimed_hot }}</span></div>
+            <div><span class="text-slate-500 block">损坏报文跳过</span><span class="text-amber-300">{{ indexerSnap.app.malformed_messages_acked }}</span></div>
+            <div><span class="text-slate-500 block">毒丸报文跳过</span><span class="text-rose-300">{{ indexerSnap.app.poison_messages_acked }}</span></div>
+            <div><span class="text-slate-500 block">热度更新异常</span><span class="text-rose-300">{{ indexerSnap.app.hot_update_errors }}</span></div>
           </div>
         </div>
       </div>

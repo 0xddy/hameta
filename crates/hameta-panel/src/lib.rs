@@ -1,19 +1,28 @@
 pub mod api;
 pub mod assets;
 pub mod auth;
+pub mod discovery;
+pub mod ingest_hub;
 pub mod metrics_collector;
 pub mod server;
 pub mod services;
 pub mod supervisor;
 
 pub use auth::LoginRateLimiter;
-pub use metrics_collector::{MetricsCollector, OverviewSnapshot};
+pub use ingest_hub::{ConsoleIngestEvent, IngestHub, IngestHubStats};
+pub use metrics_collector::{
+    GlobeChannelRates, GlobeCountryTraffic, GlobeGeoIpStatus, GlobeTrafficSnapshot,
+    MetricsCollector, OverviewSnapshot,
+};
 pub use server::{PanelConfig, PanelState, build_router, run_panel};
 pub use services::{
     ManticoreTestReport, RedisTestReport, ServiceRuntimePool, test_manticore_connection,
     test_redis_connection,
 };
-pub use supervisor::{IndexerReloadResult, Supervisor, WorkerStatusView};
+pub use supervisor::{
+    CrawlerGeoIpReloadResult, IndexerReloadResult, META_GEOIP_CONFIG_KEY, Supervisor,
+    WorkerStatusView, load_geoip_config,
+};
 
 #[cfg(test)]
 mod tests {

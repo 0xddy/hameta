@@ -1,6 +1,6 @@
-use crate::config::{ManticoreServiceConfig, RedisServiceConfig};
+use crate::config::{GeoIpConfig, ManticoreServiceConfig, RedisServiceConfig};
 use crate::error::CommonError;
-use crate::models::WorkerRole;
+use crate::models::{FileInfo, WorkerRole};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::io::Read;
@@ -18,6 +18,8 @@ pub struct WorkerBootstrap {
     pub manticore: Option<ManticoreServiceConfig>,
     pub worker_config: Value,
     pub filter_bundle: Option<Value>,
+    #[serde(default)]
+    pub geoip: Option<GeoIpConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -31,6 +33,8 @@ struct StandaloneBootstrapOverlay {
     manticore: Option<ManticoreServiceConfig>,
     worker_config: Option<Value>,
     filter_bundle: Option<Value>,
+    #[serde(default)]
+    geoip: Option<GeoIpConfig>,
 }
 
 /// 解析 `WorkerBootstrap` JSON 字符串；当 `allow_standalone_defaults` 为 `true` 时，允许省略部分独立运行非必需字段。
@@ -62,6 +66,7 @@ pub fn parse_worker_bootstrap_str(
             manticore: overlay.manticore,
             worker_config: overlay.worker_config.unwrap_or_else(|| json!({})),
             filter_bundle: overlay.filter_bundle,
+            geoip: overlay.geoip,
         }
     } else {
         serde_json::from_str::<WorkerBootstrap>(trimmed)
@@ -223,4 +228,53 @@ pub struct WorkerSnapshotEnvelope {
     pub role: WorkerRole,
     pub captured_at_unix: u64,
     pub payload: Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkerReloadGeoIpRequest {
+    pub config: GeoIpConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkerReloadGeoIpResponse {
+    pub enabled: bool,
+    pub mmdb_loaded: bool,
+    pub mmdb_path: String,
+    pub mmdb_size_bytes: u64,
+    pub mmdb_build_epoch: u64,
+    pub database_type: String,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IngestEventType {
+    Indexed,
+    HotUpdated,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IngestEventItem {
+    pub info_hash: String,
+    pub event_type: IngestEventType,
+    pub worker_id: String,
+    pub manticore_id: i64,
+    pub batch_id: u64,
+    pub raw_name: String,
+    pub refine_name: String,
+    pub cleaned: bool,
+    pub total_size: u64,
+    pub file_count: i32,
+    #[serde(default)]
+    pub files_preview: Vec<FileInfo>,
+    pub hot: i32,
+    pub hot_delta: i32,
+    pub latency_ms: u64,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkerIngestEventsRequest {
+    pub instance_id: String,
+    pub events: Vec<IngestEventItem>,
 }

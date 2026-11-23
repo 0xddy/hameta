@@ -1,34 +1,34 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from "vue";
+import { computed, onMounted, ref, watch } from "vue";
+import { useRoute, useRouter } from "vue-router";
+import { ElMessage } from "element-plus";
 import {
-  AlertTriangle,
   ArrowDown,
-  ArrowRight,
   ArrowUp,
+  BarChart3,
+  BookOpen,
   CheckCircle2,
   Copy,
   Download,
-  Edit3,
-  FileJson,
-  Filter,
   FlaskConical,
   History,
+  Layers,
+  Pencil,
   Play,
   Plus,
   RefreshCw,
+  RotateCcw,
   Save,
   Search,
+  ShieldAlert,
   ShieldCheck,
   Sparkles,
   Trash2,
   Upload,
-  Zap,
 } from "lucide-vue-next";
-import { ElMessage, ElMessageBox } from "element-plus";
-import ByteSizeInput from "@/components/filter/ByteSizeInput.vue";
-import RuleEditorDrawer from "@/components/filter/RuleEditorDrawer.vue";
 import {
   discardFilterDraft,
+  discoverAdCandidates,
   getFilterPresets,
   getFilterState,
   getFilterStats,
@@ -36,251 +36,86 @@ import {
   listFilterVersions,
   publishFilterDraft,
   resetFilterPreset,
-  rollbackFilterVersion,
   runPlaygroundTest,
   samplePlaygroundTorrents,
   saveFilterDraft,
   validateFilterBundle,
-  type AbComparisonItem,
-  type AbComparisonReport,
+  rollbackFilterVersion,
   type AbDiffStatus,
-  type CleanerOptions,
+  type AdPhraseRule,
+  type AdRegexRule,
+  type DiscoveredAdCandidate,
   type FilterBundle,
-  type FilterCategory,
   type FilterPresetsResponse,
-  type FilterStateResponse,
   type FilterStatsResponse,
   type FilterVersionDto,
+  type IndexerRuleStatusDto,
   type PlaygroundInput,
-  type PlaygroundItemResult,
+  type PlaygroundTestResponse,
   type PolicyRule,
   type RuleMatcher,
-  type RuleTemplateInfo,
-  type WorkerRejectedSampleDto,
 } from "@/api/filter";
+import ByteSizeInput from "@/components/filter/ByteSizeInput.vue";
+import RuleEditorDrawer from "@/components/filter/RuleEditorDrawer.vue";
+import ObsHorizontalBars from "@/components/ui/ObsHorizontalBars.vue";
+import ObsModal from "@/components/ui/ObsModal.vue";
+import ObsNumberInput from "@/components/ui/ObsNumberInput.vue";
+import ObsSelect from "@/components/ui/ObsSelect.vue";
+import { useTelemetryStore } from "@/stores/telemetry";
+import { fmtBytes, fmtCount, formatDateTime } from "@/utils/format";
 
-const loading = ref(true);
+const route = useRoute();
+const router = useRouter();
+const telemetry = useTelemetryStore();
+
+type WorkbenchTab = "rules" | "cleaner" | "playground" | "stats" | "versions";
+const activeTab = ref<WorkbenchTab>("rules");
+
+const loading = ref(false);
 const saving = ref(false);
-const publishing = ref(false);
 const validating = ref(false);
+const publishing = ref(false);
 
-const filterState = ref<FilterStateResponse | null>(null);
-const presetsCatalog = ref<FilterPresetsResponse | null>(null);
-const versions = ref<FilterVersionDto[]>([]);
-const versionsLoading = ref(false);
-const stats = ref<FilterStatsResponse | null>(null);
-const statsLoading = ref(false);
+const publishedVer = ref<FilterVersionDto | null>(null);
+const draftVer = ref<FilterVersionDto | null>(null);
+const onlineIndexers = ref<IndexerRuleStatusDto[]>([]);
+const presets = ref<FilterPresetsResponse | null>(null);
+const dirty = ref(false);
 
-const workingBundle = ref<FilterBundle>(emptyBundle());
-const baselineJson = ref("");
-const draftNote = ref("");
-
-const activeMainTab = ref("policy");
-const gatesExpanded = ref(true);
-
-// 规则链筛选
-const ruleSearch = ref("");
-const ruleActionFilter = ref<"all" | "reject" | "allow">("all");
-const ruleTypeFilter = ref<"all" | RuleMatcher["type"]>("all");
-
-// 规则编辑抽屉
-const drawerVisible = ref(false);
-const drawerRule = ref<PolicyRule | null>(null);
-const drawerIsNew = ref(false);
-const drawerInsertIndex = ref<number | null>(null);
-
-// 标题清洗词库搜索与新增
-const phraseSearch = ref("");
-const newAdPhrase = ref("");
-const newAdPhraseNote = ref("");
-const newAdRegex = ref("");
-const newAdRegexReplacement = ref(" ");
-const newAdRegexNote = ref("");
-
-// 导入弹窗与转换提示
-const legacyImportVisible = ref(false);
-const legacyImportText = ref("");
-const legacyImportNote = ref("");
-const legacyImporting = ref(false);
-const legacyFileRef = ref<HTMLInputElement | null>(null);
-const lastConversionNotes = ref<string[]>([]);
-
-const inspectVersionVisible = ref(false);
-const inspectVersionData = ref<FilterVersionDto | null>(null);
-
-// 演练场状态
-const pgMode = ref<"ab_compare" | "draft" | "published">("ab_compare");
-const singleTitle = ref("【高清影视】Ubuntu.24.04.LTS.Desktop.amd64[example.com]");
-const singleInfoHash = ref("");
-const singleAutoFile = ref(true);
-const singleFiles = ref<Array<{ path: string; size: number }>>([
-  { path: "Ubuntu-24.04/release.mkv", size: 104857600 },
-]);
-const singleRunning = ref(false);
-const singleResult = ref<PlaygroundItemResult | null>(null);
-const singleAbItem = ref<AbComparisonItem | null>(null);
-
-const batchSamples = ref<PlaygroundInput[]>([]);
-const batchKeyword = ref("");
-const batchPasteVisible = ref(false);
-const batchPasteText = ref("");
-const batchSampling = ref(false);
-const batchRunning = ref(false);
-const batchAbReport = ref<AbComparisonReport | null>(null);
-const batchDiffFilter = ref<"all" | "changed" | AbDiffStatus>("all");
-
-// 统计与样本过滤
-const rejectedSearch = ref("");
-const rejectedCategoryFilter = ref<string>("all");
-
-const CLEANER_STAGE_META: Array<{
-  key: keyof Omit<CleanerOptions, "reject_if_empty_after_clean">;
-  label: string;
-  desc: string;
-}> = [
-  { key: "enable_nfkc", label: "1. NFKC 全半角归一化", desc: "全角字母数字、标点与异常间距归一" },
-  {
-    key: "enable_deobfuscate_brackets",
-    label: "2. 括号内单字反混淆",
-    desc: "还原 [ w w w . x y z ] 为 [www.xyz]",
-  },
-  {
-    key: "enable_collapse_spaced_chars",
-    label: "3. 连续单字拆分还原",
-    desc: "还原 最 新 地 址 为 最新地址",
-  },
-  {
-    key: "enable_strip_leading_site_prefix",
-    label: "4. 开头站点发布前缀剥离",
-    desc: "剥离开头 www.xxx.com - 及【xxx网】",
-  },
-  {
-    key: "enable_strip_urls_and_domains",
-    label: "5. URL 与裸域名清理",
-    desc: "清理 http(s):// 及 1,284 个 IANA 顶级域名",
-  },
-  { key: "enable_ad_regexes", label: "6. 动态广告正则替换", desc: "按下方 ad_regexes 顺序正则替换" },
-  { key: "enable_ad_phrases", label: "7. 动态广告短语剥离", desc: "按长度降序剥离推广固定短语" },
-  { key: "enable_cleanup", label: "8. 空括号与首尾符号修剪", desc: "清空残留 []/() 与边缘分隔符" },
-];
-
-const hasUnsavedChanges = computed(() => {
-  if (!baselineJson.value) return false;
-  return JSON.stringify(workingBundle.value) !== baselineJson.value;
-});
-
-const hitCountByRuleId = computed(() => {
-  const map = new Map<string, number>();
-  for (const h of stats.value?.rule_hits ?? []) {
-    map.set(h.rule_id, (map.get(h.rule_id) ?? 0) + h.hits);
-  }
-  return map;
-});
-
-const filteredRules = computed(() => {
-  const q = ruleSearch.value.trim().toLowerCase();
-  const act = ruleActionFilter.value;
-  const typ = ruleTypeFilter.value;
-  return workingBundle.value.policy.rules.filter((r) => {
-    if (act !== "all" && r.action !== act) return false;
-    if (typ !== "all" && r.matcher.type !== typ) return false;
-    if (!q) return true;
-    if (
-      r.name.toLowerCase().includes(q) ||
-      r.id.toLowerCase().includes(q) ||
-      r.note.toLowerCase().includes(q) ||
-      r.tags.some((t) => t.toLowerCase().includes(q))
-    ) {
-      return true;
-    }
-    const m = r.matcher;
-    if (m.type === "keyword_group") return m.words.some((w) => w.toLowerCase().includes(q));
-    if (m.type === "extension_rule" || m.type === "file_constraint" || m.type === "size_ratio") {
-      return m.extensions.some((e) => e.toLowerCase().includes(q));
-    }
-    if (m.type === "substantive_content") {
-      return m.junk_extensions.some((e) => e.toLowerCase().includes(q));
-    }
-    return false;
-  });
-});
-
-const filteredAdPhrases = computed(() => {
-  const q = phraseSearch.value.trim().toLowerCase();
-  if (!q) return workingBundle.value.ad_phrases;
-  return workingBundle.value.ad_phrases.filter(
-    (r) => r.phrase.toLowerCase().includes(q) || r.note.toLowerCase().includes(q),
-  );
-});
-
-const filteredAbItems = computed(() => {
-  if (!batchAbReport.value) return [];
-  const items = batchAbReport.value.items;
-  if (batchDiffFilter.value === "all") return items;
-  if (batchDiffFilter.value === "changed") {
-    return items.filter(
-      (i) =>
-        i.diff_status === "newly_rejected" ||
-        i.diff_status === "newly_accepted" ||
-        i.diff_status === "refined_name_changed",
-    );
-  }
-  return items.filter((i) => i.diff_status === batchDiffFilter.value);
-});
-
-const filteredRejectedSamples = computed(() => {
-  if (!stats.value) return [];
-  const q = rejectedSearch.value.trim().toLowerCase();
-  const cat = rejectedCategoryFilter.value;
-  return stats.value.recent_rejected.filter((row) => {
-    if (cat !== "all" && row.hit.category !== cat) return false;
-    if (!q) return true;
-    return (
-      row.raw_name.toLowerCase().includes(q) ||
-      row.info_hash.toLowerCase().includes(q) ||
-      row.hit.rule_label.toLowerCase().includes(q) ||
-      row.hit.detail.toLowerCase().includes(q)
-    );
-  });
-});
-
-const allowRulesCount = computed(
-  () => workingBundle.value.policy.rules.filter((r) => r.action === "allow").length,
-);
-
-const rejectRulesCount = computed(
-  () => workingBundle.value.policy.rules.filter((r) => r.action === "reject").length,
-);
-
-function emptyBundle(): FilterBundle {
+function makeFallbackBundle(): FilterBundle {
   return {
     version: 1,
     policy: {
-      schema_version: 2,
+      schema_version: 1,
       preset_id: null,
       gates: {
         reject_empty_name: true,
-        min_name_length: { enabled: true, value: 4 },
-        max_name_length: { enabled: true, value: 128 },
+        min_name_length: { enabled: false, value: 2 },
+        max_name_length: { enabled: false, value: 512 },
         reject_empty_files: true,
         reject_all_empty_files: true,
-        max_empty_files: { enabled: false, value: 0 },
-        max_file_count: { enabled: true, value: 2000 },
+        max_empty_files: { enabled: false, value: 50 },
+        max_file_count: { enabled: false, value: 2000 },
         max_file_name_length: { enabled: false, value: 255 },
-        min_total_size: { enabled: true, value: 1 },
-        max_total_size: { enabled: true, value: 2199023255552 },
-        density_check: { enabled: true, min_file_count: 100, min_avg_file_size: 102400 },
+        min_total_size: { enabled: false, value: 1024 * 1024 },
+        max_total_size: { enabled: false, value: 2 * 1024 * 1024 * 1024 * 1024 },
+        density_check: { enabled: false, min_file_count: 50, min_avg_file_size: 32768 },
       },
       cleaner: {
         enable_nfkc: true,
+        enable_confusable_norm: true,
         enable_deobfuscate_brackets: true,
         enable_collapse_spaced_chars: true,
         enable_strip_leading_site_prefix: true,
         enable_strip_urls_and_domains: true,
         enable_ad_regexes: true,
         enable_ad_phrases: true,
+        enable_span_ad_scoring: true,
+        span_ad_threshold: 65,
+        enable_filename_cross_clean: true,
         enable_cleanup: true,
         reject_if_empty_after_clean: true,
+        min_refined_name_length: { enabled: true, value: 2 },
       },
       rules: [],
     },
@@ -289,238 +124,284 @@ function emptyBundle(): FilterBundle {
   };
 }
 
-function cloneBundle(bundle: FilterBundle): FilterBundle {
-  return JSON.parse(JSON.stringify(bundle)) as FilterBundle;
+const bundle = ref<FilterBundle>(makeFallbackBundle());
+
+// Rules tab state
+const ruleActionFilter = ref<"all" | "allow" | "reject">("all");
+const ruleKeyword = ref("");
+const drawerVisible = ref(false);
+const drawerMode = ref<"create" | "edit">("edit");
+const editingRuleIdx = ref<number | null>(null);
+const editingRuleObj = ref<PolicyRule | null>(null);
+const templatesModalVisible = ref(false);
+
+// Cleaner tab state
+const phraseKeyword = ref("");
+const regexKeyword = ref("");
+const addPhraseVisible = ref(false);
+const phraseModalTab = ref<"single" | "batch">("single");
+const singlePhraseText = ref("");
+const singlePhraseNote = ref("");
+const bulkPhraseText = ref("");
+const bulkPhraseNote = ref("");
+
+const addRegexVisible = ref(false);
+const regexModalTab = ref<"single" | "batch">("single");
+const singleRegexPattern = ref("");
+const singleRegexReplacement = ref(" ");
+const singleRegexNote = ref("");
+const bulkRegexText = ref("");
+const bulkRegexReplacement = ref(" ");
+const bulkRegexNote = ref("");
+
+// Smart ad template discovery state
+const discoveryLoading = ref(false);
+const discoveryScanning = ref(false);
+const discoveryMeta = ref("");
+const discoveredCandidates = ref<DiscoveredAdCandidate[]>([]);
+const dismissedDiscoveryKeys = ref<Set<string>>(new Set());
+
+// Publish / Discard / Import / Reset Modals
+const publishVisible = ref(false);
+const publishNote = ref("");
+const importVisible = ref(false);
+const importRawJson = ref("");
+const importNote = ref("");
+const importBusy = ref(false);
+const resetVisible = ref(false);
+const resetPresetId = ref("online_standard");
+const resetIncludeDict = ref(true);
+const resetBusy = ref(false);
+
+// Playground state
+const pgMode = ref<"published" | "draft" | "ab_compare">("ab_compare");
+const pgAutoPlaceholder = ref(true);
+const pgQuickTitle = ref("");
+const pgSamplesText = ref("");
+const pgSamples = ref<PlaygroundInput[]>([
+  { name: "[ExampleSite.com] Example.Torrent.2025.1080p.WEB-DL.x264", files: [{ path: "Example.Torrent.2025.1080p.mkv", size: 2_400_000_000 }] },
+]);
+const pgRunning = ref(false);
+const pgSampling = ref(false);
+const pgResult = ref<PlaygroundTestResponse | null>(null);
+
+// Stats & Versions state
+const statsLoading = ref(false);
+const stats = ref<FilterStatsResponse | null>(null);
+const versionsLoading = ref(false);
+const versions = ref<FilterVersionDto[]>([]);
+const rollbackBusyVer = ref<number | null>(null);
+
+const hasDraft = computed(() => Boolean(draftVer.value) || dirty.value);
+
+const filteredRules = computed(() => {
+  const kw = ruleKeyword.value.trim().toLowerCase();
+  return bundle.value.policy.rules
+    .map((rule, index) => ({ rule, index }))
+    .filter(({ rule }) => {
+      if (ruleActionFilter.value !== "all" && rule.action !== ruleActionFilter.value) return false;
+      if (!kw) return true;
+      return (
+        rule.name.toLowerCase().includes(kw) ||
+        rule.id.toLowerCase().includes(kw) ||
+        rule.tags.some((t) => t.toLowerCase().includes(kw))
+      );
+    });
+});
+
+const filteredPhrases = computed(() => {
+  const kw = phraseKeyword.value.trim().toLowerCase();
+  return bundle.value.ad_phrases
+    .map((item, index) => ({ item, index }))
+    .filter(({ item }) => !kw || item.phrase.toLowerCase().includes(kw) || item.note.toLowerCase().includes(kw));
+});
+
+const filteredRegexes = computed(() => {
+  const kw = regexKeyword.value.trim().toLowerCase();
+  return bundle.value.ad_regexes
+    .map((item, index) => ({ item, index }))
+    .filter(
+      ({ item }) =>
+        !kw ||
+        item.pattern.toLowerCase().includes(kw) ||
+        item.replacement.toLowerCase().includes(kw) ||
+        item.note.toLowerCase().includes(kw),
+    );
+});
+
+const enabledPhraseCount = computed(() => bundle.value.ad_phrases.filter((x) => x.enabled).length);
+const enabledRegexCount = computed(() => bundle.value.ad_regexes.filter((x) => x.enabled).length);
+
+const presetSelectOptions = computed(() =>
+  (presets.value?.policy_presets ?? []).map((p) => ({
+    value: p.id,
+    label: `${p.name} (${p.allow_count} 白 / ${p.reject_count} 黑)`,
+  })),
+);
+
+const PG_MODE_OPTIONS = [
+  { label: "线上 vs 草稿 A/B 对比", value: "ab_compare" },
+  { label: "仅用当前编辑器草稿测试", value: "draft" },
+  { label: "仅用线上已发布规则测试", value: "published" },
+];
+
+const statsBarItems = computed(() => {
+  if (!stats.value) return [];
+  return stats.value.rule_hits.slice(0, 12).map((h) => ({
+    label: `${h.action === "allow" ? "[ALLOW]" : "[REJECT]"} ${h.rule_label}`,
+    value: h.hits,
+  }));
+});
+
+const allowRuleCount = computed(() => bundle.value.policy.rules.filter((r) => r.action === "allow").length);
+const rejectRuleCount = computed(() => bundle.value.policy.rules.filter((r) => r.action === "reject").length);
+
+type CleanerStageKey =
+  | "enable_nfkc"
+  | "enable_confusable_norm"
+  | "enable_deobfuscate_brackets"
+  | "enable_collapse_spaced_chars"
+  | "enable_strip_leading_site_prefix"
+  | "enable_strip_urls_and_domains"
+  | "enable_ad_regexes"
+  | "enable_ad_phrases"
+  | "enable_span_ad_scoring"
+  | "enable_filename_cross_clean"
+  | "enable_cleanup";
+
+const CLEANER_STAGE_META: Array<{
+  key: CleanerStageKey;
+  num: string;
+  title: string;
+  desc: string;
+  smart?: boolean;
+}> = [
+  { key: "enable_nfkc", num: "STAGE 01", title: "NFKC 规范化", desc: "全角字母数字与兼容字符统一规范化" },
+  { key: "enable_confusable_norm", num: "STAGE 02", title: "同形字与噪声归一", desc: "还原西里尔混写、带圈字符并降噪营销符号", smart: true },
+  { key: "enable_deobfuscate_brackets", num: "STAGE 03", title: "方括号混淆拆解", desc: "拆解 [abc . com] 等域名空格伪装" },
+  { key: "enable_collapse_spaced_chars", num: "STAGE 04", title: "拉宽字符折叠", desc: "恢复 w w w . x x x 等插空推广词" },
+  { key: "enable_strip_leading_site_prefix", num: "STAGE 05", title: "发布站前缀剥离", desc: "移除片头 [站点名] / 【发布组】 前缀" },
+  { key: "enable_strip_urls_and_domains", num: "STAGE 06", title: "URL / 域名剥离", desc: "擦除正文中挟带的推广网址与域名" },
+  { key: "enable_ad_regexes", num: "STAGE 07", title: "正则擦除引擎", desc: "按优先级顺序执行自定义正则模式替换" },
+  { key: "enable_ad_phrases", num: "STAGE 08", title: "广告短语词典", desc: "大小写不敏感字面量短语批量擦除" },
+  { key: "enable_span_ad_scoring", num: "STAGE 09", title: "语块智能打分剥离", desc: "char n-gram + 语块边界打分擦除变种引流", smart: true },
+  { key: "enable_filename_cross_clean", num: "STAGE 10", title: "主文件名交叉对齐", desc: "结合最大主文件名锚定并剥离外侧未知水印", smart: true },
+  { key: "enable_cleanup", num: "STAGE 11", title: "残留标点裁剪", desc: "合并连续空白并清理首尾冗余符号" },
+];
+
+function toggleCleanerStage(key: CleanerStageKey) {
+  bundle.value.policy.cleaner[key] = !bundle.value.policy.cleaner[key];
+  markDirty();
 }
 
-function formatBytes(bytes: number): string {
-  if (!bytes || Number.isNaN(bytes)) return "0 B";
-  if (bytes < 1024) return `${bytes} B`;
-  const units = ["KB", "MB", "GB", "TB", "PB"];
-  let val = bytes / 1024;
-  let idx = 0;
-  while (val >= 1024 && idx < units.length - 1) {
-    val /= 1024;
-    idx += 1;
-  }
-  return `${val.toFixed(val >= 100 ? 0 : 2)} ${units[idx]}`;
+function exportBundleJson() {
+  const payload = JSON.stringify(bundle.value, null, 2);
+  const blob = new Blob([payload], { type: "application/json;charset=utf-8" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = `hameta-filter-v${publishedVer.value?.version ?? "draft"}.json`;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+  ElMessage.success("已导出当前规则配置 JSON");
 }
 
-function formatTs(ts: number | null | undefined): string {
-  if (!ts) return "-";
-  return new Date(ts * 1000).toLocaleString("zh-CN", { hour12: false });
+function moveRegex(idx: number, delta: -1 | 1) {
+  const arr = bundle.value.ad_regexes;
+  const target = idx + delta;
+  if (target < 0 || target >= arr.length) return;
+  [arr[idx], arr[target]] = [arr[target], arr[idx]];
+  markDirty();
 }
 
-function categoryLabel(cat: FilterCategory): string {
-  const map: Record<FilterCategory, string> = {
-    empty_name: "空标题门禁",
-    title_length: "标题长度门禁",
-    empty_files: "空文件列表门禁",
-    all_empty_files: "全零字节门禁",
-    max_empty_files: "空文件数门禁",
-    max_file_count: "文件总数门禁",
-    max_file_name_length: "单文件名长度门禁",
-    min_total_size: "最小体积门禁",
-    max_total_size: "最大体积门禁",
-    file_density: "碎文件密度门禁",
-    keyword_group: "关键词词组",
-    extension_rule: "扩展名后缀",
-    title_pattern_preset: "垃圾标题特征",
-    file_constraint: "文件约束",
-    substantive_content: "实质内容底线",
-    size_ratio: "体积占比上限",
-    custom_regex: "自定义正则",
-    composite: "组合逻辑规则",
-    empty_refined_name: "清洗后为空",
-  };
-  return map[cat] ?? cat;
-}
-
-function matcherTypeLabel(t: RuleMatcher["type"]): string {
-  const map: Record<RuleMatcher["type"], string> = {
-    keyword_group: "关键词词组",
-    extension_rule: "扩展名后缀",
-    title_pattern_preset: "标题特征开关",
-    file_constraint: "文件体积/长度",
-    substantive_content: "有效实质内容",
-    size_ratio: "体积占比",
-    custom_regex: "自定义正则",
-    composite: "复合条件",
-  };
-  return map[t];
-}
-
-function summarizeMatcher(m: RuleMatcher): string {
+function matcherBadge(m: RuleMatcher): string {
   switch (m.type) {
-    case "keyword_group": {
-      const targetName =
-        m.target === "raw_name"
-          ? "原始标题"
-          : m.target === "refined_name"
-            ? "清洗后标题"
-            : m.target === "any_file_path"
-              ? "文件路径"
-              : "单文件名";
-      const modeName = m.match_mode === "word_boundary" ? "整词边界" : "包含子串";
-      const preview = m.words.slice(0, 6).join(", ");
-      const more = m.words.length > 6 ? ` 等共 ${m.words.length} 词` : ` (${m.words.length} 词)`;
-      return `${targetName} · ${modeName}: ${preview || "(空)"}${m.words.length > 0 ? more : ""}`;
-    }
-    case "extension_rule": {
-      const scopeName =
-        m.scope === "torrent_name"
-          ? "标题后缀"
-          : m.scope === "any_file"
-            ? "含任意该后缀文件"
-            : "全部为此后缀";
-      const preview = m.extensions
-        .slice(0, 8)
-        .map((e) => `.${e}`)
-        .join(" ");
-      const more =
-        m.extensions.length > 8
-          ? ` 等共 ${m.extensions.length} 个`
-          : ` (${m.extensions.length} 个)`;
-      return `${scopeName}: ${preview || "(未选)"}${m.extensions.length > 0 ? more : ""}`;
-    }
+    case "keyword_group":
+      return `关键词 (${m.words.length})`;
+    case "extension_rule":
+      return `后缀集 (${m.extensions.length})`;
     case "title_pattern_preset":
-      return `已勾选 ${m.patterns.length} 项结构特征（西里尔阈值 ${m.min_cyrillic_chars}）`;
-    case "file_constraint": {
-      const modeStr = m.mode === "at_least_one_matched" ? "至少 1 个主文件达标" : "每个匹配文件都达标";
-      const parts: string[] = [];
-      if (m.min_file_size) parts.push(`>= ${formatBytes(m.min_file_size)}`);
-      if (m.max_file_size) parts.push(`<= ${formatBytes(m.max_file_size)}`);
-      if (m.min_file_name_length) parts.push(`文件名>=${m.min_file_name_length}字符`);
-      if (m.max_file_name_length) parts.push(`文件名<=${m.max_file_name_length}字符`);
-      const extPreview = m.extensions
-        .slice(0, 5)
-        .map((e) => `.${e}`)
-        .join(" ");
-      return `${extPreview || "自定义正则"} · ${modeStr} · ${parts.join(" 且 ") || "命中即生效"}`;
-    }
+      return `标题特征 (${m.patterns.length})`;
+    case "file_constraint":
+      return "文件约束";
     case "substantive_content":
-      return `${m.include_system_junk ? "排除系统垃圾 + " : ""}排除 ${m.junk_extensions.length} 类后缀后：至少 ${m.min_files} 个文件且合计 >= ${formatBytes(m.min_total_size)}`;
-    case "size_ratio": {
-      const extPreview = m.extensions
-        .slice(0, 5)
-        .map((e) => `.${e}`)
-        .join(" ");
-      return `${extPreview}${m.include_split_archives ? " (+分卷压缩)" : ""} · 占比阈值 ${(m.max_ratio * 100).toFixed(0)}%`;
-    }
+      return "实质内容";
+    case "size_ratio":
+      return `占比 ≥${Math.round(m.max_ratio * 100)}%`;
     case "custom_regex":
-      return `${m.patterns.length} 条 Regex (${m.match_all ? "AND 全部匹配" : "OR 任一匹配"})`;
+      return `自定义正则 (${m.patterns.length})`;
     case "composite":
-      return `${m.logic === "all" ? "ALL 全部满足" : "ANY 任一满足"} · ${m.conditions.length} 个子条件`;
+      return `复合 ${m.logic.toUpperCase()} (${m.conditions.length})`;
   }
 }
 
-function abDiffLabel(st: AbDiffStatus): string {
-  const map: Record<AbDiffStatus, string> = {
-    unchanged_accepted: "维持放行",
-    unchanged_rejected: "维持拦截",
-    newly_rejected: "新增拦截",
-    newly_accepted: "解除拦截",
-    refined_name_changed: "清洗标题变化",
+function markDirty() {
+  dirty.value = true;
+  telemetry.filterHasDraft = true;
+}
+
+function deepClone<T>(value: T): T {
+  return JSON.parse(JSON.stringify(value)) as T;
+}
+
+function applyLoadedState(st: Awaited<ReturnType<typeof getFilterState>>) {
+  publishedVer.value = st.published;
+  draftVer.value = st.draft;
+  onlineIndexers.value = st.online_indexers;
+  const activeBundle = st.draft?.bundle ?? st.published?.bundle ?? makeFallbackBundle();
+  const cloned = deepClone(activeBundle);
+  cloned.policy.cleaner = {
+    ...makeFallbackBundle().policy.cleaner,
+    ...(cloned.policy.cleaner ?? {}),
   };
-  return map[st];
+  bundle.value = cloned;
+  dirty.value = false;
+  telemetry.filterHasDraft = Boolean(st.has_draft || st.draft);
 }
 
-function abDiffTagType(
-  st: AbDiffStatus,
-): "success" | "danger" | "warning" | "info" | "primary" {
-  switch (st) {
-    case "newly_rejected":
-      return "danger";
-    case "newly_accepted":
-      return "success";
-    case "refined_name_changed":
-      return "warning";
-    case "unchanged_rejected":
-      return "info";
-    default:
-      return "primary";
-  }
-}
-
-async function fetchState() {
+async function fetchAllInitial() {
   loading.value = true;
   try {
-    const res = await getFilterState();
-    filterState.value = res;
-    const base = res.draft?.bundle ?? res.published?.bundle ?? emptyBundle();
-    workingBundle.value = cloneBundle(base);
-    baselineJson.value = JSON.stringify(workingBundle.value);
-    draftNote.value = res.draft?.note ?? "";
-  } catch (err) {
-    ElMessage.error(err instanceof Error ? err.message : "加载过滤规则失败");
+    const [st, pr] = await Promise.all([getFilterState(), getFilterPresets()]);
+    presets.value = pr;
+    applyLoadedState(st);
+    if (pr.policy_presets.length > 0) {
+      resetPresetId.value = pr.policy_presets[0].id;
+    }
+  } catch (e) {
+    ElMessage.error(e instanceof Error ? e.message : "加载过滤工作台状态失败");
   } finally {
     loading.value = false;
   }
 }
 
-async function fetchPresets() {
-  try {
-    presetsCatalog.value = await getFilterPresets();
-  } catch {
-    presetsCatalog.value = null;
-  }
-}
-
-async function fetchVersions() {
-  versionsLoading.value = true;
-  try {
-    versions.value = await listFilterVersions(30);
-  } catch {
-    versions.value = [];
-  } finally {
-    versionsLoading.value = false;
-  }
-}
-
-async function fetchStats() {
-  statsLoading.value = true;
-  try {
-    stats.value = await getFilterStats();
-  } catch (err) {
-    ElMessage.error(err instanceof Error ? err.message : "加载拦截统计失败");
-  } finally {
-    statsLoading.value = false;
-  }
-}
-
-async function refreshAll() {
-  await Promise.all([fetchState(), fetchPresets(), fetchVersions(), fetchStats()]);
-}
-
 async function handleValidate() {
   validating.value = true;
   try {
-    const res = await validateFilterBundle(workingBundle.value);
+    const res = await validateFilterBundle(bundle.value);
     ElMessage.success(
-      `策略校验通过：门禁 ${res.counts.enabled_gates} 项 / 规则 ${res.counts.enabled_rules}/${res.counts.total_rules} 条（放行 ${res.counts.allow_rules} · 拦截 ${res.counts.reject_rules}）/ 清洗词库 ${res.counts.ad_phrases + res.counts.ad_regexes}`,
+      `校验通过：${res.counts.enabled_rules}/${res.counts.total_rules} 条规则启用 · ${res.counts.ad_phrases} 短语 · ${res.counts.ad_regexes} 正则`,
     );
-  } catch (err) {
-    ElMessage.error(err instanceof Error ? err.message : "规则校验失败");
+  } catch (e) {
+    ElMessage.error(e instanceof Error ? e.message : "配置校验未通过");
   } finally {
     validating.value = false;
   }
 }
 
-async function handleSaveDraft(): Promise<boolean> {
+async function handleSaveDraft(silent = false): Promise<boolean> {
   saving.value = true;
   try {
-    const saved = await saveFilterDraft(
-      workingBundle.value,
-      draftNote.value.trim() || "面板策略草稿更新",
-    );
-    workingBundle.value = cloneBundle(saved.bundle);
-    baselineJson.value = JSON.stringify(workingBundle.value);
-    await fetchState();
-    await fetchVersions();
-    ElMessage.success(`已保存草稿 v${saved.version}`);
+    const saved = await saveFilterDraft(bundle.value, "通过可视化工作台保存草稿");
+    draftVer.value = saved;
+    dirty.value = false;
+    telemetry.filterHasDraft = true;
+    if (!silent) ElMessage.success(`草稿已保存为 v${saved.version}`);
     return true;
-  } catch (err) {
-    ElMessage.error(err instanceof Error ? err.message : "保存草稿失败");
+  } catch (e) {
+    ElMessage.error(e instanceof Error ? e.message : "保存草稿失败");
     return false;
   } finally {
     saving.value = false;
@@ -529,1665 +410,1921 @@ async function handleSaveDraft(): Promise<boolean> {
 
 async function handleDiscardDraft() {
   try {
-    await ElMessageBox.confirm(
-      "确认放弃当前草稿并将编辑区恢复为线上正在生效的版本吗？",
-      "放弃草稿确认",
-      { type: "warning", confirmButtonText: "确认放弃", cancelButtonText: "取消" },
-    );
-  } catch {
-    return;
-  }
-  saving.value = true;
-  try {
     await discardFilterDraft();
-    lastConversionNotes.value = [];
-    await refreshAll();
-    ElMessage.success("已放弃草稿并恢复为线上版本");
-  } catch (err) {
-    ElMessage.error(err instanceof Error ? err.message : "放弃草稿失败");
-  } finally {
-    saving.value = false;
+    const st = await getFilterState();
+    applyLoadedState(st);
+    ElMessage.success("已放弃草稿并恢复线上已发布版本");
+  } catch (e) {
+    ElMessage.error(e instanceof Error ? e.message : "放弃草稿失败");
   }
 }
 
-async function handlePublish() {
-  if (!filterState.value?.has_draft && !hasUnsavedChanges.value) {
-    ElMessage.info("当前内容与线上版本一致，暂无待发布变更");
-    return;
-  }
-  try {
-    await ElMessageBox.confirm(
-      "发布后将覆盖当前线上生效版本，并通过本地 IPC 向所有在线 Indexer 无停机广播热更新，确认发布吗？",
-      "发布并热更新",
-      { type: "warning", confirmButtonText: "立即发布并热更新", cancelButtonText: "取消" },
-    );
-  } catch {
-    return;
-  }
+function openPublishModal() {
+  publishVisible.value = true;
+}
 
+async function confirmPublish() {
   publishing.value = true;
   try {
-    if (hasUnsavedChanges.value || !filterState.value?.has_draft) {
-      const ok = await handleSaveDraft();
-      if (!ok) return;
+    if (dirty.value || !draftVer.value) {
+      const ok = await handleSaveDraft(true);
+      if (!ok) {
+        publishing.value = false;
+        return;
+      }
     }
-    const res = await publishFilterDraft(draftNote.value.trim() || undefined);
-    const failed = res.reload_results.filter((r) => !r.ok);
-    if (failed.length > 0) {
-      ElMessage.warning(
-        `已发布 v${res.published.version}，但部分 Indexer 热更新失败：${failed.map((f) => `${f.instance_id}(${f.message})`).join("；")}`,
-      );
-    } else if (res.reload_results.length > 0) {
-      ElMessage.success(
-        `已发布 v${res.published.version}，并热更新 ${res.reload_results.length} 个在线 Indexer（无重启生效）`,
-      );
-    } else {
-      ElMessage.success(`已发布线上版本 v${res.published.version}（当前无在线 Indexer）`);
-    }
-    await refreshAll();
-  } catch (err) {
-    ElMessage.error(err instanceof Error ? err.message : "发布规则失败");
+    const res = await publishFilterDraft(publishNote.value.trim() || undefined);
+    const okCount = res.reload_results.filter((r) => r.ok).length;
+    const failCount = res.reload_results.length - okCount;
+    ElMessage.success(
+      `已发布 v${res.published.version}` +
+        (res.reload_results.length > 0
+          ? `，热推送 ${okCount} 个 Indexer 成功` + (failCount > 0 ? ` (${failCount} 个失败)` : "")
+          : ""),
+    );
+    publishVisible.value = false;
+    const st = await getFilterState();
+    applyLoadedState(st);
+  } catch (e) {
+    ElMessage.error(e instanceof Error ? e.message : "发布失败");
   } finally {
     publishing.value = false;
   }
 }
 
-function openCreateRuleDrawer(tpl?: RuleTemplateInfo) {
-  drawerIsNew.value = true;
-  drawerInsertIndex.value = null;
-  if (tpl) {
-    const cloned = JSON.parse(JSON.stringify(tpl.rule)) as PolicyRule;
-    cloned.id = `${tpl.id.replace(/^tpl-/, "")}-${Date.now()}`;
-    drawerRule.value = cloned;
-  } else {
-    drawerRule.value = null;
+async function submitImportLegacy() {
+  if (!importRawJson.value.trim()) {
+    ElMessage.warning("请粘贴旧版 rules / cleaner JSON 内容");
+    return;
   }
+  importBusy.value = true;
+  try {
+    const res = await importLegacyFilter(importRawJson.value, true, importNote.value.trim() || "导入旧版规则");
+    ElMessage.success(`已转换 (${res.source_format}) 并存入草稿`);
+    importVisible.value = false;
+    const st = await getFilterState();
+    applyLoadedState(st);
+  } catch (e) {
+    ElMessage.error(e instanceof Error ? e.message : "导入解析失败");
+  } finally {
+    importBusy.value = false;
+  }
+}
+
+async function submitResetPreset() {
+  resetBusy.value = true;
+  try {
+    await resetFilterPreset(resetPresetId.value, resetIncludeDict.value, `重置为预设模板 ${resetPresetId.value}`);
+    ElMessage.success("已生成预设模板草稿");
+    resetVisible.value = false;
+    const st = await getFilterState();
+    applyLoadedState(st);
+  } catch (e) {
+    ElMessage.error(e instanceof Error ? e.message : "重置失败");
+  } finally {
+    resetBusy.value = false;
+  }
+}
+
+// Rule list editing helpers
+function openCreateRule() {
+  drawerMode.value = "create";
+  editingRuleIdx.value = null;
+  editingRuleObj.value = null;
   drawerVisible.value = true;
 }
 
-function openEditRuleDrawer(rule: PolicyRule) {
-  drawerIsNew.value = false;
-  drawerInsertIndex.value = workingBundle.value.policy.rules.indexOf(rule);
-  drawerRule.value = JSON.parse(JSON.stringify(rule)) as PolicyRule;
+function openEditRule(idx: number) {
+  drawerMode.value = "edit";
+  editingRuleIdx.value = idx;
+  editingRuleObj.value = bundle.value.policy.rules[idx];
   drawerVisible.value = true;
 }
 
-function handleSaveRuleFromDrawer(saved: PolicyRule) {
-  if (drawerIsNew.value) {
-    if (drawerInsertIndex.value !== null && drawerInsertIndex.value >= 0) {
-      workingBundle.value.policy.rules.splice(drawerInsertIndex.value, 0, saved);
-    } else if (saved.action === "allow") {
-      // 白名单默认插入最顶部以高于一般拦截规则，安全后缀之后用户可微调顺序
-      workingBundle.value.policy.rules.unshift(saved);
-    } else {
-      workingBundle.value.policy.rules.push(saved);
+function saveRuleFromDrawer(nextRule: PolicyRule) {
+  if (drawerMode.value === "create" || editingRuleIdx.value === null) {
+    bundle.value.policy.rules.push(nextRule);
+  } else {
+    bundle.value.policy.rules.splice(editingRuleIdx.value, 1, nextRule);
+  }
+  markDirty();
+}
+
+function moveRule(idx: number, delta: -1 | 1) {
+  const arr = bundle.value.policy.rules;
+  const target = idx + delta;
+  if (target < 0 || target >= arr.length) return;
+  [arr[idx], arr[target]] = [arr[target], arr[idx]];
+  markDirty();
+}
+
+function duplicateRule(idx: number) {
+  const src = bundle.value.policy.rules[idx];
+  const copy = deepClone(src);
+  copy.id = `${src.id}_copy_${Date.now().toString(36).slice(-4)}`;
+  copy.name = `${src.name} (副本)`;
+  bundle.value.policy.rules.splice(idx + 1, 0, copy);
+  markDirty();
+}
+
+function deleteRule(idx: number) {
+  bundle.value.policy.rules.splice(idx, 1);
+  markDirty();
+}
+
+function addFromTemplate(tplRule: PolicyRule) {
+  const copy = deepClone(tplRule);
+  if (bundle.value.policy.rules.some((r) => r.id === copy.id)) {
+    copy.id = `${copy.id}_${Date.now().toString(36).slice(-4)}`;
+  }
+  bundle.value.policy.rules.push(copy);
+  markDirty();
+  templatesModalVisible.value = false;
+  ElMessage.success(`已追加规则模板「${copy.name}」`);
+}
+
+// Cleaner inline + modal helpers
+function openAddPhraseModal(tab: "single" | "batch" = "single") {
+  phraseModalTab.value = tab;
+  singlePhraseText.value = "";
+  singlePhraseNote.value = "";
+  bulkPhraseText.value = "";
+  bulkPhraseNote.value = "";
+  addPhraseVisible.value = true;
+}
+
+function submitAddPhraseModal() {
+  if (phraseModalTab.value === "single") {
+    const p = singlePhraseText.value.trim();
+    if (!p) {
+      ElMessage.warning("请输入广告短语");
+      return;
     }
-    ElMessage.success(`已添加规则「${saved.name}」（记得点击保存/发布生效）`);
-  } else if (drawerInsertIndex.value !== null && drawerInsertIndex.value >= 0) {
-    workingBundle.value.policy.rules[drawerInsertIndex.value] = saved;
-    ElMessage.success(`已更新规则「${saved.name}」`);
-  }
-}
-
-function duplicateRule(rule: PolicyRule) {
-  const idx = workingBundle.value.policy.rules.indexOf(rule);
-  if (idx < 0) return;
-  const copy = JSON.parse(JSON.stringify(rule)) as PolicyRule;
-  copy.id = `${rule.id}-copy-${Date.now()}`;
-  copy.name = `${rule.name} (副本)`;
-  workingBundle.value.policy.rules.splice(idx + 1, 0, copy);
-}
-
-function moveRule(rule: PolicyRule, delta: -1 | 1) {
-  const idx = workingBundle.value.policy.rules.indexOf(rule);
-  const nextIdx = idx + delta;
-  if (idx < 0 || nextIdx < 0 || nextIdx >= workingBundle.value.policy.rules.length) return;
-  const arr = workingBundle.value.policy.rules;
-  const [item] = arr.splice(idx, 1);
-  arr.splice(nextIdx, 0, item);
-}
-
-function removeRule(rule: PolicyRule) {
-  workingBundle.value.policy.rules = workingBundle.value.policy.rules.filter((x) => x !== rule);
-}
-
-function locateRuleFromSample(sample: WorkerRejectedSampleDto) {
-  const target = workingBundle.value.policy.rules.find((r) => r.id === sample.hit.rule_id);
-  activeMainTab.value = "policy";
-  if (target) {
-    openEditRuleDrawer(target);
-  } else {
-    ElMessage.info(
-      `命中规则 ${sample.hit.rule_id}（${sample.hit.rule_label}）属于基础门禁或旧版本规则，可在上方「基础门禁」或演练场调试`,
-    );
-  }
-}
-
-function quickAllowFromSample(sample: WorkerRejectedSampleDto) {
-  activeMainTab.value = "policy";
-  drawerIsNew.value = true;
-  drawerInsertIndex.value = 0;
-  drawerRule.value = {
-    id: `allow-sample-${Date.now()}`,
-    name: `白名单放行：${sample.raw_name.slice(0, 28)}`,
-    enabled: true,
-    action: "allow",
-    tags: ["快速白名单"],
-    note: `基于被拦截样本 ${sample.info_hash.slice(0, 12)} 快速生成`,
-    matcher: {
-      type: "keyword_group",
-      target: "raw_name",
-      match_mode: "word_boundary",
-      case_sensitive: false,
-      words: [sample.raw_name],
-    },
-  };
-  drawerVisible.value = true;
-}
-
-function addAdPhrase() {
-  const val = newAdPhrase.value.trim();
-  if (!val) return;
-  workingBundle.value.ad_phrases.unshift({
-    id: `ad-phrase-${Date.now()}`,
-    phrase: val,
-    enabled: true,
-    note: newAdPhraseNote.value.trim(),
-  });
-  newAdPhrase.value = "";
-  newAdPhraseNote.value = "";
-}
-
-function addAdRegex() {
-  const pat = newAdRegex.value.trim();
-  if (!pat) return;
-  workingBundle.value.ad_regexes.unshift({
-    id: `ad-re-${Date.now()}`,
-    pattern: pat,
-    replacement: newAdRegexReplacement.value ?? " ",
-    enabled: true,
-    note: newAdRegexNote.value.trim(),
-  });
-  newAdRegex.value = "";
-  newAdRegexReplacement.value = " ";
-  newAdRegexNote.value = "";
-}
-
-function openLegacyImport() {
-  legacyImportText.value = "";
-  legacyImportNote.value = "";
-  legacyImportVisible.value = true;
-}
-
-function handleLegacyFileSelected(ev: Event) {
-  const input = ev.target as HTMLInputElement;
-  const file = input.files?.[0];
-  if (!file) return;
-  const reader = new FileReader();
-  reader.onload = () => {
-    legacyImportText.value = String(reader.result ?? "");
-  };
-  reader.readAsText(file);
-  input.value = "";
-}
-
-async function submitLegacyImport() {
-  if (!legacyImportText.value.trim()) {
-    ElMessage.warning("请粘贴 JSON 或选择配置文件");
+    const rule: AdPhraseRule = {
+      id: `phr_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 5)}`,
+      phrase: p,
+      enabled: true,
+      note: singlePhraseNote.value.trim(),
+    };
+    bundle.value.ad_phrases.unshift(rule);
+    markDirty();
+    addPhraseVisible.value = false;
+    ElMessage.success(`已添加广告短语「${p}」`);
     return;
   }
-  legacyImporting.value = true;
-  try {
-    const res = await importLegacyFilter(
-      legacyImportText.value,
-      true,
-      legacyImportNote.value.trim() || "导入并转换为 Hameta v2 策略",
-    );
-    workingBundle.value = cloneBundle(res.bundle);
-    baselineJson.value = JSON.stringify(workingBundle.value);
-    lastConversionNotes.value = res.conversion_notes;
-    legacyImportVisible.value = false;
-    await fetchState();
-    await fetchVersions();
-    ElMessage.success(
-      `导入成功（${res.source_format}）：已写入草稿 v${res.saved_draft?.version ?? ""}（共 ${res.bundle.policy.rules.length} 条策略规则）`,
-    );
-  } catch (err) {
-    ElMessage.error(err instanceof Error ? err.message : "导入 JSON 失败");
-  } finally {
-    legacyImporting.value = false;
-  }
-}
 
-function downloadJson(data: unknown, filename: string) {
-  const blob = new Blob([JSON.stringify(data, null, 2)], {
-    type: "application/json;charset=utf-8",
-  });
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement("a");
-  a.href = url;
-  a.download = filename;
-  a.click();
-  URL.revokeObjectURL(url);
-}
-
-function handleExportV2Bundle() {
-  const ver = workingBundle.value.version || 0;
-  downloadJson(workingBundle.value, `hameta-filter-v2-bundle-v${ver}.json`);
-}
-
-async function handleApplyPolicyPreset(presetId: string) {
-  const info = presetsCatalog.value?.policy_presets.find((p) => p.id === presetId);
-  const name = info?.name ?? presetId;
-  try {
-    await ElMessageBox.confirm(
-      `将切换并加载预设「${name}」（${info?.summary ?? ""}）到草稿，原有草稿内容将被替换，是否继续？`,
-      "应用内置场景预设",
-      {
-        confirmButtonText: "加载预设到草稿",
-        cancelButtonText: "取消",
-        type: "warning",
-      },
-    );
-  } catch {
-    return;
-  }
-  saving.value = true;
-  try {
-    const saved = await resetFilterPreset(presetId, true, `切换场景预设: ${name}`);
-    workingBundle.value = cloneBundle(saved.bundle);
-    baselineJson.value = JSON.stringify(workingBundle.value);
-    lastConversionNotes.value = [];
-    await refreshAll();
-    ElMessage.success(`已将预设「${name}」加载至草稿 v${saved.version}`);
-  } catch (err) {
-    ElMessage.error(err instanceof Error ? err.message : "应用预设失败");
-  } finally {
-    saving.value = false;
-  }
-}
-
-async function handleRollback(targetVersion: number) {
-  try {
-    await ElMessageBox.confirm(
-      `确认将规则直接回滚到历史版本 v${targetVersion} 并立刻向所有在线 Indexer 广播热更新吗？`,
-      "回滚确认",
-      { type: "warning", confirmButtonText: "确认回滚并热更新", cancelButtonText: "取消" },
-    );
-  } catch {
-    return;
-  }
-  publishing.value = true;
-  try {
-    const res = await rollbackFilterVersion(targetVersion);
-    ElMessage.success(
-      `已回滚生成线上版本 v${res.published.version}，通知 ${res.reload_results.length} 个 Indexer 节点`,
-    );
-    await refreshAll();
-  } catch (err) {
-    ElMessage.error(err instanceof Error ? err.message : "回滚失败");
-  } finally {
-    publishing.value = false;
-  }
-}
-
-// 演练场逻辑
-async function runSingleTest() {
-  if (!singleTitle.value.trim()) {
-    ElMessage.warning("请输入测试标题");
-    return;
-  }
-  singleRunning.value = true;
-  try {
-    const res = await runPlaygroundTest({
-      mode: pgMode.value,
-      draft_bundle: workingBundle.value,
-      auto_placeholder_file: singleAutoFile.value,
-      samples: [
-        {
-          info_hash: singleInfoHash.value.trim() || undefined,
-          name: singleTitle.value,
-          files: singleAutoFile.value ? [] : singleFiles.value,
-        },
-      ],
-    });
-    singleResult.value = res.results[0] ?? null;
-    singleAbItem.value = res.ab_report?.items[0] ?? null;
-  } catch (err) {
-    ElMessage.error(err instanceof Error ? err.message : "单条试跑失败");
-  } finally {
-    singleRunning.value = false;
-  }
-}
-
-async function loadSamplesFrom(source: "manticore_latest" | "manticore_random" | "rejected_recent") {
-  batchSampling.value = true;
-  try {
-    const res = await samplePlaygroundTorrents({
-      source,
-      limit: 30,
-      keyword: batchKeyword.value.trim() || undefined,
-    });
-    batchSamples.value = res.samples;
-    batchAbReport.value = null;
-    ElMessage.success(`已加载 ${res.samples.length} 条回归样本`);
-  } catch (err) {
-    ElMessage.error(err instanceof Error ? err.message : "抽样加载失败");
-  } finally {
-    batchSampling.value = false;
-  }
-}
-
-function applyPasteSamples() {
-  const lines = batchPasteText.value
+  const lines = bulkPhraseText.value
     .split(/\r?\n/)
     .map((s) => s.trim())
-    .filter(Boolean)
-    .slice(0, 200);
+    .filter((s) => s.length > 0);
   if (lines.length === 0) {
-    ElMessage.warning("请输入至少一行种子标题");
+    ElMessage.warning("请至少输入一条广告短语");
     return;
   }
-  batchSamples.value = lines.map((name) => ({ name }));
-  batchPasteVisible.value = false;
-  batchAbReport.value = null;
-  ElMessage.success(`已加载 ${lines.length} 条粘贴样本`);
-}
-
-async function runBatchAbCompare() {
-  if (batchSamples.value.length === 0) {
-    ElMessage.warning("请先从 Manticore / 拦截缓存抽样或粘贴测试标题");
-    return;
-  }
-  batchRunning.value = true;
-  try {
-    const res = await runPlaygroundTest({
-      mode: "ab_compare",
-      draft_bundle: workingBundle.value,
-      auto_placeholder_file: true,
-      samples: batchSamples.value.slice(0, 200),
+  const existing = new Set(bundle.value.ad_phrases.map((x) => x.phrase));
+  const note = bulkPhraseNote.value.trim() || "批量导入";
+  let added = 0;
+  for (const line of lines) {
+    if (existing.has(line)) continue;
+    existing.add(line);
+    bundle.value.ad_phrases.unshift({
+      id: `phr_${Date.now().toString(36)}_${added}`,
+      phrase: line,
+      enabled: true,
+      note,
     });
-    batchAbReport.value = res.ab_report;
-  } catch (err) {
-    ElMessage.error(err instanceof Error ? err.message : "批量 A/B 对比失败");
-  } finally {
-    batchRunning.value = false;
+    added += 1;
+  }
+  markDirty();
+  addPhraseVisible.value = false;
+  ElMessage.success(`已追加 ${added} 条广告短语`);
+}
+
+function openAddRegexModal(tab: "single" | "batch" = "single") {
+  regexModalTab.value = tab;
+  singleRegexPattern.value = "";
+  singleRegexReplacement.value = " ";
+  singleRegexNote.value = "";
+  bulkRegexText.value = "";
+  bulkRegexReplacement.value = " ";
+  bulkRegexNote.value = "";
+  addRegexVisible.value = true;
+}
+
+function fillRegexPreset(pattern: string, replacement: string, note: string) {
+  singleRegexPattern.value = pattern;
+  singleRegexReplacement.value = replacement;
+  singleRegexNote.value = note;
+}
+
+function submitAddRegexModal() {
+  if (regexModalTab.value === "single") {
+    const pat = singleRegexPattern.value.trim();
+    if (!pat) {
+      ElMessage.warning("请输入正则表达式");
+      return;
+    }
+    const rule: AdRegexRule = {
+      id: `rgx_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 5)}`,
+      pattern: pat,
+      replacement: singleRegexReplacement.value,
+      enabled: true,
+      note: singleRegexNote.value.trim(),
+    };
+    bundle.value.ad_regexes.unshift(rule);
+    markDirty();
+    addRegexVisible.value = false;
+    ElMessage.success("已添加动态广告正则");
+    return;
+  }
+
+  const lines = bulkRegexText.value
+    .split(/\r?\n/)
+    .map((s) => s.trim())
+    .filter((s) => s.length > 0);
+  if (lines.length === 0) {
+    ElMessage.warning("请至少输入一条正则表达式");
+    return;
+  }
+  const existing = new Set(bundle.value.ad_regexes.map((x) => x.pattern));
+  const note = bulkRegexNote.value.trim() || "批量正则导入";
+  let added = 0;
+  for (const pat of lines) {
+    if (existing.has(pat)) continue;
+    existing.add(pat);
+    bundle.value.ad_regexes.unshift({
+      id: `rgx_${Date.now().toString(36)}_${added}`,
+      pattern: pat,
+      replacement: bulkRegexReplacement.value,
+      enabled: true,
+      note,
+    });
+    added += 1;
+  }
+  markDirty();
+  addRegexVisible.value = false;
+  ElMessage.success(`已追加 ${added} 条动态广告正则`);
+}
+
+// Playground helpers
+function syncSamplesTextFromList() {
+  pgSamplesText.value = pgSamples.value.map((s) => s.name).join("\n");
+}
+
+function applyTitleFromQuickOrLines() {
+  const t = pgQuickTitle.value.trim();
+  if (t) {
+    pgSamples.value.unshift({ name: t, files: [{ path: `${t}.mkv`, size: 1_500_000_000 }] });
+    pgQuickTitle.value = "";
+    syncSamplesTextFromList();
   }
 }
 
-function sendSampleToPlayground(rawName: string, infoHash?: string) {
-  singleTitle.value = rawName;
-  singleInfoHash.value = infoHash ?? "";
-  activeMainTab.value = "playground";
-  void runSingleTest();
+async function loadSamplesFromBackend(source: "manticore_latest" | "manticore_random" | "rejected_recent") {
+  pgSampling.value = true;
+  try {
+    const res = await samplePlaygroundTorrents({ source, limit: 15 });
+    pgSamples.value = res.samples;
+    syncSamplesTextFromList();
+    ElMessage.success(`已载入 ${res.samples.length} 条真实样本 (${source})`);
+  } catch (e) {
+    ElMessage.error(e instanceof Error ? e.message : "拉取样本失败");
+  } finally {
+    pgSampling.value = false;
+  }
 }
 
-onMounted(() => {
-  void refreshAll();
+async function runPlayground() {
+  // Merge lines from textarea if edited manually
+  const lines = pgSamplesText.value
+    .split(/\r?\n/)
+    .map((s) => s.trim())
+    .filter((s) => s.length > 0);
+
+  let inputs: PlaygroundInput[];
+  if (lines.length > 0 && lines.length !== pgSamples.value.length) {
+    inputs = lines.map((name) => ({ name }));
+  } else if (lines.length > 0) {
+    inputs = lines.map((name, i) => ({
+      ...(pgSamples.value[i] ?? {}),
+      name,
+    }));
+  } else {
+    ElMessage.warning("请至少输入或拉取 1 条测试标题");
+    return;
+  }
+
+  pgRunning.value = true;
+  try {
+    pgResult.value = await runPlaygroundTest({
+      mode: pgMode.value,
+      draft_bundle: pgMode.value === "published" ? undefined : bundle.value,
+      samples: inputs,
+      auto_placeholder_file: pgAutoPlaceholder.value,
+    });
+  } catch (e) {
+    ElMessage.error(e instanceof Error ? e.message : "演练测试失败");
+  } finally {
+    pgRunning.value = false;
+  }
+}
+
+function sendTitleToPlayground(title: string) {
+  pgSamples.value = [{ name: title, files: [] }, ...pgSamples.value.slice(0, 14)];
+  syncSamplesTextFromList();
+  activeTab.value = "playground";
+}
+
+function abDiffLabel(s: AbDiffStatus): { text: string; cls: string } {
+  switch (s) {
+    case "newly_rejected":
+      return { text: "新增拦截", cls: "bg-rose-500/15 text-rose-300 border-rose-500/35" };
+    case "newly_accepted":
+      return { text: "新增放行", cls: "bg-emerald-500/15 text-emerald-300 border-emerald-500/35" };
+    case "refined_name_changed":
+      return { text: "清洗标题变化", cls: "bg-amber-500/15 text-amber-300 border-amber-500/35" };
+    case "unchanged_rejected":
+      return { text: "一致拦截", cls: "bg-slate-800/80 text-slate-400 border-slate-700" };
+    default:
+      return { text: "一致放行", cls: "bg-slate-800/80 text-slate-300 border-slate-700" };
+  }
+}
+
+// Smart ad template discovery helpers
+const visibleDiscoveryCandidates = computed(() => {
+  const existing = new Set(bundle.value.ad_phrases.map((x) => x.phrase.trim().toLowerCase()));
+  return discoveredCandidates.value.filter((c) => {
+    const k = c.phrase.trim().toLowerCase();
+    return k && !existing.has(k) && !dismissedDiscoveryKeys.value.has(k);
+  });
+});
+
+async function loadLiveDiscoveryCandidates(silent = false) {
+  discoveryLoading.value = true;
+  try {
+    const res = await getFilterStats();
+    stats.value = res;
+    discoveredCandidates.value = res.discovered_ad_candidates ?? [];
+    discoveryMeta.value =
+      discoveredCandidates.value.length > 0
+        ? `已同步在线 Indexer 旁路统计，发现 ${discoveredCandidates.value.length} 个高频模板`
+        : "当前在线 Indexer 暂未观察到跨标题重复的新水印候选";
+    if (!silent) {
+      ElMessage.success(discoveryMeta.value);
+    }
+  } catch (e) {
+    if (!silent) {
+      ElMessage.error(e instanceof Error ? e.message : "拉取在线发现候选失败");
+    }
+  } finally {
+    discoveryLoading.value = false;
+  }
+}
+
+async function scanManticoreDiscoveryCandidates() {
+  discoveryScanning.value = true;
+  try {
+    const res = await discoverAdCandidates(300);
+    discoveredCandidates.value = res.candidates ?? [];
+    discoveryMeta.value =
+      res.scanned_titles > 0
+        ? `已扫描库内近期 ${res.scanned_titles} 条种子并合并在线发现，识别 ${visibleDiscoveryCandidates.value.length} 个候选模板`
+        : `来源 ${res.source}，识别 ${visibleDiscoveryCandidates.value.length} 个候选模板`;
+    ElMessage.success(discoveryMeta.value);
+  } catch (e) {
+    ElMessage.error(e instanceof Error ? e.message : "扫描库内疑似广告模板失败");
+  } finally {
+    discoveryScanning.value = false;
+  }
+}
+
+function adoptDiscoveredCandidate(cand: DiscoveredAdCandidate) {
+  const phrase = cand.phrase.trim();
+  if (!phrase) return;
+  const existing = new Set(bundle.value.ad_phrases.map((x) => x.phrase.trim().toLowerCase()));
+  if (!existing.has(phrase.toLowerCase())) {
+    bundle.value.ad_phrases.unshift({
+      id: `phr_auto_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 5)}`,
+      phrase,
+      enabled: true,
+      note: `智能统计自发现（覆盖 ${cand.distinct_titles} 个不同标题）`,
+    });
+    markDirty();
+    ElMessage.success(`已将「${phrase}」加入动态广告短语草稿`);
+  }
+  dismissedDiscoveryKeys.value.add(phrase.toLowerCase());
+}
+
+function dismissDiscoveredCandidate(cand: DiscoveredAdCandidate) {
+  dismissedDiscoveryKeys.value.add(cand.phrase.trim().toLowerCase());
+}
+
+// Stats & Versions loaders
+async function loadStats() {
+  statsLoading.value = true;
+  try {
+    stats.value = await getFilterStats();
+    if ((stats.value.discovered_ad_candidates?.length ?? 0) > 0 && discoveredCandidates.value.length === 0) {
+      discoveredCandidates.value = stats.value.discovered_ad_candidates ?? [];
+    }
+  } catch (e) {
+    ElMessage.error(e instanceof Error ? e.message : "读取命中统计失败");
+  } finally {
+    statsLoading.value = false;
+  }
+}
+
+async function loadVersions() {
+  versionsLoading.value = true;
+  try {
+    versions.value = await listFilterVersions(30);
+  } catch (e) {
+    ElMessage.error(e instanceof Error ? e.message : "读取规则版本历史失败");
+  } finally {
+    versionsLoading.value = false;
+  }
+}
+
+async function handleRollback(ver: number) {
+  rollbackBusyVer.value = ver;
+  try {
+    const res = await rollbackFilterVersion(ver);
+    ElMessage.success(`已回滚并发布新版本 v${res.published.version}`);
+    const st = await getFilterState();
+    applyLoadedState(st);
+    await loadVersions();
+  } catch (e) {
+    ElMessage.error(e instanceof Error ? e.message : "版本回滚失败");
+  } finally {
+    rollbackBusyVer.value = null;
+  }
+}
+
+function applyRouteDeepLink() {
+  const tabQ = route.query.tab;
+  const titleQ = route.query.title;
+  let changed = false;
+  if (tabQ === "playground" || tabQ === "rules" || tabQ === "cleaner" || tabQ === "stats" || tabQ === "versions") {
+    activeTab.value = tabQ;
+    changed = true;
+  }
+  if (typeof titleQ === "string" && titleQ.trim()) {
+    const t = titleQ.trim();
+    pgSamples.value = [{ name: t, files: [{ path: `${t}.mkv`, size: 1_500_000_000 }] }];
+    syncSamplesTextFromList();
+    activeTab.value = "playground";
+    changed = true;
+  }
+  if (changed) {
+    void router.replace({ path: "/filter", query: {} });
+  }
+}
+
+watch(activeTab, (tab) => {
+  if (tab === "cleaner" && discoveredCandidates.value.length === 0 && !discoveryMeta.value) {
+    void loadLiveDiscoveryCandidates(true);
+  }
+  if (tab === "stats") void loadStats();
+  if (tab === "versions") void loadVersions();
+});
+
+watch(
+  () => [route.query.tab, route.query.title],
+  () => {
+    applyRouteDeepLink();
+  },
+);
+
+onMounted(async () => {
+  syncSamplesTextFromList();
+  applyRouteDeepLink();
+  await fetchAllInitial();
+  if (activeTab.value === "stats") void loadStats();
+  if (activeTab.value === "versions") void loadVersions();
 });
 </script>
 
 <template>
-  <div class="max-w-7xl mx-auto space-y-5" v-loading="loading">
-    <!-- 顶部状态与版本发布控制栏 -->
-    <div class="rounded-xl border border-slate-200 bg-white p-5 shadow-sm space-y-3.5">
+  <div class="space-y-4">
+    <!-- 2-Row Governance Header -->
+    <section class="obs-card rounded-xl p-4 space-y-3">
       <div class="flex flex-wrap items-center justify-between gap-3">
-        <div>
-          <div class="flex flex-wrap items-center gap-2">
-            <h2 class="text-base font-semibold text-slate-900">过滤清洗工作台 (Filter Policy v2)</h2>
-            <el-tag v-if="filterState?.published" type="success" size="small" effect="light">
-              线上已发布: v{{ filterState.published.version }}
-            </el-tag>
-            <el-tag v-if="filterState?.has_draft" type="warning" size="small" effect="light">
-              草稿: v{{ filterState.draft?.version }}
-            </el-tag>
-            <el-tag v-if="workingBundle.policy.preset_id" type="info" size="small" effect="plain">
-              基线: {{ workingBundle.policy.preset_id }}
-            </el-tag>
-            <el-tag v-if="hasUnsavedChanges" type="danger" size="small" effect="plain">
-              编辑器有未保存变更
-            </el-tag>
-          </div>
-          <p class="text-xs text-slate-500 mt-1">
-            三段式流水线：基础门禁 (Gates) → 8 步可控标题清洗 (Cleaner) → Allow/Reject 有序策略规则链 (`ArcSwap` 无停机热更新)
-          </p>
+        <div class="flex flex-wrap items-center gap-2">
+          <span class="px-2.5 py-0.5 rounded-full text-[11px] font-mono bg-emerald-500/12 border border-emerald-500/30 text-emerald-300 inline-flex items-center gap-1.5">
+            <span class="w-1.5 h-1.5 rounded-full bg-emerald-400" />
+            线网生效 {{ publishedVer ? `v${publishedVer.version}` : "未发布" }}
+          </span>
+          <span
+            v-if="hasDraft"
+            class="px-2.5 py-0.5 rounded-full text-[11px] font-mono bg-amber-500/15 border border-amber-500/35 text-amber-300"
+          >
+            {{ dirty ? "存在未保存编辑" : `草稿待发布 v${draftVer?.version}` }}
+          </span>
+          <span
+            v-for="ix in onlineIndexers"
+            :key="ix.id"
+            class="px-2 py-0.5 rounded-md text-[10px] font-mono bg-[#0b0f17] border border-slate-800 text-slate-300"
+          >
+            {{ ix.id }} · v{{ ix.active_rule_version ?? "—" }}
+          </span>
         </div>
 
         <div class="flex flex-wrap items-center gap-2">
-          <!-- 切换内置场景预设 -->
-          <el-dropdown @command="(id: string) => handleApplyPolicyPreset(id)">
-            <el-button size="small">
-              <Sparkles class="h-3.5 w-3.5 mr-1 text-indigo-600" />
-              切换内置预设
-            </el-button>
-            <template #dropdown>
-              <el-dropdown-menu>
-                <el-dropdown-item
-                  v-for="preset in presetsCatalog?.policy_presets ?? []"
-                  :key="preset.id"
-                  :command="preset.id"
-                >
-                  <div class="py-0.5 max-w-xs">
-                    <div class="font-medium text-slate-800 flex items-center gap-2">
-                      <span>{{ preset.name }}</span>
-                      <el-tag size="small" type="info" effect="plain">{{ preset.badge }}</el-tag>
-                    </div>
-                    <div class="text-[11px] text-slate-500 whitespace-normal">
-                      {{ preset.summary }}（{{ preset.rule_count }} 条规则）
-                    </div>
-                  </div>
-                </el-dropdown-item>
-              </el-dropdown-menu>
-            </template>
-          </el-dropdown>
-
-          <el-button size="small" @click="openLegacyImport">
-            <Upload class="h-3.5 w-3.5 mr-1" />
-            导入旧版 / 策略 JSON
-          </el-button>
-
-          <el-button size="small" @click="handleExportV2Bundle">
-            <Download class="h-3.5 w-3.5 mr-1" />
-            导出 Hameta v2 JSON
-          </el-button>
-
-          <el-button size="small" :loading="validating" @click="handleValidate">
-            <CheckCircle2 class="h-3.5 w-3.5 mr-1" />
-            校验规则
-          </el-button>
-
-          <el-button
-            v-if="filterState?.has_draft"
-            size="small"
-            type="info"
-            plain
-            :loading="saving"
+          <button type="button" class="obs-btn obs-btn-ghost px-2.5! py-1.5! text-xs! inline-flex items-center gap-1" @click="exportBundleJson">
+            <Download class="w-3.5 h-3.5" />
+            导出 JSON
+          </button>
+          <button type="button" class="obs-btn obs-btn-ghost px-2.5! py-1.5! text-xs! inline-flex items-center gap-1" @click="importVisible = true">
+            <Upload class="w-3.5 h-3.5" />
+            导入 JSON
+          </button>
+          <button type="button" class="obs-btn obs-btn-ghost px-2.5! py-1.5! text-xs! inline-flex items-center gap-1" @click="resetVisible = true">
+            <RotateCcw class="w-3.5 h-3.5" />
+            重置预设
+          </button>
+          <button type="button" class="obs-btn obs-btn-ghost px-2.5! py-1.5! text-xs! inline-flex items-center gap-1" :disabled="validating" @click="handleValidate">
+            <CheckCircle2 class="w-3.5 h-3.5 text-sky-400" />
+            {{ validating ? "校验中…" : "校验配置" }}
+          </button>
+          <button
+            v-if="hasDraft"
+            type="button"
+            class="obs-btn obs-btn-ghost px-2.5! py-1.5! text-xs! text-rose-300!"
             @click="handleDiscardDraft"
           >
             放弃草稿
-          </el-button>
-
-          <el-button size="small" type="warning" :loading="saving" @click="handleSaveDraft">
-            <Save class="h-3.5 w-3.5 mr-1" />
-            保存草稿
-          </el-button>
-
-          <el-button size="small" type="primary" :loading="publishing" @click="handlePublish">
-            <Zap class="h-3.5 w-3.5 mr-1" />
-            发布并热更新 Indexer
-          </el-button>
+          </button>
+          <button type="button" class="obs-btn obs-btn-ghost px-3! py-1.5! text-xs! inline-flex items-center gap-1" :disabled="saving" @click="handleSaveDraft(false)">
+            <Save class="w-3.5 h-3.5 text-amber-300" />
+            {{ saving ? "保存中…" : "保存草稿" }}
+          </button>
         </div>
       </div>
 
-      <!-- 智能转换提示条 -->
-      <el-alert
-        v-if="lastConversionNotes.length > 0"
-        type="success"
-        show-icon
-        closable
-        @close="lastConversionNotes = []"
-      >
-        <template #title>
-          <span class="text-xs font-medium">
-            智能转换完成：{{ lastConversionNotes.join(" · ") }}
-          </span>
-        </template>
-      </el-alert>
-
-      <!-- 在线 Indexer 规则同步状态条 -->
-      <div class="flex flex-wrap items-center justify-between gap-3 pt-2.5 border-t border-slate-100 text-xs">
-        <div class="flex flex-wrap items-center gap-2">
-          <span class="text-slate-500">在线 Indexer 规则状态:</span>
-          <span v-if="!filterState?.online_indexers.length" class="text-slate-400">
-            暂无 Indexer 实例
-          </span>
-          <el-tag
-            v-for="idx in filterState?.online_indexers ?? []"
-            :key="idx.id"
-            size="small"
-            :type="
-              idx.runtime_state === 'running'
-                ? idx.active_rule_version === filterState?.published?.version
-                  ? 'success'
-                  : 'warning'
-                : 'info'
-            "
-            effect="plain"
-          >
-            {{ idx.id }} ({{ idx.runtime_state }}) ·
-            {{ idx.active_rule_version ? `v${idx.active_rule_version}` : "未上报" }}
-          </el-tag>
-        </div>
-
-        <el-input
-          v-model="draftNote"
-          size="small"
-          placeholder="本次草稿/发布说明（可选）"
-          style="width: 260px"
+      <div class="flex flex-wrap items-center gap-2.5 pt-3 border-t border-slate-800/80">
+        <input
+          v-model="publishNote"
+          type="text"
+          placeholder="发布说明（可选），例如：收紧碎片体积门限并增补推广词库 · 热推送至在线 Indexer 写入进程"
+          class="obs-input flex-1 min-w-[240px] rounded-lg px-3 py-1.5 text-xs"
         />
+        <button type="button" class="obs-btn obs-btn-primary px-4! py-1.5! text-xs! shrink-0" :disabled="publishing" @click="openPublishModal">
+          {{ publishing ? "发布并推送中…" : "发布并热生效" }}
+        </button>
       </div>
-    </div>
+    </section>
 
-    <!-- 主工作区 Tabs -->
-    <el-tabs v-model="activeMainTab" type="border-card">
-      <!-- Tab 1: 策略编排（基础门禁 + 有序规则链） -->
-      <el-tab-pane name="policy">
-        <template #label>
-          <span class="inline-flex items-center gap-1.5">
-            <Filter class="h-3.5 w-3.5" />
-            策略编排 ({{ workingBundle.policy.rules.length }} 规则)
-          </span>
-        </template>
+    <!-- Single Unified Workbench Card -->
+    <section class="obs-card rounded-xl overflow-hidden">
+      <!-- Pill Tab Navigation Bar -->
+      <div class="px-4 py-2.5 border-b border-slate-800/80 bg-[#0b0f17] flex flex-wrap items-center justify-between gap-2 text-xs">
+        <div class="flex flex-wrap items-center gap-1.5">
+          <button
+            type="button"
+            class="px-3 py-1.5 rounded-lg font-medium inline-flex items-center gap-1.5 border transition cursor-pointer"
+            :class="activeTab === 'rules' ? 'obs-tab-active' : 'border-transparent text-slate-400 hover:text-slate-200 hover:bg-slate-800/40'"
+            @click="activeTab = 'rules'"
+          >
+            <Layers class="w-3.5 h-3.5" />
+            <span>规则策略 &amp; 闸门</span>
+            <span class="px-1.5 py-0.2 rounded bg-slate-800/90 text-[10px] font-mono-num text-slate-300">{{ bundle.policy.rules.length }}</span>
+          </button>
+          <button
+            type="button"
+            class="px-3 py-1.5 rounded-lg font-medium inline-flex items-center gap-1.5 border transition cursor-pointer"
+            :class="activeTab === 'cleaner' ? 'obs-tab-active' : 'border-transparent text-slate-400 hover:text-slate-200 hover:bg-slate-800/40'"
+            @click="activeTab = 'cleaner'"
+          >
+            <Sparkles class="w-3.5 h-3.5" />
+            <span>标题清洗与词库</span>
+            <span class="px-1.5 py-0.2 rounded bg-slate-800/90 text-[10px] font-mono-num text-slate-300">
+              {{ bundle.ad_phrases.length + bundle.ad_regexes.length }}
+            </span>
+          </button>
+          <button
+            type="button"
+            class="px-3 py-1.5 rounded-lg font-medium inline-flex items-center gap-1.5 border transition cursor-pointer"
+            :class="activeTab === 'playground' ? 'obs-tab-active' : 'border-transparent text-slate-400 hover:text-slate-200 hover:bg-slate-800/40'"
+            @click="activeTab = 'playground'"
+          >
+            <FlaskConical class="w-3.5 h-3.5" />
+            <span>A/B 演练场</span>
+          </button>
+          <button
+            type="button"
+            class="px-3 py-1.5 rounded-lg font-medium inline-flex items-center gap-1.5 border transition cursor-pointer"
+            :class="activeTab === 'stats' ? 'obs-tab-active' : 'border-transparent text-slate-400 hover:text-slate-200 hover:bg-slate-800/40'"
+            @click="activeTab = 'stats'"
+          >
+            <BarChart3 class="w-3.5 h-3.5" />
+            <span>命中统计</span>
+          </button>
+          <button
+            type="button"
+            class="px-3 py-1.5 rounded-lg font-medium inline-flex items-center gap-1.5 border transition cursor-pointer"
+            :class="activeTab === 'versions' ? 'obs-tab-active' : 'border-transparent text-slate-400 hover:text-slate-200 hover:bg-slate-800/40'"
+            @click="activeTab = 'versions'"
+          >
+            <History class="w-3.5 h-3.5" />
+            <span>版本历史</span>
+          </button>
+        </div>
 
-        <div class="space-y-5">
-          <!-- ① 基础门禁 (Gates) -->
-          <div class="rounded-xl border border-slate-200 bg-slate-50/50">
-            <div
-              class="flex items-center justify-between px-4 py-3 cursor-pointer select-none"
-              @click="gatesExpanded = !gatesExpanded"
-            >
-              <div class="flex items-center gap-2">
-                <span class="text-sm font-semibold text-slate-900">① 基础门禁 (Gates)</span>
-                <span class="text-xs text-slate-500">
-                  在清洗与复杂规则之前执行 O(1) 快速剪枝，支持显式开关与可视化容量单位
-                </span>
+        <span class="text-[11px] font-mono text-slate-500 hidden md:inline">
+          草稿校验与演练通过后可一键热更新生效
+        </span>
+      </div>
+
+      <!-- TAB 1: RULES & GATES -->
+      <div v-if="activeTab === 'rules'" class="p-4 space-y-5">
+        <!-- 11 Base Structural Gates in 3 Grouped Cards -->
+        <div class="space-y-3">
+          <div class="flex flex-wrap items-center justify-between gap-2">
+            <div>
+              <h3 class="text-xs font-semibold text-white">前置基础结构闸门 (Structural Gates)</h3>
+              <p class="text-[11px] text-slate-400">硬性完整性保护先于一切放行/拦截策略执行</p>
+            </div>
+            <span class="text-[10px] font-mono text-slate-500 uppercase tracking-wider">11 Built-in Guards</span>
+          </div>
+
+          <div class="grid grid-cols-1 md:grid-cols-3 gap-3 text-xs">
+            <!-- Group 1: 标题合规检查 -->
+            <div class="obs-inset rounded-xl p-3.5 space-y-2.5">
+              <div class="text-[11px] font-semibold text-emerald-300 uppercase tracking-wider font-mono border-b border-slate-800/80 pb-1.5">
+                标题合规检查
               </div>
-              <el-button size="small" link type="primary">
-                {{ gatesExpanded ? "收起门禁面板" : "展开门禁配置" }}
-              </el-button>
+              <label class="flex items-center gap-2 text-slate-200 cursor-pointer">
+                <input v-model="bundle.policy.gates.reject_empty_name" type="checkbox" class="obs-checkbox" @change="markDirty" />
+                <span>拒绝空标题种子</span>
+              </label>
+              <div class="flex items-center justify-between gap-2">
+                <label class="inline-flex items-center gap-2 text-slate-300 cursor-pointer">
+                  <input v-model="bundle.policy.gates.min_name_length.enabled" type="checkbox" class="obs-checkbox" @change="markDirty" />
+                  <span>标题最短字数</span>
+                </label>
+                <div class="w-24">
+                  <ObsNumberInput v-model="bundle.policy.gates.min_name_length.value" :min="1" :disabled="!bundle.policy.gates.min_name_length.enabled" @change="markDirty" />
+                </div>
+              </div>
+              <div class="flex items-center justify-between gap-2">
+                <label class="inline-flex items-center gap-2 text-slate-300 cursor-pointer">
+                  <input v-model="bundle.policy.gates.max_name_length.enabled" type="checkbox" class="obs-checkbox" @change="markDirty" />
+                  <span>标题最长字数</span>
+                </label>
+                <div class="w-24">
+                  <ObsNumberInput v-model="bundle.policy.gates.max_name_length.value" :min="1" :disabled="!bundle.policy.gates.max_name_length.enabled" @change="markDirty" />
+                </div>
+              </div>
+              <div class="flex items-center justify-between gap-2">
+                <label class="inline-flex items-center gap-2 text-slate-300 cursor-pointer">
+                  <input v-model="bundle.policy.gates.max_file_name_length.enabled" type="checkbox" class="obs-checkbox" @change="markDirty" />
+                  <span>单文件名最长</span>
+                </label>
+                <div class="w-24">
+                  <ObsNumberInput v-model="bundle.policy.gates.max_file_name_length.value" :min="1" :disabled="!bundle.policy.gates.max_file_name_length.enabled" @change="markDirty" />
+                </div>
+              </div>
             </div>
 
-            <div
-              v-show="gatesExpanded"
-              class="px-4 pb-4 pt-2 border-t border-slate-200 grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-3 text-xs"
-            >
-              <!-- 标题门禁 -->
-              <div class="rounded-lg border border-slate-200 bg-white p-3 space-y-2.5">
-                <div class="font-semibold text-slate-800">标题合规检查</div>
-                <div class="flex items-center justify-between">
-                  <span class="text-slate-600">拒绝空标题</span>
-                  <el-switch v-model="workingBundle.policy.gates.reject_empty_name" size="small" />
-                </div>
-                <div class="flex items-center justify-between gap-2">
-                  <el-switch
-                    v-model="workingBundle.policy.gates.min_name_length.enabled"
-                    size="small"
-                    active-text="标题最短字符"
-                  />
-                  <el-input-number
-                    v-if="workingBundle.policy.gates.min_name_length.enabled"
-                    v-model="workingBundle.policy.gates.min_name_length.value"
-                    :min="1"
-                    size="small"
-                    style="width: 110px"
-                  />
-                </div>
-                <div class="flex items-center justify-between gap-2">
-                  <el-switch
-                    v-model="workingBundle.policy.gates.max_name_length.enabled"
-                    size="small"
-                    active-text="标题最长字符"
-                  />
-                  <el-input-number
-                    v-if="workingBundle.policy.gates.max_name_length.enabled"
-                    v-model="workingBundle.policy.gates.max_name_length.value"
-                    :min="1"
-                    size="small"
-                    style="width: 110px"
-                  />
+            <!-- Group 2: 文件清单与空文件 -->
+            <div class="obs-inset rounded-xl p-3.5 space-y-2.5">
+              <div class="text-[11px] font-semibold text-sky-300 uppercase tracking-wider font-mono border-b border-slate-800/80 pb-1.5">
+                文件清单与空文件
+              </div>
+              <label class="flex items-center gap-2 text-slate-200 cursor-pointer">
+                <input v-model="bundle.policy.gates.reject_empty_files" type="checkbox" class="obs-checkbox" @change="markDirty" />
+                <span>拒绝无文件清单种子</span>
+              </label>
+              <label class="flex items-center gap-2 text-slate-200 cursor-pointer">
+                <input v-model="bundle.policy.gates.reject_all_empty_files" type="checkbox" class="obs-checkbox" @change="markDirty" />
+                <span>拒绝文件大小全为 0 B</span>
+              </label>
+              <div class="flex items-center justify-between gap-2">
+                <label class="inline-flex items-center gap-2 text-slate-300 cursor-pointer">
+                  <input v-model="bundle.policy.gates.max_empty_files.enabled" type="checkbox" class="obs-checkbox" @change="markDirty" />
+                  <span>最多 0B 文件</span>
+                </label>
+                <div class="w-24">
+                  <ObsNumberInput v-model="bundle.policy.gates.max_empty_files.value" :min="0" :disabled="!bundle.policy.gates.max_empty_files.enabled" @change="markDirty" />
                 </div>
               </div>
-
-              <!-- 文件数量与空文件门禁 -->
-              <div class="rounded-lg border border-slate-200 bg-white p-3 space-y-2.5">
-                <div class="font-semibold text-slate-800">文件清单与空文件检查</div>
-                <div class="flex items-center justify-between">
-                  <span class="text-slate-600">拒绝空文件列表 (file_count = 0)</span>
-                  <el-switch v-model="workingBundle.policy.gates.reject_empty_files" size="small" />
-                </div>
-                <div class="flex items-center justify-between">
-                  <span class="text-slate-600">拒绝全部 0 字节种子</span>
-                  <el-switch
-                    v-model="workingBundle.policy.gates.reject_all_empty_files"
-                    size="small"
-                  />
-                </div>
-                <div class="flex items-center justify-between gap-2">
-                  <el-switch
-                    v-model="workingBundle.policy.gates.max_file_count.enabled"
-                    size="small"
-                    active-text="最大文件数"
-                  />
-                  <el-input-number
-                    v-if="workingBundle.policy.gates.max_file_count.enabled"
-                    v-model="workingBundle.policy.gates.max_file_count.value"
-                    :min="1"
-                    size="small"
-                    style="width: 110px"
-                  />
-                </div>
-                <div class="flex items-center justify-between gap-2">
-                  <el-switch
-                    v-model="workingBundle.policy.gates.max_empty_files.enabled"
-                    size="small"
-                    active-text="最大空文件数"
-                  />
-                  <el-input-number
-                    v-if="workingBundle.policy.gates.max_empty_files.enabled"
-                    v-model="workingBundle.policy.gates.max_empty_files.value"
-                    :min="0"
-                    size="small"
-                    style="width: 110px"
-                  />
+              <div class="flex items-center justify-between gap-2">
+                <label class="inline-flex items-center gap-2 text-slate-300 cursor-pointer">
+                  <input v-model="bundle.policy.gates.max_file_count.enabled" type="checkbox" class="obs-checkbox" @change="markDirty" />
+                  <span>文件数量上限</span>
+                </label>
+                <div class="w-24">
+                  <ObsNumberInput v-model="bundle.policy.gates.max_file_count.value" :min="1" :disabled="!bundle.policy.gates.max_file_count.enabled" @change="markDirty" />
                 </div>
               </div>
+            </div>
 
-              <!-- 体积与碎文件密度门禁 -->
-              <div class="rounded-lg border border-slate-200 bg-white p-3 space-y-2.5">
-                <div class="font-semibold text-slate-800">整种体积与密度防护</div>
-                <div class="flex items-center justify-between gap-2">
-                  <el-switch
-                    v-model="workingBundle.policy.gates.min_total_size.enabled"
-                    size="small"
-                    active-text="最小体积"
-                  />
-                  <ByteSizeInput
-                    v-if="workingBundle.policy.gates.min_total_size.enabled"
-                    v-model="workingBundle.policy.gates.min_total_size.value"
-                    :min="1"
-                  />
-                </div>
-                <div class="flex items-center justify-between gap-2">
-                  <el-switch
-                    v-model="workingBundle.policy.gates.max_total_size.enabled"
-                    size="small"
-                    active-text="最大体积"
-                  />
-                  <ByteSizeInput
-                    v-if="workingBundle.policy.gates.max_total_size.enabled"
-                    v-model="workingBundle.policy.gates.max_total_size.value"
-                    :min="1"
-                  />
-                </div>
-                <div class="flex items-center justify-between gap-2">
-                  <el-switch
-                    v-model="workingBundle.policy.gates.max_file_name_length.enabled"
-                    size="small"
-                    active-text="单文件名限长"
-                  />
-                  <el-input-number
-                    v-if="workingBundle.policy.gates.max_file_name_length.enabled"
-                    v-model="workingBundle.policy.gates.max_file_name_length.value"
-                    :min="1"
-                    size="small"
-                    style="width: 110px"
-                  />
-                </div>
-                <div class="pt-1 border-t border-slate-100 space-y-1.5">
-                  <div class="flex items-center justify-between">
-                    <span class="text-slate-600">超多小碎文件密度拦截</span>
-                    <el-switch
-                      v-model="workingBundle.policy.gates.density_check.enabled"
-                      size="small"
-                    />
-                  </div>
-                  <div
-                    v-if="workingBundle.policy.gates.density_check.enabled"
-                    class="flex flex-wrap items-center gap-1.5"
-                  >
-                    <span class="text-slate-500">文件数 &gt;</span>
-                    <el-input-number
-                      v-model="workingBundle.policy.gates.density_check.min_file_count"
-                      :min="1"
-                      size="small"
-                      controls-position="right"
-                      style="width: 82px"
-                    />
-                    <span class="text-slate-500">且均重 &lt;</span>
-                    <ByteSizeInput
-                      v-model="workingBundle.policy.gates.density_check.min_avg_file_size"
-                      :min="1"
-                    />
-                  </div>
+            <!-- Group 3: 体积与碎文件密度 -->
+            <div class="obs-inset rounded-xl p-3.5 space-y-2.5">
+              <div class="text-[11px] font-semibold text-amber-300 uppercase tracking-wider font-mono border-b border-slate-800/80 pb-1.5">
+                体积与碎文件密度
+              </div>
+              <div class="space-y-1.5">
+                <label class="inline-flex items-center gap-2 text-slate-300 cursor-pointer">
+                  <input v-model="bundle.policy.gates.min_total_size.enabled" type="checkbox" class="obs-checkbox" @change="markDirty" />
+                  <span>总体积下限 (Min Total)</span>
+                </label>
+                <ByteSizeInput
+                  v-model="bundle.policy.gates.min_total_size.value"
+                  :min="0"
+                  @update:model-value="(v) => { bundle.policy.gates.min_total_size.value = v ?? 0; markDirty(); }"
+                />
+              </div>
+              <div class="space-y-1.5">
+                <label class="inline-flex items-center gap-2 text-slate-300 cursor-pointer">
+                  <input v-model="bundle.policy.gates.max_total_size.enabled" type="checkbox" class="obs-checkbox" @change="markDirty" />
+                  <span>总体积上限 (Max Total)</span>
+                </label>
+                <ByteSizeInput
+                  v-model="bundle.policy.gates.max_total_size.value"
+                  :min="0"
+                  @update:model-value="(v) => { bundle.policy.gates.max_total_size.value = v ?? 0; markDirty(); }"
+                />
+              </div>
+              <div class="space-y-1.5 pt-0.5">
+                <label class="inline-flex items-center gap-2 text-slate-300 cursor-pointer">
+                  <input v-model="bundle.policy.gates.density_check.enabled" type="checkbox" class="obs-checkbox" @change="markDirty" />
+                  <span>碎文件密度保护 (最少文件数 / 平均最小 B)</span>
+                </label>
+                <div class="grid grid-cols-2 gap-2">
+                  <ObsNumberInput v-model="bundle.policy.gates.density_check.min_file_count" :min="1" :disabled="!bundle.policy.gates.density_check.enabled" @change="markDirty" />
+                  <ObsNumberInput v-model="bundle.policy.gates.density_check.min_avg_file_size" :min="1" :disabled="!bundle.policy.gates.density_check.enabled" @change="markDirty" />
                 </div>
               </div>
             </div>
           </div>
+        </div>
 
-          <!-- ② 有序策略规则链 -->
-          <div class="space-y-3">
-            <div class="flex flex-wrap items-center justify-between gap-3">
-              <div class="flex flex-wrap items-center gap-2">
-                <span class="text-sm font-semibold text-slate-900">② 有序策略规则链</span>
-                <el-tag size="small" type="success" effect="light">
-                  白名单 Allow: {{ allowRulesCount }}
-                </el-tag>
-                <el-tag size="small" type="danger" effect="light">
-                  黑名单 Reject: {{ rejectRulesCount }}
-                </el-tag>
-                <span class="text-xs text-slate-500">
-                  按列表顺序从上到下短路执行（推荐：致命木马先 Reject → 信任资源 Allow 放行 → 常规过滤）
-                </span>
+        <!-- Rule Priority Chain -->
+        <div class="pt-3 border-t border-slate-800/80 space-y-3">
+          <div class="flex flex-wrap items-center justify-between gap-2.5">
+            <div class="flex flex-wrap items-center gap-2">
+              <div class="bg-[#0b0f17] border border-slate-800 p-0.5 rounded-lg inline-flex text-xs">
+                <button
+                  type="button"
+                  class="px-2.5 py-1 rounded-md transition cursor-pointer"
+                  :class="ruleActionFilter === 'all' ? 'bg-slate-800 text-white font-medium' : 'text-slate-400 hover:text-slate-200'"
+                  @click="ruleActionFilter = 'all'"
+                >
+                  全部 ({{ bundle.policy.rules.length }})
+                </button>
+                <button
+                  type="button"
+                  class="px-2.5 py-1 rounded-md transition cursor-pointer"
+                  :class="ruleActionFilter === 'allow' ? 'bg-emerald-500/15 text-emerald-300 font-medium' : 'text-slate-400 hover:text-slate-200'"
+                  @click="ruleActionFilter = 'allow'"
+                >
+                  白名单 ALLOW ({{ allowRuleCount }})
+                </button>
+                <button
+                  type="button"
+                  class="px-2.5 py-1 rounded-md transition cursor-pointer"
+                  :class="ruleActionFilter === 'reject' ? 'bg-rose-500/15 text-rose-300 font-medium' : 'text-slate-400 hover:text-slate-200'"
+                  @click="ruleActionFilter = 'reject'"
+                >
+                  黑名单 REJECT ({{ rejectRuleCount }})
+                </button>
               </div>
 
-              <div class="flex flex-wrap items-center gap-2">
-                <el-input
-                  v-model="ruleSearch"
-                  size="small"
-                  clearable
-                  placeholder="搜索规则名 / 关键词 / 后缀..."
-                  style="width: 200px"
-                >
-                  <template #prefix><Search class="h-3.5 w-3.5 text-slate-400" /></template>
-                </el-input>
-
-                <el-select v-model="ruleActionFilter" size="small" style="width: 115px">
-                  <el-option label="全部动作" value="all" />
-                  <el-option label="仅 Reject" value="reject" />
-                  <el-option label="仅 Allow" value="allow" />
-                </el-select>
-
-                <el-select v-model="ruleTypeFilter" size="small" style="width: 135px">
-                  <el-option label="全部类型" value="all" />
-                  <el-option label="关键词词组" value="keyword_group" />
-                  <el-option label="扩展名后缀" value="extension_rule" />
-                  <el-option label="标题特征开关" value="title_pattern_preset" />
-                  <el-option label="文件体积/长度" value="file_constraint" />
-                  <el-option label="实质内容底线" value="substantive_content" />
-                  <el-option label="体积占比上限" value="size_ratio" />
-                  <el-option label="自定义正则" value="custom_regex" />
-                  <el-option label="复合条件" value="composite" />
-                </el-select>
-
-                <el-dropdown @command="(tpl: RuleTemplateInfo) => openCreateRuleDrawer(tpl)">
-                  <el-button size="small" type="success" plain>
-                    <Sparkles class="h-3.5 w-3.5 mr-1" />
-                    从内置模板添加
-                  </el-button>
-                  <template #dropdown>
-                    <el-dropdown-menu>
-                      <el-dropdown-item
-                        v-for="tpl in presetsCatalog?.rule_templates ?? []"
-                        :key="tpl.id"
-                        :command="tpl"
-                      >
-                        <div class="max-w-sm">
-                          <div class="font-medium text-xs text-slate-800">
-                            [{{ tpl.group }}] {{ tpl.name }}
-                          </div>
-                          <div class="text-[11px] text-slate-500 truncate">
-                            {{ tpl.description }}
-                          </div>
-                        </div>
-                      </el-dropdown-item>
-                    </el-dropdown-menu>
-                  </template>
-                </el-dropdown>
-
-                <el-button size="small" type="primary" @click="openCreateRuleDrawer()">
-                  <Plus class="h-3.5 w-3.5 mr-1" />
-                  新建规则
-                </el-button>
+              <div class="relative w-56">
+                <Search class="w-3.5 h-3.5 text-slate-500 absolute left-2.5 top-1/2 -translate-y-1/2 pointer-events-none" />
+                <input v-model="ruleKeyword" type="text" placeholder="搜索规则名 / ID / 标签" class="obs-input rounded-lg pl-8 pr-3 py-1 text-xs" />
               </div>
             </div>
 
+            <div class="flex items-center gap-2">
+              <button type="button" class="obs-btn obs-btn-ghost px-3! py-1.5! text-xs! inline-flex items-center gap-1" @click="templatesModalVisible = true">
+                <BookOpen class="w-3.5 h-3.5 text-sky-400" />
+                从模板库添加
+              </button>
+              <button type="button" class="obs-btn obs-btn-primary px-3! py-1.5! text-xs! inline-flex items-center gap-1" @click="openCreateRule">
+                <Plus class="w-3.5 h-3.5" />
+                新建规则
+              </button>
+            </div>
+          </div>
+
+          <div class="space-y-2.5">
             <div
-              v-if="filteredRules.length === 0"
-              class="rounded-xl border border-dashed border-slate-300 py-12 text-center text-xs text-slate-500"
+              v-for="{ rule, index } in filteredRules"
+              :key="rule.id"
+              class="rounded-xl border p-3.5 flex flex-wrap items-center justify-between gap-3 transition-colors"
+              :class="
+                !rule.enabled
+                  ? 'border-slate-800/70 bg-[#090d16]/50 opacity-55'
+                  : rule.action === 'allow'
+                    ? 'border-emerald-500/30 bg-emerald-500/[0.03] hover:border-emerald-500/45'
+                    : 'border-slate-800 bg-[#0b0f17]/90 hover:border-slate-700'
+              "
             >
-              当前过滤条件下没有策略规则，可点击右上角「从内置模板添加」或「新建规则」。
+              <div class="flex items-start gap-3 min-w-0 flex-1">
+                <input v-model="rule.enabled" type="checkbox" class="obs-checkbox mt-1" @change="markDirty" />
+                <span class="font-mono-num text-[11px] text-slate-500 w-7 pt-0.5">#{{ index + 1 }}</span>
+
+                <div class="min-w-0 space-y-1">
+                  <div class="flex flex-wrap items-center gap-2">
+                    <span
+                      class="px-2 py-0.5 rounded-md text-[10px] font-mono border inline-flex items-center gap-1"
+                      :class="
+                        rule.action === 'allow'
+                          ? 'bg-emerald-500/12 text-emerald-300 border-emerald-500/30'
+                          : 'bg-rose-500/12 text-rose-300 border-rose-500/30'
+                      "
+                    >
+                      <ShieldCheck v-if="rule.action === 'allow'" class="w-3 h-3" />
+                      <ShieldAlert v-else class="w-3 h-3" />
+                      {{ rule.action.toUpperCase() }}
+                    </span>
+                    <span class="font-semibold text-xs text-white">{{ rule.name }}</span>
+                    <span class="px-2 py-0.5 rounded-md bg-sky-500/10 border border-sky-500/25 text-[10px] font-mono text-sky-300">
+                      {{ matcherBadge(rule.matcher) }}
+                    </span>
+                    <span class="text-[10px] font-mono text-slate-500">{{ rule.id }}</span>
+                  </div>
+
+                  <div v-if="rule.note || rule.tags.length > 0" class="flex flex-wrap items-center gap-2 text-[11px] text-slate-400">
+                    <span v-for="tag in rule.tags" :key="tag" class="px-1.5 py-0.5 rounded bg-slate-800/80 text-slate-300 text-[10px]">
+                      {{ tag }}
+                    </span>
+                    <span v-if="rule.note" class="truncate">{{ rule.note }}</span>
+                  </div>
+                </div>
+              </div>
+
+              <div class="flex items-center gap-1 shrink-0">
+                <button type="button" class="obs-btn obs-btn-ghost p-1.5!" title="上移优先级" :disabled="index === 0" @click="moveRule(index, -1)">
+                  <ArrowUp class="w-3.5 h-3.5" />
+                </button>
+                <button type="button" class="obs-btn obs-btn-ghost p-1.5!" title="下移优先级" :disabled="index === bundle.policy.rules.length - 1" @click="moveRule(index, 1)">
+                  <ArrowDown class="w-3.5 h-3.5" />
+                </button>
+                <button type="button" class="obs-btn obs-btn-ghost p-1.5!" title="编辑规则" @click="openEditRule(index)">
+                  <Pencil class="w-3.5 h-3.5 text-emerald-400" />
+                </button>
+                <button type="button" class="obs-btn obs-btn-ghost p-1.5!" title="复制" @click="duplicateRule(index)">
+                  <Copy class="w-3.5 h-3.5 text-slate-400" />
+                </button>
+                <button type="button" class="obs-btn obs-btn-danger p-1.5!" title="删除" @click="deleteRule(index)">
+                  <Trash2 class="w-3.5 h-3.5" />
+                </button>
+              </div>
+            </div>
+
+            <div v-if="filteredRules.length === 0" class="py-12 text-center text-xs text-slate-500">
+              没有符合条件的策略规则，可点击右上角新增规则或载入预设模板
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- TAB 2: TITLE CLEANER -->
+      <div v-else-if="activeTab === 'cleaner'" class="p-4 space-y-5">
+        <!-- 11 Clickable Pipeline Stages + Threshold + Post-Clean Gates -->
+        <div class="space-y-3">
+          <div class="flex flex-wrap items-center justify-between gap-2">
+            <div>
+              <h3 class="text-xs font-semibold text-white">标题清洗流水线 (Cleaner Pipeline)</h3>
+              <p class="text-[11px] text-slate-400">按序执行字符规范化、同形字降噪、混淆拆解、规则擦除与类 NLP 智能补盲</p>
+            </div>
+            <span class="text-[10px] font-mono text-slate-500">点击卡片即可启停对应清洗阶段</span>
+          </div>
+
+          <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-2.5">
+            <button
+              v-for="st in CLEANER_STAGE_META"
+              :key="st.key"
+              type="button"
+              class="text-left rounded-xl border p-3 transition-all cursor-pointer space-y-1.5"
+              :class="
+                bundle.policy.cleaner[st.key]
+                  ? st.smart
+                    ? 'border-cyan-500/40 bg-cyan-500/[0.06] hover:border-cyan-400/60'
+                    : 'border-emerald-500/35 bg-emerald-500/[0.06] hover:border-emerald-500/50'
+                  : 'border-slate-800 bg-[#0b0f17]/70 opacity-65 hover:opacity-95'
+              "
+              @click="toggleCleanerStage(st.key)"
+            >
+              <div class="flex items-center justify-between gap-2 text-[10px] font-mono">
+                <div class="flex items-center gap-1.5">
+                  <span :class="bundle.policy.cleaner[st.key] ? (st.smart ? 'text-cyan-300' : 'text-emerald-400') : 'text-slate-500'">{{ st.num }}</span>
+                  <span
+                    v-if="st.smart"
+                    class="px-1.5 py-0.2 rounded bg-cyan-500/15 border border-cyan-500/30 text-cyan-300 text-[9px]"
+                  >
+                    智能
+                  </span>
+                </div>
+                <span
+                  class="px-1.5 py-0.5 rounded border text-[9px]"
+                  :class="
+                    bundle.policy.cleaner[st.key]
+                      ? st.smart
+                        ? 'bg-cyan-500/15 text-cyan-200 border-cyan-500/35'
+                        : 'bg-emerald-500/15 text-emerald-300 border-emerald-500/30'
+                      : 'bg-slate-800 text-slate-500 border-slate-700'
+                  "
+                >
+                  {{ bundle.policy.cleaner[st.key] ? "ON" : "OFF" }}
+                </span>
+              </div>
+              <div class="text-xs font-semibold text-white">{{ st.title }}</div>
+              <div class="text-[11px] text-slate-400 leading-snug">{{ st.desc }}</div>
+            </button>
+          </div>
+
+          <div class="grid grid-cols-1 lg:grid-cols-3 gap-2.5 text-xs">
+            <div class="obs-inset rounded-xl p-3 flex flex-wrap items-center justify-between gap-3">
+              <div class="space-y-0.5">
+                <div class="text-cyan-200 font-medium">阶段 9 · 语块广告判定阈值</div>
+                <div class="text-[10px] text-slate-400">建议 60–75；越低越激进 (范围 20–95)</div>
+              </div>
+              <div class="w-24">
+                <ObsNumberInput
+                  v-model="bundle.policy.cleaner.span_ad_threshold"
+                  :min="20"
+                  :max="95"
+                  :disabled="!bundle.policy.cleaner.enable_span_ad_scoring"
+                  @change="markDirty"
+                />
+              </div>
+            </div>
+            <label class="obs-inset rounded-xl p-3 flex items-center gap-2.5 cursor-pointer text-amber-200">
+              <input v-model="bundle.policy.cleaner.reject_if_empty_after_clean" type="checkbox" class="obs-checkbox" @change="markDirty" />
+              <span>12 · 清洗后标题为空则直接拒绝入库</span>
+            </label>
+            <div class="obs-inset rounded-xl p-3 flex flex-wrap items-center justify-between gap-3">
+              <label class="inline-flex items-center gap-2 text-slate-200 cursor-pointer">
+                <input v-model="bundle.policy.cleaner.min_refined_name_length.enabled" type="checkbox" class="obs-checkbox" @change="markDirty" />
+                <span>13 · 清洗后最短有效字符限制</span>
+              </label>
+              <div class="w-24">
+                <ObsNumberInput
+                  v-model="bundle.policy.cleaner.min_refined_name_length.value"
+                  :min="1"
+                  :disabled="!bundle.policy.cleaner.min_refined_name_length.enabled"
+                  @change="markDirty"
+                />
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Dual Phrase & Regex Tables with Frosted Overlay -->
+        <div class="grid grid-cols-1 xl:grid-cols-2 gap-4 text-xs">
+          <!-- 左列：动态广告短语 -->
+          <section
+            class="relative overflow-hidden obs-inset rounded-xl p-4 space-y-3 flex flex-col min-w-0"
+            :class="bundle.policy.cleaner.enable_ad_phrases ? '' : 'border-amber-500/35'"
+          >
+            <div class="flex flex-wrap items-center justify-between gap-2">
+              <div class="flex flex-wrap items-center gap-2">
+                <span class="font-semibold text-slate-100 text-sm">动态广告短语</span>
+                <span class="px-2 py-0.5 rounded bg-slate-800 text-cyan-300 font-mono-num text-[11px]">
+                  启用 {{ enabledPhraseCount }} / 共 {{ bundle.ad_phrases.length }}
+                </span>
+                <span class="px-1.5 py-0.5 rounded bg-slate-900 border border-slate-800 text-slate-400 font-mono-num text-[10px]">
+                  阶段 8 控制
+                </span>
+              </div>
+              <div class="flex items-center gap-1.5">
+                <input
+                  v-model="phraseKeyword"
+                  type="text"
+                  placeholder="搜索短语 / 备注..."
+                  class="obs-input rounded-lg px-2.5 py-1 text-xs w-36"
+                />
+                <button
+                  type="button"
+                  class="obs-btn obs-btn-primary px-3! py-1! rounded-lg text-xs! shrink-0"
+                  @click="openAddPhraseModal('single')"
+                >
+                  + 添加
+                </button>
+              </div>
+            </div>
+
+            <div class="max-h-[420px] overflow-y-auto obs-scroll rounded-lg border border-slate-800/80 bg-[#080b11]">
+              <table class="w-full text-left text-xs">
+                <thead class="sticky top-0 z-10 bg-[#0c111b] border-b border-slate-800 text-[11px] text-slate-500">
+                  <tr>
+                    <th class="py-2 px-2.5 font-medium">启用</th>
+                    <th class="py-2 px-2 font-medium">广告短语（点击直接编辑）</th>
+                    <th class="py-2 px-2 font-medium">备注</th>
+                    <th class="py-2 px-2.5 text-right font-medium">操作</th>
+                  </tr>
+                </thead>
+                <tbody class="divide-y divide-slate-800/60">
+                  <tr
+                    v-for="{ item, index } in filteredPhrases"
+                    :key="item.id"
+                    class="hover:bg-slate-800/30 transition"
+                    :class="item.enabled ? '' : 'opacity-60'"
+                  >
+                    <td class="py-2 px-2.5 align-middle w-14">
+                      <button
+                        type="button"
+                        class="px-2 py-0.5 rounded-full text-[10px] font-mono-num border cursor-pointer transition"
+                        :class="
+                          item.enabled
+                            ? 'bg-emerald-500/20 text-emerald-300 border-emerald-500/40'
+                            : 'bg-slate-800 text-slate-400 border-slate-700'
+                        "
+                        @click="item.enabled = !item.enabled; markDirty()"
+                      >
+                        {{ item.enabled ? "ON" : "OFF" }}
+                      </button>
+                    </td>
+                    <td class="py-2 px-2 align-middle min-w-[160px]">
+                      <input
+                        v-model="item.phrase"
+                        type="text"
+                        placeholder="广告短语..."
+                        class="obs-input w-full rounded-md px-2.5 py-1 text-xs font-mono-num"
+                        @input="markDirty"
+                      />
+                    </td>
+                    <td class="py-2 px-2 align-middle min-w-[110px]">
+                      <input
+                        v-model="item.note"
+                        type="text"
+                        placeholder="备注..."
+                        class="obs-input w-full rounded-md px-2.5 py-1 text-xs text-slate-300"
+                        @input="markDirty"
+                      />
+                    </td>
+                    <td class="py-2 px-2.5 align-middle text-right w-14">
+                      <button
+                        type="button"
+                        class="obs-btn-danger px-2 py-1 rounded text-[11px] cursor-pointer"
+                        @click="bundle.ad_phrases.splice(index, 1); markDirty()"
+                      >
+                        删
+                      </button>
+                    </td>
+                  </tr>
+
+                  <tr v-if="filteredPhrases.length === 0">
+                    <td colspan="4" class="py-8 px-4 text-center text-xs text-slate-500">
+                      {{ phraseKeyword.trim() ? "未找到匹配的广告短语" : "暂无广告短语规则，请点击右上角「+ 添加」" }}
+                    </td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
+            <div
+              v-if="!bundle.policy.cleaner.enable_ad_phrases"
+              class="absolute inset-0 z-20 bg-[#080a0f]/80 backdrop-blur-[2px] flex flex-col items-center justify-center gap-3 p-6 text-center"
+            >
+              <span class="px-3 py-1 rounded-full bg-amber-500/15 border border-amber-500/35 text-amber-300 font-mono-num text-[11px] font-semibold">
+                阶段 8 · 动态广告短语剥离已关闭
+              </span>
+              <p class="text-xs text-slate-300 max-w-xs leading-relaxed">
+                当前阶段开关处于关闭状态，列表中的 <span class="font-mono-num text-amber-200">{{ bundle.ad_phrases.length }}</span> 条广告短语暂不参与标题清洗。
+              </p>
+              <button
+                type="button"
+                class="obs-btn obs-btn-primary px-4! py-1.5! rounded-lg text-xs!"
+                @click="bundle.policy.cleaner.enable_ad_phrases = true; markDirty()"
+              >
+                ⚡ 立即开启阶段 8
+              </button>
+            </div>
+          </section>
+
+          <!-- 右列：动态广告正则 -->
+          <section
+            class="relative overflow-hidden obs-inset rounded-xl p-4 space-y-3 flex flex-col min-w-0"
+            :class="bundle.policy.cleaner.enable_ad_regexes ? '' : 'border-amber-500/35'"
+          >
+            <div class="flex flex-wrap items-center justify-between gap-2">
+              <div class="flex flex-wrap items-center gap-2">
+                <span class="font-semibold text-slate-100 text-sm">动态广告正则</span>
+                <span class="px-2 py-0.5 rounded bg-slate-800 text-cyan-300 font-mono-num text-[11px]">
+                  启用 {{ enabledRegexCount }} / 共 {{ bundle.ad_regexes.length }}
+                </span>
+                <span class="px-1.5 py-0.5 rounded bg-slate-900 border border-slate-800 text-slate-400 font-mono-num text-[10px]">
+                  阶段 7 控制 · 按顺序
+                </span>
+              </div>
+              <div class="flex items-center gap-1.5">
+                <input
+                  v-model="regexKeyword"
+                  type="text"
+                  placeholder="搜索正则 / 备注..."
+                  class="obs-input rounded-lg px-2.5 py-1 text-xs w-36"
+                />
+                <button
+                  type="button"
+                  class="obs-btn obs-btn-primary px-3! py-1! rounded-lg text-xs! shrink-0"
+                  @click="openAddRegexModal('single')"
+                >
+                  + 添加
+                </button>
+              </div>
+            </div>
+
+            <div class="max-h-[420px] overflow-y-auto obs-scroll rounded-lg border border-slate-800/80 bg-[#080b11]">
+              <table class="w-full text-left text-xs">
+                <thead class="sticky top-0 z-10 bg-[#0c111b] border-b border-slate-800 text-[11px] text-slate-500">
+                  <tr>
+                    <th class="py-2 px-2.5 font-medium">启用 / 顺序</th>
+                    <th class="py-2 px-2 font-medium">正则表达式 &amp; 替换为（点击直接编辑）</th>
+                    <th class="py-2 px-2 font-medium">备注</th>
+                    <th class="py-2 px-2.5 text-right font-medium">操作</th>
+                  </tr>
+                </thead>
+                <tbody class="divide-y divide-slate-800/60">
+                  <tr
+                    v-for="{ item, index } in filteredRegexes"
+                    :key="item.id"
+                    class="hover:bg-slate-800/30 transition"
+                    :class="item.enabled ? '' : 'opacity-60'"
+                  >
+                    <td class="py-2 px-2.5 align-top w-24">
+                      <div class="flex items-center gap-1">
+                        <button
+                          type="button"
+                          class="px-2 py-0.5 rounded-full text-[10px] font-mono-num border cursor-pointer transition"
+                          :class="
+                            item.enabled
+                              ? 'bg-emerald-500/20 text-emerald-300 border-emerald-500/40'
+                              : 'bg-slate-800 text-slate-400 border-slate-700'
+                          "
+                          @click="item.enabled = !item.enabled; markDirty()"
+                        >
+                          {{ item.enabled ? "ON" : "OFF" }}
+                        </button>
+                        <button
+                          type="button"
+                          title="上移执行优先级"
+                          :disabled="index === 0"
+                          class="px-1 py-0.5 rounded text-[10px] font-mono-num obs-btn-ghost"
+                          :class="index === 0 ? 'opacity-30 cursor-not-allowed' : 'cursor-pointer'"
+                          @click="moveRegex(index, -1)"
+                        >
+                          ↑
+                        </button>
+                        <button
+                          type="button"
+                          title="下移执行优先级"
+                          :disabled="index === bundle.ad_regexes.length - 1"
+                          class="px-1 py-0.5 rounded text-[10px] font-mono-num obs-btn-ghost"
+                          :class="index === bundle.ad_regexes.length - 1 ? 'opacity-30 cursor-not-allowed' : 'cursor-pointer'"
+                          @click="moveRegex(index, 1)"
+                        >
+                          ↓
+                        </button>
+                      </div>
+                      <div class="text-[10px] text-slate-500 font-mono-num mt-1">#{{ index + 1 }}</div>
+                    </td>
+                    <td class="py-2 px-2 align-top min-w-[200px] space-y-1">
+                      <input
+                        v-model="item.pattern"
+                        type="text"
+                        placeholder="正则表达式..."
+                        class="obs-input w-full rounded-md px-2.5 py-1 text-xs font-mono-num text-cyan-200"
+                        @input="markDirty"
+                      />
+                      <div class="flex items-center gap-1.5">
+                        <span class="text-[10px] text-slate-500 shrink-0">替换为</span>
+                        <input
+                          v-model="item.replacement"
+                          type="text"
+                          placeholder="空字符串或空格"
+                          class="obs-input flex-1 rounded-md px-2 py-0.5 text-[11px] font-mono-num text-slate-200"
+                          @input="markDirty"
+                        />
+                      </div>
+                    </td>
+                    <td class="py-2 px-2 align-top min-w-[100px]">
+                      <input
+                        v-model="item.note"
+                        type="text"
+                        placeholder="备注..."
+                        class="obs-input w-full rounded-md px-2.5 py-1 text-xs text-slate-300"
+                        @input="markDirty"
+                      />
+                    </td>
+                    <td class="py-2 px-2.5 align-top text-right w-14">
+                      <button
+                        type="button"
+                        class="obs-btn-danger px-2 py-1 rounded text-[11px] cursor-pointer"
+                        @click="bundle.ad_regexes.splice(index, 1); markDirty()"
+                      >
+                        删
+                      </button>
+                    </td>
+                  </tr>
+
+                  <tr v-if="filteredRegexes.length === 0">
+                    <td colspan="4" class="py-8 px-4 text-center text-xs text-slate-500">
+                      {{ regexKeyword.trim() ? "未找到匹配的广告正则" : "暂无广告正则规则，请点击右上角「+ 添加」" }}
+                    </td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
+            <div
+              v-if="!bundle.policy.cleaner.enable_ad_regexes"
+              class="absolute inset-0 z-20 bg-[#080a0f]/80 backdrop-blur-[2px] flex flex-col items-center justify-center gap-3 p-6 text-center"
+            >
+              <span class="px-3 py-1 rounded-full bg-amber-500/15 border border-amber-500/35 text-amber-300 font-mono-num text-[11px] font-semibold">
+                阶段 7 · 动态广告正则替换已关闭
+              </span>
+              <p class="text-xs text-slate-300 max-w-xs leading-relaxed">
+                当前阶段开关处于关闭状态，列表中的 <span class="font-mono-num text-amber-200">{{ bundle.ad_regexes.length }}</span> 条广告正则暂不参与标题清洗。
+              </p>
+              <button
+                type="button"
+                class="obs-btn obs-btn-primary px-4! py-1.5! rounded-lg text-xs!"
+                @click="bundle.policy.cleaner.enable_ad_regexes = true; markDirty()"
+              >
+                ⚡ 立即开启阶段 7
+              </button>
+            </div>
+          </section>
+        </div>
+
+        <!-- Bypass Unsupervised Discovery Card -->
+        <section class="obs-inset rounded-xl p-4 space-y-3 text-xs">
+          <div class="flex flex-wrap items-center justify-between gap-2.5">
+            <div class="space-y-0.5">
+              <div class="flex items-center gap-2">
+                <span class="font-semibold text-slate-100 text-sm">智能统计自发现 · 疑似新广告模板</span>
+                <span class="px-1.5 py-0.5 rounded bg-cyan-500/15 border border-cyan-500/30 text-cyan-300 font-mono text-[10px]">
+                  无监督 DF 挖掘
+                </span>
+              </div>
+              <p class="text-[11px] text-slate-400">
+                旁路统计高频挂载在多个不同种子首尾、且尚未被当前词库拦截的新站前缀与水印候选
+              </p>
+            </div>
+
+            <div class="flex flex-wrap items-center gap-2">
+              <button
+                type="button"
+                class="obs-btn obs-btn-ghost px-3! py-1.5! text-xs! inline-flex items-center gap-1"
+                :disabled="discoveryLoading"
+                @click="loadLiveDiscoveryCandidates(false)"
+              >
+                <RefreshCw class="w-3.5 h-3.5" :class="discoveryLoading ? 'animate-spin text-cyan-400' : ''" />
+                拉取在线 Indexer 发现
+              </button>
+              <button
+                type="button"
+                class="obs-btn obs-btn-primary px-3! py-1.5! text-xs! inline-flex items-center gap-1"
+                :disabled="discoveryScanning"
+                @click="scanManticoreDiscoveryCandidates"
+              >
+                <Sparkles class="w-3.5 h-3.5" />
+                {{ discoveryScanning ? "扫描分析中…" : "扫描库内近期种子" }}
+              </button>
+            </div>
+          </div>
+
+          <div v-if="discoveryMeta" class="text-[11px] font-mono text-cyan-300/90">
+            {{ discoveryMeta }}
+          </div>
+
+          <div v-if="visibleDiscoveryCandidates.length > 0" class="grid grid-cols-1 lg:grid-cols-2 gap-2.5">
+            <div
+              v-for="cand in visibleDiscoveryCandidates"
+              :key="cand.phrase"
+              class="rounded-lg border border-slate-800 bg-[#080b11] p-3 flex items-start justify-between gap-3"
+            >
+              <div class="min-w-0 space-y-1">
+                <div class="flex flex-wrap items-center gap-1.5">
+                  <span class="px-2 py-0.5 rounded bg-amber-500/12 border border-amber-500/30 text-amber-200 font-mono-num text-xs font-semibold break-all">
+                    {{ cand.phrase }}
+                  </span>
+                  <span class="px-1.5 py-0.5 rounded bg-slate-800 text-slate-300 font-mono-num text-[10px]">
+                    出现 {{ cand.occurrences }} 次 · 覆盖 {{ cand.distinct_titles }} 个不同标题
+                  </span>
+                  <span
+                    v-if="cand.suggested_score > 0"
+                    class="px-1.5 py-0.5 rounded bg-cyan-500/15 border border-cyan-500/30 text-cyan-300 font-mono-num text-[10px]"
+                  >
+                    风险分 {{ cand.suggested_score }}
+                  </span>
+                </div>
+                <div v-if="cand.sample_titles.length > 0" class="text-[11px] font-mono text-slate-500 truncate">
+                  样本: {{ cand.sample_titles[0] }}
+                </div>
+              </div>
+
+              <div class="flex items-center gap-1.5 shrink-0">
+                <button
+                  type="button"
+                  class="obs-btn obs-btn-primary px-2.5! py-1! rounded text-[11px]! cursor-pointer"
+                  @click="adoptDiscoveredCandidate(cand)"
+                >
+                  + 加入短语
+                </button>
+                <button
+                  type="button"
+                  class="obs-btn obs-btn-ghost px-2! py-1! rounded text-[11px]! cursor-pointer"
+                  @click="dismissDiscoveredCandidate(cand)"
+                >
+                  忽略
+                </button>
+              </div>
+            </div>
+          </div>
+
+          <div v-else class="py-5 text-center text-[11px] text-slate-500 border border-dashed border-slate-800 rounded-lg">
+            暂无待处理的疑似新广告模板；可点击右上角「扫描库内近期种子」对近期入库标题做即时挖掘
+          </div>
+        </section>
+      </div>
+
+      <!-- TAB 3: A/B PLAYGROUND -->
+      <div v-else-if="activeTab === 'playground'" class="p-4">
+        <div class="grid grid-cols-1 xl:grid-cols-12 gap-4 items-start">
+          <!-- Left 5 cols: Input & Mode -->
+          <section class="xl:col-span-5 obs-inset rounded-xl p-4 space-y-3 text-xs">
+            <div class="flex items-center justify-between">
+              <h3 class="font-semibold text-white">演练样本与对比模式</h3>
+              <span class="text-[11px] font-mono text-slate-400">支持真库抽样或自由输入</span>
             </div>
 
             <div class="space-y-2.5">
-              <div
-                v-for="rule in filteredRules"
-                :key="rule.id"
-                class="rounded-xl border p-3.5 transition-colors flex flex-wrap md:flex-nowrap items-start justify-between gap-3"
-                :class="[
-                  rule.enabled
-                    ? rule.action === 'allow'
-                      ? 'border-emerald-200 bg-emerald-50/20'
-                      : 'border-slate-200 bg-white'
-                    : 'border-slate-200 bg-slate-50 opacity-65',
-                ]"
-              >
-                <div class="flex items-start gap-3 flex-1 min-w-0">
-                  <!-- 优先级编号与上下移动 -->
-                  <div class="flex flex-col items-center gap-0.5 pt-0.5">
-                    <span class="text-[11px] font-mono font-semibold text-slate-400">
-                      #{{ workingBundle.policy.rules.indexOf(rule) + 1 }}
-                    </span>
-                    <div class="flex items-center">
-                      <el-button
-                        size="small"
-                        link
-                        :disabled="workingBundle.policy.rules.indexOf(rule) === 0"
-                        @click="moveRule(rule, -1)"
-                      >
-                        <ArrowUp class="h-3.5 w-3.5" />
-                      </el-button>
-                      <el-button
-                        size="small"
-                        link
-                        :disabled="
-                          workingBundle.policy.rules.indexOf(rule) ===
-                          workingBundle.policy.rules.length - 1
-                        "
-                        @click="moveRule(rule, 1)"
-                      >
-                        <ArrowDown class="h-3.5 w-3.5" />
-                      </el-button>
-                    </div>
-                  </div>
-
-                  <div class="flex-1 min-w-0 space-y-1.5">
-                    <div class="flex flex-wrap items-center gap-2">
-                      <el-switch v-model="rule.enabled" size="small" />
-                      <el-tag
-                        size="small"
-                        :type="rule.action === 'allow' ? 'success' : 'danger'"
-                        effect="dark"
-                      >
-                        {{ rule.action === "allow" ? "ALLOW 放行" : "REJECT 拦截" }}
-                      </el-tag>
-                      <el-tag size="small" type="info" effect="plain">
-                        {{ matcherTypeLabel(rule.matcher.type) }}
-                      </el-tag>
-                      <span class="font-semibold text-sm text-slate-900 truncate">
-                        {{ rule.name }}
-                      </span>
-                      <span class="font-mono text-[11px] text-slate-400">{{ rule.id }}</span>
-                      <el-tag
-                        v-if="(hitCountByRuleId.get(rule.id) ?? 0) > 0"
-                        size="small"
-                        :type="rule.action === 'allow' ? 'success' : 'warning'"
-                        effect="light"
-                      >
-                        线上命中 {{ hitCountByRuleId.get(rule.id) }} 次
-                      </el-tag>
-                    </div>
-
-                    <div class="text-xs text-slate-700 font-mono bg-slate-50 rounded px-2.5 py-1.5 border border-slate-100 break-all">
-                      {{ summarizeMatcher(rule.matcher) }}
-                    </div>
-
-                    <div v-if="rule.note" class="text-[11px] text-slate-500">
-                      {{ rule.note }}
-                    </div>
-                  </div>
-                </div>
-
-                <div class="flex items-center gap-1 shrink-0">
-                  <el-button size="small" plain @click="openEditRuleDrawer(rule)">
-                    <Edit3 class="h-3.5 w-3.5 mr-1" />
-                    配置
-                  </el-button>
-                  <el-button size="small" link @click="duplicateRule(rule)">
-                    <Copy class="h-3.5 w-3.5" />
-                  </el-button>
-                  <el-button size="small" type="danger" link @click="removeRule(rule)">
-                    <Trash2 class="h-3.5 w-3.5" />
-                  </el-button>
-                </div>
-              </div>
-            </div>
-          </div>
-        </div>
-      </el-tab-pane>
-
-      <!-- Tab 2: 标题清洗管线与动态词库 -->
-      <el-tab-pane name="cleaner">
-        <template #label>
-          <span class="inline-flex items-center gap-1.5">
-            <Sparkles class="h-3.5 w-3.5" />
-            标题清洗管线 ({{ workingBundle.ad_phrases.length + workingBundle.ad_regexes.length }})
-          </span>
-        </template>
-
-        <div class="space-y-5">
-          <!-- 8 阶段可视化开关 -->
-          <div class="rounded-xl border border-indigo-200 bg-indigo-50/40 p-4 space-y-3">
-            <div class="flex flex-wrap items-center justify-between gap-3">
-              <div>
-                <div class="text-sm font-semibold text-indigo-950">8 阶段本地标题去广告清洗开关</div>
-                <div class="text-xs text-indigo-800/80">
-                  内置 1,284 个 IANA 顶级域智能识别；支持按需关闭任意清洗阶段
-                </div>
-              </div>
-              <div class="flex items-center gap-2 bg-white rounded-lg border border-indigo-200 px-3 py-1.5">
-                <span class="text-xs font-medium text-slate-700">清洗后有效标题为空时直接拦截：</span>
-                <el-switch
-                  v-model="workingBundle.policy.cleaner.reject_if_empty_after_clean"
-                  size="small"
-                />
-              </div>
+              <ObsSelect v-model="pgMode" :options="PG_MODE_OPTIONS" class="w-full" />
+              <label class="inline-flex items-center gap-2 text-xs text-slate-300 cursor-pointer">
+                <input v-model="pgAutoPlaceholder" type="checkbox" class="obs-checkbox" />
+                纯标题样本自动附加合理媒体占位文件（避免触发空文件闸门）
+              </label>
             </div>
 
-            <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-2.5">
-              <div
-                v-for="st in CLEANER_STAGE_META"
-                :key="st.key"
-                class="rounded-lg border border-slate-200 bg-white p-2.5 flex items-start justify-between gap-2"
-              >
-                <div class="min-w-0">
-                  <div class="text-xs font-semibold text-slate-800">{{ st.label }}</div>
-                  <div class="text-[11px] text-slate-500 mt-0.5">{{ st.desc }}</div>
-                </div>
-                <el-switch v-model="workingBundle.policy.cleaner[st.key]" size="small" />
-              </div>
-            </div>
-          </div>
-
-          <div class="grid grid-cols-1 lg:grid-cols-2 gap-5">
-            <!-- 动态广告短语 -->
-            <div class="rounded-lg border border-slate-200 p-4 space-y-3">
-              <div class="flex items-center justify-between">
-                <h3 class="text-sm font-semibold text-slate-900">
-                  动态广告短语 (`ad_phrases` · {{ workingBundle.ad_phrases.length }})
-                </h3>
-                <el-input
-                  v-model="phraseSearch"
-                  size="small"
-                  clearable
-                  placeholder="筛选短语..."
-                  style="width: 150px"
-                />
-              </div>
-
-              <div class="flex items-center gap-2">
-                <el-input v-model="newAdPhrase" size="small" placeholder="新增广告短语" class="flex-1" />
-                <el-input v-model="newAdPhraseNote" size="small" placeholder="备注" style="width: 110px" />
-                <el-button size="small" type="primary" @click="addAdPhrase">添加</el-button>
-              </div>
-
-              <el-table :data="filteredAdPhrases" size="small" border stripe max-height="420">
-                <el-table-column label="启用" width="60">
-                  <template #default="{ row }">
-                    <el-switch v-model="row.enabled" size="small" />
-                  </template>
-                </el-table-column>
-                <el-table-column label="广告短语" min-width="150">
-                  <template #default="{ row }">
-                    <el-input v-model="row.phrase" size="small" />
-                  </template>
-                </el-table-column>
-                <el-table-column label="备注" width="115">
-                  <template #default="{ row }">
-                    <el-input v-model="row.note" size="small" />
-                  </template>
-                </el-table-column>
-                <el-table-column label="删" width="55">
-                  <template #default="{ row }">
-                    <el-button
-                      size="small"
-                      type="danger"
-                      link
-                      @click="workingBundle.ad_phrases = workingBundle.ad_phrases.filter((x) => x !== row)"
-                    >
-                      删
-                    </el-button>
-                  </template>
-                </el-table-column>
-              </el-table>
+            <div class="flex flex-wrap gap-1.5">
+              <button type="button" class="obs-btn obs-btn-ghost px-2.5! py-1! text-[11px]!" :disabled="pgSampling" @click="loadSamplesFromBackend('manticore_latest')">
+                抽样最新入库
+              </button>
+              <button type="button" class="obs-btn obs-btn-ghost px-2.5! py-1! text-[11px]!" :disabled="pgSampling" @click="loadSamplesFromBackend('manticore_random')">
+                随机库内抽样
+              </button>
+              <button type="button" class="obs-btn obs-btn-ghost px-2.5! py-1! text-[11px]!" :disabled="pgSampling" @click="loadSamplesFromBackend('rejected_recent')">
+                抽样最近拦截
+              </button>
             </div>
 
-            <!-- 动态广告正则 -->
-            <div class="rounded-lg border border-slate-200 p-4 space-y-3">
-              <h3 class="text-sm font-semibold text-slate-900">
-                动态广告正则 (`ad_regexes` · {{ workingBundle.ad_regexes.length }})
-              </h3>
-
-              <div class="flex flex-wrap items-center gap-2">
-                <el-input
-                  v-model="newAdRegex"
-                  size="small"
-                  placeholder="新增广告清洗正则"
-                  class="flex-1 min-w-[180px] font-mono"
-                />
-                <el-input
-                  v-model="newAdRegexReplacement"
-                  size="small"
-                  placeholder="替换为"
-                  style="width: 85px"
-                  class="font-mono"
-                />
-                <el-input v-model="newAdRegexNote" size="small" placeholder="备注" style="width: 95px" />
-                <el-button size="small" type="primary" @click="addAdRegex">添加</el-button>
-              </div>
-
-              <el-table :data="workingBundle.ad_regexes" size="small" border stripe max-height="420">
-                <el-table-column label="启用" width="55">
-                  <template #default="{ row }">
-                    <el-switch v-model="row.enabled" size="small" />
-                  </template>
-                </el-table-column>
-                <el-table-column label="正则表达式" min-width="170">
-                  <template #default="{ row }">
-                    <el-input v-model="row.pattern" size="small" class="font-mono" />
-                  </template>
-                </el-table-column>
-                <el-table-column label="替换为" width="85">
-                  <template #default="{ row }">
-                    <el-input v-model="row.replacement" size="small" class="font-mono" />
-                  </template>
-                </el-table-column>
-                <el-table-column label="备注" width="105">
-                  <template #default="{ row }">
-                    <el-input v-model="row.note" size="small" />
-                  </template>
-                </el-table-column>
-                <el-table-column label="删" width="50">
-                  <template #default="{ row }">
-                    <el-button
-                      size="small"
-                      type="danger"
-                      link
-                      @click="workingBundle.ad_regexes = workingBundle.ad_regexes.filter((x) => x !== row)"
-                    >
-                      删
-                    </el-button>
-                  </template>
-                </el-table-column>
-              </el-table>
-            </div>
-          </div>
-        </div>
-      </el-tab-pane>
-
-      <!-- Tab 3: 在线演练场与 A/B 对比 -->
-      <el-tab-pane name="playground">
-        <template #label>
-          <span class="inline-flex items-center gap-1.5">
-            <FlaskConical class="h-3.5 w-3.5" />
-            在线演练场 & A/B 对比
-          </span>
-        </template>
-
-        <div class="space-y-6">
-          <!-- 单条精调调试 -->
-          <div class="rounded-lg border border-slate-200 p-4 space-y-4">
-            <div class="flex flex-wrap items-center justify-between gap-2">
-              <div class="text-sm font-semibold text-slate-900">单条实时调试（清洗步骤跟踪 + Allow/Reject 命中归因）</div>
-              <el-radio-group v-model="pgMode" size="small">
-                <el-radio-button value="ab_compare">线上 vs 编辑器 A/B 对比</el-radio-button>
-                <el-radio-button value="draft">仅测编辑器当前规则</el-radio-button>
-                <el-radio-button value="published">仅测线上已发布规则</el-radio-button>
-              </el-radio-group>
-            </div>
-
-            <div class="flex flex-wrap items-center gap-2.5">
-              <el-input
-                v-model="singleTitle"
-                size="small"
-                placeholder="输入待测种子标题..."
-                class="flex-1 min-w-[260px]"
-                @keyup.enter="runSingleTest"
+            <div class="flex items-center gap-2">
+              <input
+                v-model="pgQuickTitle"
+                type="text"
+                placeholder="快速插入一条待测种子标题…"
+                class="obs-input rounded-lg px-3 py-1.5 text-xs flex-1"
+                @keyup.enter="applyTitleFromQuickOrLines"
               />
-              <el-input
-                v-model="singleInfoHash"
-                size="small"
-                placeholder="可选 40 位 info_hash"
-                style="width: 220px"
-                class="font-mono"
+              <button type="button" class="obs-btn obs-btn-ghost px-2.5! py-1.5! text-xs!" @click="applyTitleFromQuickOrLines">插入</button>
+            </div>
+
+            <div>
+              <label class="block text-[11px] text-slate-400 mb-1">测试标题列表（每行 1 条）</label>
+              <textarea
+                v-model="pgSamplesText"
+                rows="10"
+                class="w-full rounded-lg bg-[#07090e] border border-slate-800 focus:border-cyan-500/60 focus:outline-none p-2.5 text-xs font-mono text-cyan-200 leading-relaxed obs-scroll"
               />
-              <el-checkbox v-model="singleAutoFile" size="small">自动合成 100MiB 视频占位文件</el-checkbox>
-              <el-button size="small" type="primary" :loading="singleRunning" @click="runSingleTest">
-                <Play class="h-3.5 w-3.5 mr-1" />
-                运行测试
-              </el-button>
             </div>
 
-            <div v-if="!singleAutoFile" class="rounded border border-slate-200 p-3 space-y-2 bg-slate-50">
-              <div class="flex items-center justify-between text-xs text-slate-600">
-                <span>自定义模拟文件列表</span>
-                <el-button size="small" link type="primary" @click="singleFiles.push({ path: '', size: 0 })">
-                  + 添加文件
-                </el-button>
-              </div>
-              <div v-for="(f, idx) in singleFiles" :key="idx" class="flex items-center gap-2">
-                <el-input v-model="f.path" size="small" placeholder="path" class="flex-1 font-mono" />
-                <ByteSizeInput v-model="f.size" :min="0" />
-                <el-button size="small" type="danger" link @click="singleFiles.splice(idx, 1)">删</el-button>
-              </div>
-            </div>
+            <button
+              type="button"
+              class="obs-btn obs-btn-primary w-full py-2! text-xs! font-semibold inline-flex items-center justify-center gap-1.5"
+              :disabled="pgRunning"
+              @click="runPlayground"
+            >
+              <Play class="w-3.5 h-3.5" />
+              {{ pgRunning ? "正在真实 Rust 引擎执行演练…" : "运行规则与标题清洗演练" }}
+            </button>
+          </section>
 
-            <div v-if="singleResult" class="space-y-3 pt-2 border-t border-slate-100">
-              <div class="flex flex-wrap items-center gap-3 text-xs">
-                <el-tag :type="singleResult.accepted ? 'success' : 'danger'">
-                  {{ singleResult.accepted ? "放行 (Accepted)" : "拦截 (Rejected)" }}
-                </el-tag>
-                <el-tag v-if="singleAbItem" :type="abDiffTagType(singleAbItem.diff_status)" effect="plain">
-                  A/B 状态: {{ abDiffLabel(singleAbItem.diff_status) }}
-                </el-tag>
-                <span class="text-slate-500">原始:</span>
-                <span class="font-mono text-slate-800">{{ singleResult.raw_name }}</span>
-                <ArrowRight class="h-3.5 w-3.5 text-slate-400" />
-                <span class="text-slate-500">清洗后:</span>
-                <span class="font-mono font-semibold text-indigo-700">
-                  {{ singleResult.refined_name || "(空字符串)" }}
-                </span>
-              </div>
-
-              <div
-                v-if="singleResult.allowed_by"
-                class="rounded border border-emerald-200 bg-emerald-50 px-3.5 py-2 text-xs text-emerald-900 flex flex-wrap gap-3"
-              >
-                <span><strong>白名单放行:</strong> {{ singleResult.allowed_by.rule_label }}</span>
-                <span><strong>规则 ID:</strong> <code class="font-mono">{{ singleResult.allowed_by.rule_id }}</code></span>
-                <span><strong>详情:</strong> {{ singleResult.allowed_by.detail }}</span>
-              </div>
-
-              <div
-                v-if="singleResult.hit"
-                class="rounded border border-rose-200 bg-rose-50 px-3.5 py-2 text-xs text-rose-800 flex flex-wrap gap-3"
-              >
-                <span><strong>命中类别:</strong> {{ categoryLabel(singleResult.hit.category) }}</span>
-                <span><strong>规则 ID:</strong> <code class="font-mono">{{ singleResult.hit.rule_id }}</code></span>
-                <span><strong>规则标签:</strong> {{ singleResult.hit.rule_label }}</span>
-                <span><strong>详情:</strong> {{ singleResult.hit.detail }}</span>
-              </div>
-
-              <el-table :data="singleResult.cleaning_trace.steps" size="small" border>
-                <el-table-column prop="stage" label="清洗阶段" width="190" />
-                <el-table-column prop="before" label="处理前" min-width="210" show-overflow-tooltip>
-                  <template #default="{ row }">
-                    <span class="font-mono text-xs text-slate-500">{{ row.before }}</span>
-                  </template>
-                </el-table-column>
-                <el-table-column prop="after" label="处理后" min-width="210" show-overflow-tooltip>
-                  <template #default="{ row }">
-                    <span
-                      class="font-mono text-xs"
-                      :class="row.changed ? 'text-emerald-700 font-semibold' : 'text-slate-600'"
-                    >
-                      {{ row.after }}
-                    </span>
-                  </template>
-                </el-table-column>
-                <el-table-column label="状态" width="85">
-                  <template #default="{ row }">
-                    <el-tag
-                      size="small"
-                      :type="!row.enabled ? 'warning' : row.changed ? 'success' : 'info'"
-                      effect="plain"
-                    >
-                      {{ !row.enabled ? "已关闭" : row.changed ? "已改" : "未变" }}
-                    </el-tag>
-                  </template>
-                </el-table-column>
-              </el-table>
-            </div>
-          </div>
-
-          <!-- 批量抽样回归 & A/B Diff 报告 -->
-          <div class="rounded-lg border border-slate-200 p-4 space-y-4">
-            <div class="flex flex-wrap items-center justify-between gap-3">
-              <div>
-                <div class="text-sm font-semibold text-slate-900">
-                  批量抽样回归 & A/B 影响评估 (当前已载入 {{ batchSamples.length }} 条样本)
-                </div>
-                <div class="text-xs text-slate-500 mt-0.5">
-                  直接使用编辑器当前尚未发布的变更对比线上已发布规则，评估是否引发误杀或意外放行
-                </div>
-              </div>
-              <div class="flex flex-wrap items-center gap-2">
-                <el-input
-                  v-model="batchKeyword"
-                  size="small"
-                  clearable
-                  placeholder="抽样过滤词（可选）"
-                  style="width: 150px"
-                />
-                <el-button
-                  size="small"
-                  :loading="batchSampling"
-                  @click="loadSamplesFrom('manticore_latest')"
-                >
-                  Manticore 最新 30
-                </el-button>
-                <el-button
-                  size="small"
-                  :loading="batchSampling"
-                  @click="loadSamplesFrom('manticore_random')"
-                >
-                  Manticore 随机 30
-                </el-button>
-                <el-button
-                  size="small"
-                  :loading="batchSampling"
-                  @click="loadSamplesFrom('rejected_recent')"
-                >
-                  最近拦截样本 30
-                </el-button>
-                <el-button size="small" @click="batchPasteVisible = true">粘贴多行标题</el-button>
-                <el-button
-                  size="small"
-                  type="primary"
-                  :loading="batchRunning"
-                  :disabled="batchSamples.length === 0"
-                  @click="runBatchAbCompare"
-                >
-                  <Play class="h-3.5 w-3.5 mr-1" />
-                  执行批量 A/B 对比
-                </el-button>
-              </div>
-            </div>
-
-            <div v-if="batchAbReport" class="space-y-3">
-              <div class="grid grid-cols-2 sm:grid-cols-6 gap-2.5 text-center text-xs">
-                <div class="rounded border border-slate-200 bg-slate-50 p-2">
-                  <div class="text-slate-500">总样本数</div>
-                  <div class="text-lg font-bold font-mono text-slate-900">{{ batchAbReport.summary.total }}</div>
-                </div>
-                <div class="rounded border border-rose-200 bg-rose-50 p-2">
-                  <div class="text-rose-700">新增拦截</div>
-                  <div class="text-lg font-bold font-mono text-rose-700">{{ batchAbReport.summary.newly_rejected }}</div>
-                </div>
-                <div class="rounded border border-emerald-200 bg-emerald-50 p-2">
-                  <div class="text-emerald-700">解除拦截</div>
-                  <div class="text-lg font-bold font-mono text-emerald-700">{{ batchAbReport.summary.newly_accepted }}</div>
-                </div>
-                <div class="rounded border border-amber-200 bg-amber-50 p-2">
-                  <div class="text-amber-700">清洗变化</div>
-                  <div class="text-lg font-bold font-mono text-amber-700">{{ batchAbReport.summary.refined_name_changed }}</div>
-                </div>
-                <div class="rounded border border-slate-200 p-2">
-                  <div class="text-slate-500">维持放行</div>
-                  <div class="text-lg font-bold font-mono text-slate-700">{{ batchAbReport.summary.unchanged_accepted }}</div>
-                </div>
-                <div class="rounded border border-slate-200 p-2">
-                  <div class="text-slate-500">维持拦截</div>
-                  <div class="text-lg font-bold font-mono text-slate-700">{{ batchAbReport.summary.unchanged_rejected }}</div>
-                </div>
-              </div>
-
-              <div class="flex flex-wrap items-center gap-2">
-                <el-radio-group v-model="batchDiffFilter" size="small">
-                  <el-radio-button value="all">全部 ({{ batchAbReport.items.length }})</el-radio-button>
-                  <el-radio-button value="changed">仅显示差异</el-radio-button>
-                  <el-radio-button value="newly_rejected">新增拦截</el-radio-button>
-                  <el-radio-button value="newly_accepted">解除拦截</el-radio-button>
-                  <el-radio-button value="refined_name_changed">清洗变化</el-radio-button>
-                </el-radio-group>
-              </div>
-
-              <el-table :data="filteredAbItems" size="small" border stripe max-height="400">
-                <el-table-column label="差异" width="115">
-                  <template #default="{ row }">
-                    <el-tag size="small" :type="abDiffTagType(row.diff_status)">
-                      {{ abDiffLabel(row.diff_status) }}
-                    </el-tag>
-                  </template>
-                </el-table-column>
-                <el-table-column prop="raw_name" label="原始标题" min-width="220" show-overflow-tooltip />
-                <el-table-column label="线上版本结果" min-width="210" show-overflow-tooltip>
-                  <template #default="{ row }">
-                    <span v-if="row.published_accepted" class="text-xs text-emerald-700 font-mono">
-                      [{{ row.published_allowed_by ? `白名单: ${row.published_allowed_by.rule_label}` : "放行" }}]
-                      {{ row.published_refined_name }}
-                    </span>
-                    <span v-else class="text-xs text-rose-700">
-                      [拦截] {{ row.published_hit?.rule_label || "-" }}
-                    </span>
-                  </template>
-                </el-table-column>
-                <el-table-column label="草稿规则结果" min-width="210" show-overflow-tooltip>
-                  <template #default="{ row }">
-                    <span v-if="row.draft_accepted" class="text-xs text-emerald-700 font-mono">
-                      [{{ row.draft_allowed_by ? `白名单: ${row.draft_allowed_by.rule_label}` : "放行" }}]
-                      {{ row.draft_refined_name }}
-                    </span>
-                    <span v-else class="text-xs text-rose-700">
-                      [拦截] {{ row.draft_hit?.rule_label || "-" }}
-                    </span>
-                  </template>
-                </el-table-column>
-                <el-table-column label="调试" width="75">
-                  <template #default="{ row }">
-                    <el-button
-                      size="small"
-                      link
-                      type="primary"
-                      @click="sendSampleToPlayground(row.raw_name, row.info_hash)"
-                    >
-                      单测
-                    </el-button>
-                  </template>
-                </el-table-column>
-              </el-table>
-            </div>
-          </div>
-        </div>
-      </el-tab-pane>
-
-      <!-- Tab 4: 规则命中统计与样本巡检 -->
-      <el-tab-pane name="stats">
-        <template #label>
-          <span class="inline-flex items-center gap-1.5">
-            <AlertTriangle class="h-3.5 w-3.5" />
-            命中排行 & 最近 200 样本
-          </span>
-        </template>
-
-        <div class="space-y-5" v-loading="statsLoading">
-          <div class="flex flex-wrap items-center justify-between gap-3">
-            <div class="grid grid-cols-1 sm:grid-cols-3 gap-3 flex-1">
-              <div class="rounded-lg border border-slate-200 px-4 py-3">
-                <div class="text-xs text-slate-500">累计过滤评估总次数</div>
-                <div class="text-xl font-bold font-mono text-slate-900 mt-0.5">
-                  {{ (stats?.total_evaluated ?? 0).toLocaleString("zh-CN") }}
-                </div>
-              </div>
-              <div class="rounded-lg border border-emerald-200 bg-emerald-50/40 px-4 py-3">
-                <div class="text-xs text-emerald-700">累计放行入库数</div>
-                <div class="text-xl font-bold font-mono text-emerald-700 mt-0.5">
-                  {{ (stats?.total_accepted ?? 0).toLocaleString("zh-CN") }}
-                </div>
-              </div>
-              <div class="rounded-lg border border-rose-200 bg-rose-50/40 px-4 py-3">
-                <div class="text-xs text-rose-700">累计拦截丢弃数</div>
-                <div class="text-xl font-bold font-mono text-rose-700 mt-0.5">
-                  {{ (stats?.total_rejected ?? 0).toLocaleString("zh-CN") }}
-                </div>
-              </div>
-            </div>
-            <el-button size="small" :loading="statsLoading" @click="fetchStats">
-              <RefreshCw class="h-3.5 w-3.5 mr-1" />
-              刷新统计
-            </el-button>
-          </div>
-
-          <div class="grid grid-cols-1 lg:grid-cols-2 gap-5">
-            <!-- Top 规则命中排行 -->
-            <div class="rounded-lg border border-slate-200 p-4 space-y-2.5">
-              <div class="text-sm font-semibold text-slate-900">Top 50 规则命中归因排行</div>
-              <el-table :data="stats?.rule_hits ?? []" size="small" border stripe max-height="380">
-                <el-table-column label="动作" width="75">
-                  <template #default="{ row }">
-                    <el-tag
-                      size="small"
-                      :type="row.action === 'allow' ? 'success' : 'danger'"
-                      effect="light"
-                    >
-                      {{ row.action === "allow" ? "放行" : "拦截" }}
-                    </el-tag>
-                  </template>
-                </el-table-column>
-                <el-table-column label="规则类别" width="120">
-                  <template #default="{ row }">
-                    <el-tag size="small" effect="plain">{{ categoryLabel(row.category) }}</el-tag>
-                  </template>
-                </el-table-column>
-                <el-table-column prop="rule_label" label="规则名称" min-width="150" show-overflow-tooltip />
-                <el-table-column prop="rule_id" label="ID" width="100" show-overflow-tooltip>
-                  <template #default="{ row }">
-                    <span class="font-mono text-xs text-slate-500">{{ row.rule_id }}</span>
-                  </template>
-                </el-table-column>
-                <el-table-column prop="hits" label="命中数" width="80">
-                  <template #default="{ row }">
-                    <span
-                      class="font-mono font-semibold"
-                      :class="row.action === 'allow' ? 'text-emerald-700' : 'text-rose-700'"
-                    >
-                      {{ row.hits }}
-                    </span>
-                  </template>
-                </el-table-column>
-              </el-table>
-            </div>
-
-            <!-- Indexer 节点分布 -->
-            <div class="rounded-lg border border-slate-200 p-4 space-y-2.5">
-              <div class="text-sm font-semibold text-slate-900">各 Indexer 节点过滤吞吐统计</div>
-              <el-table :data="stats?.workers ?? []" size="small" border stripe max-height="380">
-                <el-table-column prop="id" label="节点 ID" width="120">
-                  <template #default="{ row }">
-                    <span class="font-mono font-medium">{{ row.id }}</span>
-                  </template>
-                </el-table-column>
-                <el-table-column prop="runtime_state" label="状态" width="95" />
-                <el-table-column label="规则版本" width="85">
-                  <template #default="{ row }">
-                    <span class="font-mono text-xs">{{ row.active_rule_version ? `v${row.active_rule_version}` : "-" }}</span>
-                  </template>
-                </el-table-column>
-                <el-table-column prop="total_evaluated" label="总判定" width="90" />
-                <el-table-column prop="total_rejected" label="已拦截" width="90" />
-              </el-table>
-            </div>
-          </div>
-
-          <!-- 最近 200 条拦截样本巡检 -->
-          <div class="rounded-lg border border-slate-200 p-4 space-y-3">
-            <div class="flex flex-wrap items-center justify-between gap-2">
-              <div class="text-sm font-semibold text-slate-900">
-                最近被拦截种子样本巡检 (共 {{ filteredRejectedSamples.length }} 条)
-              </div>
-              <div class="flex items-center gap-2">
-                <el-select v-model="rejectedCategoryFilter" size="small" style="width: 155px">
-                  <el-option label="全部拦截类别" value="all" />
-                  <el-option label="关键词词组" value="keyword_group" />
-                  <el-option label="扩展名后缀" value="extension_rule" />
-                  <el-option label="垃圾标题特征" value="title_pattern_preset" />
-                  <el-option label="文件体积/长度约束" value="file_constraint" />
-                  <el-option label="实质内容底线" value="substantive_content" />
-                  <el-option label="体积占比上限" value="size_ratio" />
-                  <el-option label="自定义正则" value="custom_regex" />
-                  <el-option label="复合条件规则" value="composite" />
-                  <el-option label="清洗后为空" value="empty_refined_name" />
-                </el-select>
-                <el-input
-                  v-model="rejectedSearch"
-                  size="small"
-                  clearable
-                  placeholder="搜索样本标题或 Hash..."
-                  style="width: 220px"
-                />
-              </div>
-            </div>
-
-            <el-table :data="filteredRejectedSamples" size="small" border stripe max-height="420">
-              <el-table-column prop="worker_id" label="节点" width="100" />
-              <el-table-column prop="raw_name" label="原始标题" min-width="230" show-overflow-tooltip />
-              <el-table-column label="大小 / 文件数" width="120">
-                <template #default="{ row }">
-                  <span class="font-mono text-xs">{{ formatBytes(row.total_size) }} / {{ row.file_count }}</span>
-                </template>
-              </el-table-column>
-              <el-table-column label="命中归因" min-width="210" show-overflow-tooltip>
-                <template #default="{ row }">
-                  <span class="text-xs text-rose-700">
-                    [{{ categoryLabel(row.hit.category) }}] {{ row.hit.rule_label }}: {{ row.hit.detail }}
-                  </span>
-                </template>
-              </el-table-column>
-              <el-table-column label="时间" width="150">
-                <template #default="{ row }">
-                  <span class="font-mono text-[11px] text-slate-500">{{ formatTs(row.rejected_at_unix) }}</span>
-                </template>
-              </el-table-column>
-              <el-table-column label="操作" width="215" fixed="right">
-                <template #default="{ row }">
-                  <div class="flex items-center gap-1.5">
-                    <el-button
-                      size="small"
-                      type="primary"
-                      link
-                      @click="sendSampleToPlayground(row.raw_name, row.info_hash)"
-                    >
-                      演练
-                    </el-button>
-                    <el-button size="small" link @click="locateRuleFromSample(row)">
-                      定位规则
-                    </el-button>
-                    <el-button
-                      size="small"
-                      type="success"
-                      link
-                      @click="quickAllowFromSample(row)"
-                    >
-                      <ShieldCheck class="h-3.5 w-3.5 mr-0.5" />
-                      加白名单
-                    </el-button>
-                  </div>
-                </template>
-              </el-table-column>
-            </el-table>
-          </div>
-        </div>
-      </el-tab-pane>
-
-      <!-- Tab 5: 历史版本与回滚 -->
-      <el-tab-pane name="versions">
-        <template #label>
-          <span class="inline-flex items-center gap-1.5">
-            <History class="h-3.5 w-3.5" />
-            规则版本历史 ({{ versions.length }})
-          </span>
-        </template>
-
-        <el-table :data="versions" size="small" border stripe v-loading="versionsLoading">
-          <el-table-column prop="version" label="版本" width="80">
-            <template #default="{ row }">
-              <span class="font-mono font-semibold">v{{ row.version }}</span>
-            </template>
-          </el-table-column>
-          <el-table-column prop="status" label="状态" width="105">
-            <template #default="{ row }">
-              <el-tag
-                size="small"
-                :type="
-                  row.status === 'published'
-                    ? 'success'
-                    : row.status === 'draft'
-                      ? 'warning'
-                      : 'info'
-                "
-              >
-                {{
-                  row.status === "published"
-                    ? "当前线上"
-                    : row.status === "draft"
-                      ? "草稿"
-                      : "已归档"
-                }}
-              </el-tag>
-            </template>
-          </el-table-column>
-          <el-table-column label="策略摘要" min-width="250">
-            <template #default="{ row }">
-              <span class="text-xs font-mono text-slate-600">
-                规则 {{ row.bundle.policy.rules.length }} 条（Allow {{ row.bundle.policy.rules.filter((x: PolicyRule) => x.action === "allow").length }} / Reject {{ row.bundle.policy.rules.filter((x: PolicyRule) => x.action === "reject").length }}）· 广告词库 {{ row.bundle.ad_phrases.length + row.bundle.ad_regexes.length }}
+          <!-- Right 7 cols: Simulation Results & Trace -->
+          <section class="xl:col-span-7 obs-inset rounded-xl p-4 space-y-4">
+            <div class="flex items-center justify-between border-b border-slate-800 pb-2.5">
+              <h3 class="text-xs font-semibold text-white">实时演练评估结果</h3>
+              <span v-if="pgResult" class="text-[11px] font-mono text-slate-400">
+                Published v{{ pgResult.published_version }}
+                <template v-if="pgResult.draft_version !== null"> · Draft v{{ pgResult.draft_version }}</template>
               </span>
-            </template>
-          </el-table-column>
-          <el-table-column prop="created_by" label="操作人" width="100" />
-          <el-table-column prop="note" label="变更说明" min-width="170" />
-          <el-table-column label="发布/创建时间" width="165">
-            <template #default="{ row }">{{ formatTs(row.published_at ?? row.created_at) }}</template>
-          </el-table-column>
-          <el-table-column label="操作" width="180" fixed="right">
-            <template #default="{ row }">
-              <el-button
-                size="small"
-                link
-                @click="
-                  inspectVersionData = row;
-                  inspectVersionVisible = true;
-                "
-              >
-                <FileJson class="h-3.5 w-3.5 mr-0.5" />
-                查看 JSON
-              </el-button>
-              <el-button
-                size="small"
-                type="warning"
-                link
-                :disabled="row.status === 'published' || row.status === 'draft'"
-                @click="handleRollback(row.version)"
-              >
-                回滚并热更新
-              </el-button>
-            </template>
-          </el-table-column>
-        </el-table>
-      </el-tab-pane>
-    </el-tabs>
+            </div>
 
-    <!-- 规则编辑抽屉 -->
+            <template v-if="pgResult">
+              <div v-if="pgResult.ab_report" class="bg-[#0b0f17] border border-slate-800 p-3 rounded-xl grid grid-cols-5 gap-2 text-center font-mono-num text-xs">
+                <div>
+                  <div class="text-[10px] text-slate-500">样本总数</div>
+                  <div class="text-white font-bold mt-0.5">{{ pgResult.ab_report.summary.total }}</div>
+                </div>
+                <div>
+                  <div class="text-[10px] text-emerald-400">新增放行</div>
+                  <div class="text-emerald-300 font-bold mt-0.5">{{ pgResult.ab_report.summary.newly_accepted }}</div>
+                </div>
+                <div>
+                  <div class="text-[10px] text-rose-400">新增拦截</div>
+                  <div class="text-rose-300 font-bold mt-0.5">{{ pgResult.ab_report.summary.newly_rejected }}</div>
+                </div>
+                <div>
+                  <div class="text-[10px] text-amber-400">清洗标题变</div>
+                  <div class="text-amber-300 font-bold mt-0.5">{{ pgResult.ab_report.summary.refined_name_changed }}</div>
+                </div>
+                <div>
+                  <div class="text-[10px] text-slate-500">一致状态</div>
+                  <div class="text-slate-300 font-bold mt-0.5">
+                    {{ pgResult.ab_report.summary.unchanged_accepted + pgResult.ab_report.summary.unchanged_rejected }}
+                  </div>
+                </div>
+              </div>
+
+              <div v-if="pgResult.ab_report" class="space-y-2 max-h-[520px] overflow-auto obs-scroll pr-1">
+                <div
+                  v-for="item in pgResult.ab_report.items"
+                  :key="item.sample_index"
+                  class="bg-[#0b0f17] border border-slate-800 p-3 rounded-xl space-y-1.5 text-xs"
+                >
+                  <div class="flex flex-wrap items-center justify-between gap-2">
+                    <span class="px-2 py-0.5 rounded-md text-[10px] border font-mono" :class="abDiffLabel(item.diff_status).cls">
+                      {{ abDiffLabel(item.diff_status).text }}
+                    </span>
+                    <div class="text-[11px] font-mono text-slate-400">
+                      线上: <b :class="item.published_accepted ? 'text-emerald-300' : 'text-rose-300'">{{ item.published_accepted ? "放行" : "拦截" }}</b>
+                      →
+                      草稿: <b :class="item.draft_accepted ? 'text-emerald-300' : 'text-rose-300'">{{ item.draft_accepted ? "放行" : "拦截" }}</b>
+                    </div>
+                  </div>
+                  <div class="font-mono text-[11px] text-slate-400 break-all">raw: {{ item.raw_name }}</div>
+                  <div class="text-emerald-200 break-all">draft_refined: {{ item.draft_refined_name }}</div>
+                  <div v-if="item.draft_hit" class="text-[11px] text-rose-300 font-mono">
+                    草稿命中规则: [{{ item.draft_hit.rule_label }}] {{ item.draft_hit.detail }}
+                  </div>
+                </div>
+              </div>
+
+              <div v-else class="space-y-2.5 max-h-[520px] overflow-auto obs-scroll pr-1">
+                <div
+                  v-for="item in pgResult.results"
+                  :key="item.sample_index"
+                  class="bg-[#0b0f17] border border-slate-800 p-3 rounded-xl space-y-2 text-xs"
+                >
+                  <div class="flex items-center justify-between gap-2">
+                    <span
+                      class="px-2 py-0.5 rounded-md text-[10px] font-mono border"
+                      :class="item.accepted ? 'bg-emerald-500/12 text-emerald-300 border-emerald-500/30' : 'bg-rose-500/12 text-rose-300 border-rose-500/30'"
+                    >
+                      {{ item.accepted ? "ACCEPTED 放行" : "REJECTED 拦截" }}
+                    </span>
+                    <span v-if="item.hit" class="text-[11px] font-mono text-rose-300">
+                      {{ item.hit.rule_label }} · {{ item.hit.detail }}
+                    </span>
+                    <span v-else-if="item.allowed_by" class="text-[11px] font-mono text-emerald-300">
+                      豁免: {{ item.allowed_by.rule_label }}
+                    </span>
+                  </div>
+                  <div class="font-mono text-[11px] text-slate-400 break-all">原标题: {{ item.raw_name }}</div>
+                  <div class="text-emerald-200 font-medium break-all">清洗后: {{ item.refined_name }}</div>
+
+                  <div
+                    v-if="item.cleaning_trace.steps.some((s) => s.changed)"
+                    class="pt-1.5 border-t border-slate-800 space-y-1 text-[11px] font-mono"
+                  >
+                    <div
+                      v-for="step in item.cleaning_trace.steps.filter((s) => s.changed)"
+                      :key="step.stage"
+                      class="text-slate-400 break-all space-y-0.5"
+                    >
+                      <div>
+                        <span class="text-sky-300">[{{ step.stage }}]</span> {{ step.before }} → <span class="text-emerald-300">{{ step.after }}</span>
+                      </div>
+                      <div v-if="step.detail" class="pl-3 text-[10px] text-cyan-300/90">
+                        ↳ {{ step.detail }}
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </template>
+
+            <div v-else class="py-20 text-center text-xs text-slate-500">
+              在左侧设置好测试标题或抽取库内真实种子，点击运行即可查看逐步清洗轨迹与规则差异对比
+            </div>
+          </section>
+        </div>
+      </div>
+
+      <!-- TAB 4: HIT STATS -->
+      <div v-else-if="activeTab === 'stats'" class="p-4 space-y-4">
+        <div class="flex items-center justify-between">
+          <span class="text-xs text-slate-400">汇总在线 Indexer 子进程的实时规则评估与最近拦截样本</span>
+          <button type="button" class="obs-btn obs-btn-ghost px-3! py-1.5! text-xs! inline-flex items-center gap-1" @click="loadStats">
+            <RefreshCw class="w-3.5 h-3.5" :class="statsLoading ? 'animate-spin text-emerald-400' : ''" />
+            刷新统计
+          </button>
+        </div>
+
+        <template v-if="stats">
+          <div class="grid grid-cols-1 sm:grid-cols-3 gap-3">
+            <div class="obs-inset rounded-xl p-4">
+              <div class="text-[11px] text-slate-400">累计规则评估总量</div>
+              <div class="mt-1.5 text-2xl font-bold font-mono-num text-white">{{ fmtCount(stats.total_evaluated) }}</div>
+            </div>
+            <div class="obs-inset rounded-xl p-4">
+              <div class="text-[11px] text-slate-400">规则引擎放行</div>
+              <div class="mt-1.5 text-2xl font-bold font-mono-num text-emerald-300">{{ fmtCount(stats.total_accepted) }}</div>
+            </div>
+            <div class="obs-inset rounded-xl p-4">
+              <div class="text-[11px] text-slate-400">规则引擎拦截</div>
+              <div class="mt-1.5 text-2xl font-bold font-mono-num text-rose-300">{{ fmtCount(stats.total_rejected) }}</div>
+            </div>
+          </div>
+
+          <div class="grid grid-cols-1 xl:grid-cols-2 gap-4">
+            <div class="obs-inset rounded-xl p-4 space-y-3">
+              <h3 class="text-xs font-semibold text-white">规则命中次数分布</h3>
+              <ObsHorizontalBars v-if="statsBarItems.length > 0" :items="statsBarItems" color="#f59e0b" />
+              <div v-else class="py-10 text-center text-xs text-slate-500">暂无规则命中计数</div>
+            </div>
+
+            <div class="obs-inset rounded-xl p-4 space-y-3">
+              <h3 class="text-xs font-semibold text-white">在线 Indexer 子进程执行概览</h3>
+              <div class="space-y-2">
+                <div v-for="w in stats.workers" :key="w.id" class="bg-[#0b0f17] border border-slate-800 p-3 rounded-xl flex items-center justify-between text-xs font-mono">
+                  <div>
+                    <div class="text-white font-semibold">{{ w.display_name }} ({{ w.id }})</div>
+                    <div class="text-[11px] text-slate-400">状态: {{ w.runtime_state }} · 规则 v{{ w.active_rule_version ?? "—" }}</div>
+                  </div>
+                  <div class="text-right font-mono-num">
+                    <div class="text-emerald-300">{{ fmtCount(w.total_accepted) }} 放行</div>
+                    <div class="text-rose-300">{{ fmtCount(w.total_rejected) }} 拦截</div>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <section class="obs-inset rounded-xl overflow-hidden">
+            <div class="px-4 py-3 border-b border-slate-800 bg-[#0b0f17] text-xs font-semibold text-white">
+              最近被拦截样本 ({{ stats.recent_rejected.length }})
+            </div>
+            <div class="overflow-x-auto max-h-96 obs-scroll">
+              <table class="w-full text-left border-collapse text-xs">
+                <thead class="bg-[#0b0f17] border-b border-slate-800 text-[10px] font-mono uppercase tracking-wider text-slate-400">
+                  <tr>
+                    <th class="px-4 py-2">时间</th>
+                    <th class="px-3 py-2">标题 &amp; InfoHash</th>
+                    <th class="px-3 py-2">体积 / 文件数</th>
+                    <th class="px-3 py-2">命中规则 / 详情</th>
+                    <th class="px-4 py-2 text-right">复测</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr
+                    v-for="(s, idx) in stats.recent_rejected"
+                    :key="`${s.info_hash}:${idx}`"
+                    class="border-b border-slate-800/50 hover:bg-slate-800/35"
+                  >
+                    <td class="px-4 py-2 font-mono-num text-[11px] text-slate-400 whitespace-nowrap">{{ formatDateTime(s.rejected_at_unix) }}</td>
+                    <td class="px-3 py-2 max-w-md">
+                      <div class="text-slate-100 truncate">{{ s.raw_name }}</div>
+                      <div class="text-[10px] font-mono text-cyan-400/80">{{ s.info_hash }}</div>
+                    </td>
+                    <td class="px-3 py-2 font-mono-num text-[11px] text-slate-300 whitespace-nowrap">
+                      {{ fmtBytes(s.total_size) }} · {{ s.file_count }}f
+                    </td>
+                    <td class="px-3 py-2 text-[11px] font-mono text-rose-300">
+                      [{{ s.hit.rule_label }}] {{ s.hit.detail }}
+                    </td>
+                    <td class="px-4 py-2 text-right whitespace-nowrap">
+                      <button type="button" class="obs-btn obs-btn-ghost px-2! py-1! text-[11px]!" @click="sendTitleToPlayground(s.raw_name)">
+                        送入演练场
+                      </button>
+                    </td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+          </section>
+        </template>
+      </div>
+
+      <!-- TAB 5: VERSION HISTORY -->
+      <div v-else-if="activeTab === 'versions'">
+        <div class="px-4 py-3 border-b border-slate-800 bg-[#0b0f17] flex items-center justify-between">
+          <span class="text-xs font-semibold text-white">过滤规则持久化发布历史</span>
+          <button type="button" class="obs-btn obs-btn-ghost px-2.5! py-1! text-xs! inline-flex items-center gap-1" @click="loadVersions">
+            <RefreshCw class="w-3.5 h-3.5" :class="versionsLoading ? 'animate-spin text-emerald-400' : ''" />
+            刷新
+          </button>
+        </div>
+
+        <div class="divide-y divide-slate-800/60">
+          <div v-for="v in versions" :key="v.id" class="p-3.5 flex flex-wrap items-center justify-between gap-3 text-xs">
+            <div class="space-y-1">
+              <div class="flex items-center gap-2">
+                <span class="font-mono font-bold text-emerald-300">v{{ v.version }}</span>
+                <span
+                  class="px-2 py-0.5 rounded-md text-[10px] font-mono border"
+                  :class="
+                    v.status === 'published'
+                      ? 'bg-emerald-500/12 text-emerald-300 border-emerald-500/30'
+                      : v.status === 'draft'
+                        ? 'bg-amber-500/12 text-amber-300 border-amber-500/30'
+                        : 'bg-slate-800 text-slate-400 border-slate-700'
+                  "
+                >
+                  {{ v.status }}
+                </span>
+                <span class="text-slate-100">{{ v.note || "无发布说明" }}</span>
+              </div>
+              <div class="text-[11px] font-mono text-slate-500">
+                创建人 {{ v.created_by }} · 创建于 {{ formatDateTime(v.created_at) }}
+                <template v-if="v.published_at"> · 发布于 {{ formatDateTime(v.published_at) }}</template>
+              </div>
+            </div>
+
+            <button
+              v-if="v.status !== 'draft'"
+              type="button"
+              class="obs-btn obs-btn-ghost px-3! py-1.5! text-xs!"
+              :disabled="rollbackBusyVer === v.version"
+              @click="handleRollback(v.version)"
+            >
+              {{ rollbackBusyVer === v.version ? "回滚中…" : "回滚并热生效" }}
+            </button>
+          </div>
+          <div v-if="versions.length === 0" class="py-12 text-center text-xs text-slate-500">暂无版本记录</div>
+        </div>
+      </div>
+    </section>
+
+    <!-- Rule Editor Drawer -->
     <RuleEditorDrawer
-      v-model:visible="drawerVisible"
-      :rule="drawerRule"
-      :is-new="drawerIsNew"
-      :templates="presetsCatalog?.rule_templates ?? []"
-      :extension-packs="presetsCatalog?.extension_packs ?? []"
-      :keyword-packs="presetsCatalog?.keyword_packs ?? []"
-      @save="handleSaveRuleFromDrawer"
+      v-model="drawerVisible"
+      :mode="drawerMode"
+      :rule="editingRuleObj"
+      :extension-packs="presets?.extension_packs ?? []"
+      :keyword-packs="presets?.keyword_packs ?? []"
+      @save="saveRuleFromDrawer"
     />
 
-    <!-- 导入 JSON（旧版 config.json / Hameta v1 / Hameta v2）弹窗 -->
-    <el-dialog v-model="legacyImportVisible" title="导入并智能转换过滤配置 JSON" width="660px">
-      <div class="space-y-3 text-xs">
-        <p class="text-slate-600">
-          自动识别 <strong>旧版 torrent-indexer config.json</strong>（含 <code>"filter": &#123; ... &#125;</code> 或裸对象）、<strong>Hameta v1</strong> 或 <strong>Hameta v2 策略包</strong>；旧版中的扩展名正则与特征正则会自动转为可视化开关与后缀芯片，通过预编译校验后写入草稿。
-        </p>
-        <input
-          ref="legacyFileRef"
-          type="file"
-          accept=".json,application/json"
-          class="hidden"
-          @change="handleLegacyFileSelected"
-        />
-        <div class="flex items-center gap-2">
-          <el-button size="small" @click="legacyFileRef?.click()">选择本地 JSON 文件</el-button>
-          <el-input
-            v-model="legacyImportNote"
-            size="small"
-            placeholder="导入说明（可选）"
-            class="flex-1"
+    <!-- Rule Templates Modal -->
+    <ObsModal v-model="templatesModalVisible" title="从规则模板库快速追加" max-width="640px">
+      <div class="max-h-96 overflow-auto obs-scroll space-y-2 text-xs">
+        <div
+          v-for="tpl in presets?.rule_templates ?? []"
+          :key="tpl.id"
+          class="obs-inset p-3 rounded-lg flex items-center justify-between gap-3"
+        >
+          <div class="min-w-0">
+            <div class="flex items-center gap-2">
+              <span class="px-1.5 py-0.5 rounded bg-sky-500/15 text-sky-300 text-[10px] font-mono">{{ tpl.group }}</span>
+              <span class="font-semibold text-slate-100">{{ tpl.name }}</span>
+            </div>
+            <div class="text-[11px] text-slate-400 mt-1">{{ tpl.description }}</div>
+          </div>
+          <button type="button" class="obs-btn obs-btn-primary px-3 py-1 text-xs shrink-0" @click="addFromTemplate(tpl.rule)">
+            添加
+          </button>
+        </div>
+      </div>
+    </ObsModal>
+
+    <!-- Add Phrase Modal (Single / Batch Tabs) -->
+    <ObsModal
+      v-model="addPhraseVisible"
+      title="添加动态广告短语"
+      subtitle="命中后仅从标题剥离词条本身，由阶段 8 开关统一控制生效"
+      max-width="520px"
+    >
+      <div class="-mx-5 -mt-5 mb-4 px-5 pt-3 border-b border-slate-800/80 flex gap-2 text-xs bg-[#0b0f17]">
+        <button
+          type="button"
+          class="px-3 py-1.5 rounded-t-lg border border-b-0 cursor-pointer transition"
+          :class="phraseModalTab === 'single' ? 'obs-tab-active font-semibold' : 'border-transparent text-slate-400 hover:text-slate-200'"
+          @click="phraseModalTab = 'single'"
+        >
+          单条添加
+        </button>
+        <button
+          type="button"
+          class="px-3 py-1.5 rounded-t-lg border border-b-0 cursor-pointer transition"
+          :class="phraseModalTab === 'batch' ? 'obs-tab-active font-semibold' : 'border-transparent text-slate-400 hover:text-slate-200'"
+          @click="phraseModalTab = 'batch'"
+        >
+          批量粘贴
+        </button>
+      </div>
+
+      <div v-if="phraseModalTab === 'single'" class="space-y-3 text-xs">
+        <div>
+          <label class="text-slate-400 block mb-1.5">广告短语 <span class="text-rose-400">*</span></label>
+          <input
+            v-model="singlePhraseText"
+            type="text"
+            placeholder="输入推广固定短语，如：高清完整版无删减"
+            class="obs-input w-full rounded-lg px-3 py-2 font-mono-num"
+            @keyup.enter="submitAddPhraseModal"
           />
         </div>
-        <el-input
-          v-model="legacyImportText"
-          type="textarea"
-          :rows="14"
-          placeholder='粘贴旧版 config.json / Hameta v1 / Hameta v2 JSON...'
-          class="font-mono text-xs"
+        <div>
+          <label class="text-slate-400 block mb-1.5">备注（可选）</label>
+          <input
+            v-model="singlePhraseNote"
+            type="text"
+            placeholder="规则说明，如：视频站水印"
+            class="obs-input w-full rounded-lg px-3 py-2"
+            @keyup.enter="submitAddPhraseModal"
+          />
+        </div>
+      </div>
+
+      <div v-else class="space-y-3 text-xs">
+        <div class="text-[11px] text-cyan-300">每行一条广告短语，自动去除首尾空白并跳过已存在词条</div>
+        <textarea
+          v-model="bulkPhraseText"
+          rows="5"
+          placeholder="例如：&#10;更多精彩资源&#10;永久地址发布页&#10;扫码加群"
+          class="obs-input w-full rounded-lg p-3 font-mono-num"
         />
+        <div>
+          <label class="text-slate-400 block mb-1.5">批量备注（可选）</label>
+          <input v-model="bulkPhraseNote" type="text" placeholder="默认：批量导入" class="obs-input w-full rounded-lg px-3 py-2" />
+        </div>
+      </div>
+
+      <template #footer>
+        <button type="button" class="obs-btn obs-btn-ghost px-3.5 py-1.5 rounded-lg text-xs" @click="addPhraseVisible = false">取消</button>
+        <button type="button" class="obs-btn obs-btn-primary px-4 py-1.5 rounded-lg text-xs" @click="submitAddPhraseModal">确认添加</button>
+      </template>
+    </ObsModal>
+
+    <!-- Add Regex Modal (Single / Batch Tabs) -->
+    <ObsModal
+      v-model="addRegexVisible"
+      title="添加动态广告正则"
+      subtitle="按顺序依次正则替换，由阶段 7 开关统一控制生效"
+      max-width="580px"
+    >
+      <div class="-mx-5 -mt-5 mb-4 px-5 pt-3 border-b border-slate-800/80 flex gap-2 text-xs bg-[#0b0f17]">
+        <button
+          type="button"
+          class="px-3 py-1.5 rounded-t-lg border border-b-0 cursor-pointer transition"
+          :class="regexModalTab === 'single' ? 'obs-tab-active font-semibold' : 'border-transparent text-slate-400 hover:text-slate-200'"
+          @click="regexModalTab = 'single'"
+        >
+          单条添加
+        </button>
+        <button
+          type="button"
+          class="px-3 py-1.5 rounded-t-lg border border-b-0 cursor-pointer transition"
+          :class="regexModalTab === 'batch' ? 'obs-tab-active font-semibold' : 'border-transparent text-slate-400 hover:text-slate-200'"
+          @click="regexModalTab = 'batch'"
+        >
+          批量粘贴
+        </button>
+      </div>
+
+      <div v-if="regexModalTab === 'single'" class="space-y-3 text-xs">
+        <div class="flex flex-wrap items-center gap-1.5 text-[11px]">
+          <span class="text-slate-500">快捷模板:</span>
+          <button
+            type="button"
+            class="obs-btn-ghost px-2 py-0.5 rounded cursor-pointer"
+            @click="fillRegexPreset('【[^】]{0,24}(广告|推广|下载|首发)】', ' ', '方括号广告标签')"
+          >
+            + 方括号推广
+          </button>
+          <button
+            type="button"
+            class="obs-btn-ghost px-2 py-0.5 rounded cursor-pointer"
+            @click="fillRegexPreset('\\[(?:QQ|WX|TG)[^\\]]{2,18}\\]', '', '社群号推广')"
+          >
+            + QQ/微信群
+          </button>
+          <button
+            type="button"
+            class="obs-btn-ghost px-2 py-0.5 rounded cursor-pointer"
+            @click="fillRegexPreset('\\((?:访问|备用)[:：]?https?://[^)]+\\)', '', '备用网址括号')"
+          >
+            + 网址后缀
+          </button>
+        </div>
+
+        <div>
+          <label class="text-slate-400 block mb-1.5">正则表达式 <span class="text-rose-400">*</span></label>
+          <input
+            v-model="singleRegexPattern"
+            type="text"
+            placeholder="正则表达式，如：【[^】]*广告】"
+            class="obs-input w-full rounded-lg px-3 py-2 font-mono-num text-cyan-200"
+            @keyup.enter="submitAddRegexModal"
+          />
+        </div>
+
+        <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
+          <div>
+            <label class="text-slate-400 block mb-1.5">替换为</label>
+            <input
+              v-model="singleRegexReplacement"
+              type="text"
+              placeholder="空字符串或空格"
+              class="obs-input w-full rounded-lg px-3 py-2 font-mono-num"
+              @keyup.enter="submitAddRegexModal"
+            />
+          </div>
+          <div>
+            <label class="text-slate-400 block mb-1.5">备注（可选）</label>
+            <input
+              v-model="singleRegexNote"
+              type="text"
+              placeholder="规则说明..."
+              class="obs-input w-full rounded-lg px-3 py-2"
+              @keyup.enter="submitAddRegexModal"
+            />
+          </div>
+        </div>
+      </div>
+
+      <div v-else class="space-y-3 text-xs">
+        <div class="text-[11px] text-cyan-300">每行一条 Rust 正则表达式，自动去重后追加至列表顶部</div>
+        <textarea
+          v-model="bulkRegexText"
+          rows="5"
+          placeholder="例如：&#10;【[^】]{0,24}推广】&#10;\[QQ群[:：]?\d{5,11}\]"
+          class="obs-input w-full rounded-lg p-3 font-mono-num text-cyan-200"
+        />
+        <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
+          <div>
+            <label class="text-slate-400 block mb-1.5">批量替换为</label>
+            <input v-model="bulkRegexReplacement" type="text" placeholder="默认空格" class="obs-input w-full rounded-lg px-3 py-2 font-mono-num" />
+          </div>
+          <div>
+            <label class="text-slate-400 block mb-1.5">批量备注（可选）</label>
+            <input v-model="bulkRegexNote" type="text" placeholder="默认：批量正则导入" class="obs-input w-full rounded-lg px-3 py-2" />
+          </div>
+        </div>
+      </div>
+
+      <template #footer>
+        <button type="button" class="obs-btn obs-btn-ghost px-3.5 py-1.5 rounded-lg text-xs" @click="addRegexVisible = false">取消</button>
+        <button type="button" class="obs-btn obs-btn-primary px-4 py-1.5 rounded-lg text-xs" @click="submitAddRegexModal">确认添加</button>
+      </template>
+    </ObsModal>
+
+    <!-- Publish Modal -->
+    <ObsModal v-model="publishVisible" title="发布规则集并热推送给 Indexer" max-width="480px">
+      <div class="space-y-3 text-xs text-slate-300">
+        <p>发布后将自动生成新的正式版本，并通过 IPC 热通知所有在线 Indexer 子进程立即切换新规则，无需重启写入队列。</p>
+        <div>
+          <label class="block text-[11px] text-slate-400 mb-1">本次发布变更说明（可选）</label>
+          <input v-model="publishNote" type="text" placeholder="例如：收紧垃圾文件体积占比与推广前缀" class="obs-input px-3 py-1.5 text-xs" />
+        </div>
       </div>
       <template #footer>
-        <el-button size="small" @click="legacyImportVisible = false">取消</el-button>
-        <el-button size="small" type="primary" :loading="legacyImporting" @click="submitLegacyImport">
-          智能解析并写入草稿
-        </el-button>
+        <button type="button" class="obs-btn obs-btn-ghost px-3.5 py-1.5 text-xs" @click="publishVisible = false">取消</button>
+        <button type="button" class="obs-btn obs-btn-primary px-4 py-1.5 text-xs" :disabled="publishing" @click="confirmPublish">
+          {{ publishing ? "发布并推送中…" : "确认发布生效" }}
+        </button>
       </template>
-    </el-dialog>
+    </ObsModal>
 
-    <!-- 粘贴多行标题样本弹窗 -->
-    <el-dialog v-model="batchPasteVisible" title="粘贴多行待测标题文本（最多 200 行）" width="560px">
-      <el-input
-        v-model="batchPasteText"
-        type="textarea"
-        :rows="12"
-        placeholder="每行粘贴一条种子标题..."
-      />
+    <!-- Import Legacy JSON Modal -->
+    <ObsModal v-model="importVisible" title="导入旧版 Filter JSON 配置" max-width="580px">
+      <div class="space-y-3 text-xs">
+        <label class="block text-[11px] text-slate-400">粘贴旧版 rules.json / filter 配置 JSON（自动转换为新格式草稿）</label>
+        <textarea v-model="importRawJson" rows="10" class="obs-input p-2.5 text-xs font-mono" />
+        <input v-model="importNote" type="text" placeholder="导入备注（可选）" class="obs-input px-3 py-1.5 text-xs" />
+      </div>
       <template #footer>
-        <el-button size="small" @click="batchPasteVisible = false">取消</el-button>
-        <el-button size="small" type="primary" @click="applyPasteSamples">加载样本</el-button>
+        <button type="button" class="obs-btn obs-btn-ghost px-3 py-1.5 text-xs" @click="importVisible = false">取消</button>
+        <button type="button" class="obs-btn obs-btn-primary px-4 py-1.5 text-xs" :disabled="importBusy" @click="submitImportLegacy">
+          {{ importBusy ? "解析导入中…" : "转换并存入草稿" }}
+        </button>
       </template>
-    </el-dialog>
+    </ObsModal>
 
-    <!-- 查看历史版本 JSON 弹窗 -->
-    <el-dialog
-      v-model="inspectVersionVisible"
-      :title="`过滤策略快照 v${inspectVersionData?.version ?? ''}`"
-      width="720px"
-    >
-      <pre class="rounded-lg bg-slate-950 text-slate-100 p-4 text-xs font-mono max-h-[500px] overflow-auto">{{ inspectVersionData ? JSON.stringify(inspectVersionData.bundle, null, 2) : "" }}</pre>
+    <!-- Reset Preset Modal -->
+    <ObsModal v-model="resetVisible" title="重置为官方预设规则策略" max-width="460px">
+      <div class="space-y-3 text-xs">
+        <div>
+          <label class="block text-[11px] text-slate-400 mb-1">选择预设方案</label>
+          <ObsSelect v-model="resetPresetId" :options="presetSelectOptions" class="w-full" />
+        </div>
+        <label class="inline-flex items-center gap-2 text-xs text-slate-300 cursor-pointer">
+          <input v-model="resetIncludeDict" type="checkbox" class="obs-checkbox" />
+          同时恢复默认广告短语与广告清洗正则词典
+        </label>
+      </div>
       <template #footer>
-        <el-button size="small" @click="inspectVersionVisible = false">关闭</el-button>
+        <button type="button" class="obs-btn obs-btn-ghost px-3 py-1.5 text-xs" @click="resetVisible = false">取消</button>
+        <button type="button" class="obs-btn obs-btn-danger px-4 py-1.5 text-xs" :disabled="resetBusy" @click="submitResetPreset">
+          {{ resetBusy ? "重置中…" : "覆盖为新草稿" }}
+        </button>
       </template>
-    </el-dialog>
+    </ObsModal>
   </div>
 </template>

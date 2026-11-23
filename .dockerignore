@@ -1,0 +1,12 @@
+/target
+/.cargo
+/data
+/dev-data
+/logs
+/scratch
+.git
+*.db
+*.db-wal
+*.db-shm
+web/node_modules
+.env

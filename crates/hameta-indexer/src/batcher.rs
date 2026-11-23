@@ -1,9 +1,12 @@
+use crate::ipc::IngestEventReporter;
 use crate::manticore::{ManticoreClient, writable_info_hashes};
 use crate::stats::IndexerAppStats;
 use crate::streams::RedisStreamsConsumer;
-use hameta_common::{IndexerWorkerConfig, TorrentRecord};
+use hameta_common::{
+    IndexerWorkerConfig, IngestEventItem, IngestEventType, TorrentRecord, hash_to_id,
+};
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::{Semaphore, mpsc};
 use tokio::time::interval;
@@ -20,6 +23,9 @@ pub struct TorrentBatcher {
     streams: Arc<RedisStreamsConsumer>,
     config: IndexerWorkerConfig,
     stats: Arc<IndexerAppStats>,
+    instance_id: String,
+    ingest_reporter: IngestEventReporter,
+    batch_seq: Arc<AtomicU64>,
 }
 
 impl TorrentBatcher {
@@ -34,7 +40,20 @@ impl TorrentBatcher {
             streams,
             config,
             stats,
+            instance_id: "standalone-indexer".to_string(),
+            ingest_reporter: IngestEventReporter::disabled(),
+            batch_seq: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    pub fn with_ingest_reporter(
+        mut self,
+        instance_id: impl Into<String>,
+        ingest_reporter: IngestEventReporter,
+    ) -> Self {
+        self.instance_id = instance_id.into();
+        self.ingest_reporter = ingest_reporter;
+        self
     }
 
     pub async fn run(self, mut rx: mpsc::Receiver<AcceptedTorrentItem>) {
@@ -96,11 +115,23 @@ impl TorrentBatcher {
         let manticore = self.manticore.clone();
         let streams = self.streams.clone();
         let stats = self.stats.clone();
+        let instance_id = self.instance_id.clone();
+        let ingest_reporter = self.ingest_reporter.clone();
+        let batch_seq = self.batch_seq.clone();
 
         tokio::spawn(async move {
             let _permit = permit;
             stats.torrent_in_flight.fetch_add(1, Ordering::Relaxed);
-            Self::flush_one(&manticore, &streams, &stats, batch).await;
+            Self::flush_one(
+                &manticore,
+                &streams,
+                &stats,
+                &instance_id,
+                &ingest_reporter,
+                &batch_seq,
+                batch,
+            )
+            .await;
             stats.torrent_in_flight.fetch_sub(1, Ordering::Relaxed);
         });
     }
@@ -109,6 +140,9 @@ impl TorrentBatcher {
         manticore: &Arc<ManticoreClient>,
         streams: &Arc<RedisStreamsConsumer>,
         stats: &Arc<IndexerAppStats>,
+        instance_id: &str,
+        ingest_reporter: &IngestEventReporter,
+        batch_seq: &AtomicU64,
         batch: Vec<AcceptedTorrentItem>,
     ) {
         let batch_len = batch.len();
@@ -120,9 +154,12 @@ impl TorrentBatcher {
         }
 
         let writable_hashes = writable_info_hashes(&records);
+        let flush_started = Instant::now();
+        let batch_id = batch_seq.fetch_add(1, Ordering::Relaxed).saturating_add(1);
 
         match manticore.batch_insert(&records).await {
             Ok(written) => {
+                let latency_ms = u64::try_from(flush_started.elapsed().as_millis()).unwrap_or(u64::MAX);
                 stats
                     .torrent_buffered
                     .fetch_sub(batch_len, Ordering::Relaxed);
@@ -131,6 +168,37 @@ impl TorrentBatcher {
                     u64::try_from(written).unwrap_or(u64::MAX),
                     Ordering::Relaxed,
                 );
+
+                if written > 0 {
+                    for record in records.iter().filter(|r| hash_to_id(&r.info_hash) > 0).take(64) {
+                        let refine_name = record
+                            .refine_name
+                            .clone()
+                            .unwrap_or_else(|| record.raw_name.clone());
+                        let cleaned = refine_name != record.raw_name;
+                        let total_size = record
+                            .file_info
+                            .iter()
+                            .fold(0_u64, |acc, f| acc.saturating_add(f.size));
+                        ingest_reporter.try_emit(IngestEventItem {
+                            info_hash: record.info_hash.clone(),
+                            event_type: IngestEventType::Indexed,
+                            worker_id: instance_id.to_string(),
+                            manticore_id: hash_to_id(&record.info_hash),
+                            batch_id,
+                            raw_name: record.raw_name.clone(),
+                            refine_name,
+                            cleaned,
+                            total_size,
+                            file_count: record.file_count,
+                            files_preview: record.file_info.iter().take(20).cloned().collect(),
+                            hot: record.hot,
+                            hot_delta: 1,
+                            latency_ms,
+                            updated_at: record.updated_at.timestamp(),
+                        });
+                    }
+                }
 
                 if !writable_hashes.is_empty() {
                     match streams

@@ -8,16 +8,17 @@ use axum::http::HeaderMap;
 use chrono::Utc;
 use hameta_common::{FileInfo, TorrentMessage, WorkerRole, WorkerRuntimeState};
 use hameta_filter::{
-    AbComparisonReport, AdPhraseRule, AdRegexRule, CompiledFilterEngine, FilterBundle,
-    FilterCategory, FilterPresetCatalog, FilterStatsSnapshot, PlaygroundInput,
-    PlaygroundItemResult, PolicyAction, RejectedSample, RuleHitStat, builtin_preset_catalog,
-    compare_playground_ab, default_online_filter_bundle, evaluate_playground_batch,
-    import_any_filter_json, parse_stored_policy_json, policy_preset_bundle,
+    AbComparisonReport, AdDiscoveryTracker, AdPhraseRule, AdRegexRule, CompiledFilterEngine,
+    DiscoveredAdCandidate, FilterBundle, FilterCategory, FilterPresetCatalog, FilterStatsSnapshot,
+    PlaygroundInput, PlaygroundItemResult, PolicyAction, RejectedSample, RuleHitStat, TitleCleaner,
+    builtin_preset_catalog, compare_playground_ab, default_online_filter_bundle,
+    evaluate_playground_batch, import_any_filter_json, merge_discovered_candidates,
+    parse_stored_policy_json, policy_preset_bundle, upgrade_legacy_builtin_notes,
 };
 use hameta_storage::FilterRuleVersionRow;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 #[derive(Debug, Clone, Serialize)]
@@ -153,6 +154,20 @@ pub struct FilterStatsResponse {
     pub rule_hits: Vec<RuleHitStat>,
     pub recent_rejected: Vec<WorkerRejectedSampleDto>,
     pub workers: Vec<IndexerStatBrief>,
+    #[serde(default)]
+    pub discovered_ad_candidates: Vec<DiscoveredAdCandidate>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct DiscoverCandidatesRequest {
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct DiscoverCandidatesResponse {
+    pub source: String,
+    pub scanned_titles: usize,
+    pub candidates: Vec<DiscoveredAdCandidate>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -217,13 +232,15 @@ fn row_to_bundle(row: &FilterRuleVersionRow) -> Result<FilterBundle, ApiError> {
     let policy = parse_stored_policy_json(&row.filter_json).map_err(|e| {
         ApiError::internal("解析存储的过滤规则 JSON 失败").with_detail(e.to_string())
     })?;
-    let ad_phrases: Vec<AdPhraseRule> =
+    let mut ad_phrases: Vec<AdPhraseRule> =
         serde_json::from_str(&row.ad_phrases_json).map_err(|e| {
             ApiError::internal("解析存储的广告短语 JSON 失败").with_detail(e.to_string())
         })?;
-    let ad_regexes: Vec<AdRegexRule> = serde_json::from_str(&row.ad_regexes_json).map_err(|e| {
-        ApiError::internal("解析存储的广告正则 JSON 失败").with_detail(e.to_string())
-    })?;
+    let mut ad_regexes: Vec<AdRegexRule> =
+        serde_json::from_str(&row.ad_regexes_json).map_err(|e| {
+            ApiError::internal("解析存储的广告正则 JSON 失败").with_detail(e.to_string())
+        })?;
+    upgrade_legacy_builtin_notes(&mut ad_phrases, &mut ad_regexes);
     Ok(FilterBundle {
         version: row.version,
         policy,
@@ -692,6 +709,14 @@ pub async fn rollback_filter_handler(
     }))
 }
 
+fn build_phrase_exclude_set(phrases: &[AdPhraseRule]) -> HashSet<String> {
+    phrases
+        .iter()
+        .map(|p| p.phrase.trim().to_lowercase())
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
 pub async fn get_filter_stats_handler(
     State(state): State<Arc<PanelState>>,
     _auth: AuthUser,
@@ -708,6 +733,7 @@ pub async fn get_filter_stats_handler(
     let mut merged_hits: HashMap<(FilterCategory, PolicyAction, String), RuleHitStat> =
         HashMap::new();
     let mut merged_samples: Vec<WorkerRejectedSampleDto> = Vec::new();
+    let mut discovery_batches: Vec<Vec<DiscoveredAdCandidate>> = Vec::new();
     let mut workers = Vec::new();
 
     for w in statuses {
@@ -751,6 +777,10 @@ pub async fn get_filter_stats_handler(
                     sample,
                 });
             }
+
+            if !snap.discovered_ad_candidates.is_empty() {
+                discovery_batches.push(snap.discovered_ad_candidates);
+            }
         }
 
         workers.push(IndexerStatBrief {
@@ -776,6 +806,13 @@ pub async fn get_filter_stats_handler(
     });
     merged_samples.truncate(200);
 
+    let exclude_lower = match load_current_dictionary(&state).await {
+        Ok((phrases, _)) => build_phrase_exclude_set(&phrases),
+        Err(_) => HashSet::new(),
+    };
+    let discovered_ad_candidates =
+        merge_discovered_candidates(discovery_batches, &exclude_lower, 30);
+
     Ok(Json(FilterStatsResponse {
         total_evaluated,
         total_accepted,
@@ -783,6 +820,93 @@ pub async fn get_filter_stats_handler(
         rule_hits,
         recent_rejected: merged_samples,
         workers,
+        discovered_ad_candidates,
+    }))
+}
+
+pub async fn discover_ad_candidates_handler(
+    State(state): State<Arc<PanelState>>,
+    _auth: AuthUser,
+    Json(req): Json<DiscoverCandidatesRequest>,
+) -> Result<Json<DiscoverCandidatesResponse>, ApiError> {
+    let limit = req.limit.unwrap_or(300).clamp(20, 500);
+
+    let current_bundle = if let Some(draft) = state.db.get_latest_draft_filter_version().await? {
+        row_to_bundle(&draft)?
+    } else if let Some(published) = state.db.get_published_filter_version().await? {
+        row_to_bundle(&published)?
+    } else {
+        default_online_filter_bundle()
+    };
+    let exclude_lower = build_phrase_exclude_set(&current_bundle.ad_phrases);
+    let cleaner = TitleCleaner::compile_with_options(
+        &current_bundle.ad_phrases,
+        &current_bundle.ad_regexes,
+        &current_bundle.policy.cleaner,
+    )
+    .unwrap_or_else(|_| TitleCleaner::default_baseline());
+
+    let mut discovery_batches: Vec<Vec<DiscoveredAdCandidate>> = Vec::new();
+    let statuses = state
+        .supervisor
+        .list_worker_statuses()
+        .await
+        .unwrap_or_default();
+    for w in statuses {
+        if w.role != WorkerRole::Indexer {
+            continue;
+        }
+        if let Some(env) = &w.snapshot
+            && let Some(filter_val) = env.payload.get("filter")
+            && let Ok(snap) = serde_json::from_value::<FilterStatsSnapshot>(filter_val.clone())
+            && !snap.discovered_ad_candidates.is_empty()
+        {
+            discovery_batches.push(snap.discovered_ad_candidates);
+        }
+    }
+
+    let mut scanned_titles = 0_usize;
+    let mut source = "indexer_live".to_string();
+
+    if let Some((_, client)) = state.services.manticore_client().await {
+        let body = json!({
+            "index": "torrents",
+            "query": { "match_all": {} },
+            "sort": [{ "updated_at": { "order": "desc" } }],
+            "limit": limit,
+            "options": { "max_matches": limit.max(1000) }
+        });
+        if let Ok(resp) = client.search_json(&body).await
+            && let Some(hits) = resp["hits"]["hits"].as_array()
+        {
+            let now_unix = Utc::now().timestamp();
+            let mut tracker = AdDiscoveryTracker::new();
+            for hit in hits {
+                let raw_name = hit["_source"]["raw_name"].as_str().unwrap_or_default();
+                if raw_name.trim().is_empty() {
+                    continue;
+                }
+                scanned_titles += 1;
+                let cleaned = cleaner.refine(raw_name);
+                tracker.observe(&cleaned, now_unix);
+            }
+            let manticore_cands = tracker.snapshot_candidates(30, &exclude_lower);
+            if !manticore_cands.is_empty() {
+                discovery_batches.push(manticore_cands);
+            }
+            source = if discovery_batches.is_empty() || scanned_titles == 0 {
+                source
+            } else {
+                "manticore_and_live".to_string()
+            };
+        }
+    }
+
+    let candidates = merge_discovered_candidates(discovery_batches, &exclude_lower, 30);
+    Ok(Json(DiscoverCandidatesResponse {
+        source,
+        scanned_titles,
+        candidates,
     }))
 }
 

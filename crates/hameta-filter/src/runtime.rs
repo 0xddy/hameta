@@ -1,3 +1,4 @@
+use crate::discovery::{AdDiscoveryTracker, DiscoveredAdCandidate};
 use crate::engine::{CompiledFilterEngine, FilterCategory, FilterOutcome, RuleHit};
 use crate::error::FilterError;
 use crate::schema::{FilterBundle, PolicyAction};
@@ -39,6 +40,8 @@ pub struct FilterStatsSnapshot {
     pub total_rejected: u64,
     pub rule_hits: Vec<RuleHitStat>,
     pub recent_rejected: Vec<RejectedSample>,
+    #[serde(default)]
+    pub discovered_ad_candidates: Vec<DiscoveredAdCandidate>,
 }
 
 /// 线程安全、支持 `ArcSwap` 无停机热切换、按规则归因与有界拦截样本缓冲的过滤运行时。
@@ -49,6 +52,7 @@ pub struct FilterRuntime {
     total_rejected: AtomicU64,
     rule_hits: Mutex<HashMap<(FilterCategory, PolicyAction, String), RuleHitStat>>,
     recent_rejected: Mutex<VecDeque<RejectedSample>>,
+    ad_discovery: Mutex<AdDiscoveryTracker>,
     sample_capacity: usize,
 }
 
@@ -69,6 +73,7 @@ impl FilterRuntime {
             total_rejected: AtomicU64::new(0),
             rule_hits: Mutex::new(HashMap::new()),
             recent_rejected: Mutex::new(VecDeque::with_capacity(sample_capacity)),
+            ad_discovery: Mutex::new(AdDiscoveryTracker::new()),
             sample_capacity,
         })
     }
@@ -94,6 +99,16 @@ impl FilterRuntime {
         let outcome = self.engine.load().evaluate(msg);
         self.total_evaluated.fetch_add(1, Ordering::Relaxed);
 
+        let now_unix = Utc::now().timestamp();
+        {
+            let text_to_observe = outcome.refined_name().unwrap_or(&msg.name);
+            let mut tracker = self
+                .ad_discovery
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            tracker.observe(text_to_observe, now_unix);
+        }
+
         match &outcome {
             FilterOutcome::Accepted { allowed_by, .. } => {
                 self.total_accepted.fetch_add(1, Ordering::Relaxed);
@@ -104,7 +119,7 @@ impl FilterRuntime {
             FilterOutcome::Rejected { hit, .. } => {
                 self.total_rejected.fetch_add(1, Ordering::Relaxed);
                 self.record_rule_hit(hit);
-                self.record_rejection_sample(msg, hit);
+                self.record_rejection_sample(msg, hit, now_unix);
             }
         }
 
@@ -128,7 +143,7 @@ impl FilterRuntime {
         entry.rule_label = hit.rule_label.clone();
     }
 
-    fn record_rejection_sample(&self, msg: &TorrentMessage, hit: &RuleHit) {
+    fn record_rejection_sample(&self, msg: &TorrentMessage, hit: &RuleHit, now_unix: i64) {
         if self.sample_capacity > 0 {
             let mut ring = self
                 .recent_rejected
@@ -143,7 +158,7 @@ impl FilterRuntime {
                 total_size: msg.total_size,
                 file_count: msg.file_count,
                 hit: hit.clone(),
-                rejected_at_unix: Utc::now().timestamp(),
+                rejected_at_unix: now_unix,
             });
         }
     }
@@ -170,13 +185,23 @@ impl FilterRuntime {
             ring.iter().rev().cloned().collect()
         };
 
+        let engine = self.engine.load();
+        let discovered_ad_candidates = {
+            let tracker = self
+                .ad_discovery
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            tracker.snapshot_candidates(30, engine.cleaner().active_phrases_lower())
+        };
+
         FilterStatsSnapshot {
-            active_version: self.active_version(),
+            active_version: engine.version(),
             total_evaluated: self.total_evaluated.load(Ordering::Relaxed),
             total_accepted: self.total_accepted.load(Ordering::Relaxed),
             total_rejected: self.total_rejected.load(Ordering::Relaxed),
             rule_hits,
             recent_rejected,
+            discovered_ad_candidates,
         }
     }
 }

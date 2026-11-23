@@ -588,7 +588,6 @@ checksum = "9e9de72ce2ad1f90dc62fa25f0f430ef85eb4b0d8fa0be4f30373bc40a21d28e"
 [[package]]
 name = "dht-crawler"
 version = "0.2.1"
-source = "git+https://github.com/0xddy/dht-crawler.git?branch=master#d7a9f4cef3bc21d5bbf75b1da8845a5ad59c23a3"
 dependencies = [
  "ahash",
  "arc-swap",
@@ -934,6 +933,7 @@ name = "hameta-crawler"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "arc-swap",
  "async-channel",
  "axum",
  "chrono",
@@ -941,6 +941,7 @@ dependencies = [
  "dht-crawler",
  "hameta-common",
  "libc",
+ "maxminddb",
  "moka",
  "rand 0.8.8",
  "redis",
@@ -959,6 +960,7 @@ dependencies = [
 name = "hameta-filter"
 version = "0.1.0"
 dependencies = [
+ "aho-corasick",
  "arc-swap",
  "chrono",
  "hameta-common",
@@ -1010,6 +1012,7 @@ dependencies = [
  "hameta-indexer",
  "hameta-storage",
  "libc",
+ "maxminddb",
  "mime_guess",
  "redis",
  "reqwest",
@@ -1368,6 +1371,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "791930b43c0d5973160d90a8f3894509f2b273430f5c5c73b668636d0287c5c0"
 
 [[package]]
+name = "ipnetwork"
+version = "0.21.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cf370abdafd54d13e54a620e8c3e1145f28e46cc9d704bc6d94414559df41763"
+
+[[package]]
 name = "is_terminal_polyfill"
 version = "1.70.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1486,6 +1495,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "47e1ffaa40ddd1f3ed91f717a33c8c0ee23fff369e3aa8772b9605cc1d22f4c3"
 
 [[package]]
+name = "maxminddb"
+version = "0.33.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "317d6b918ba3893345af072f52cb56bcfcb532a9d0ebcf861ab3c25b37a316ac"
+dependencies = [
+ "ipnetwork",
+ "memchr",
+ "memmap2",
+ "serde",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "md-5"
 version = "0.10.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1500,6 +1522,15 @@ name = "memchr"
 version = "2.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
+
+[[package]]
+name = "memmap2"
+version = "0.9.12"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6b0ca1155a9ecc25aa12e8313a119f32edf0255fea2f44839c4ac0a12b2ac157"
+dependencies = [
+ "libc",
+]
 
 [[package]]
 name = "metrics"

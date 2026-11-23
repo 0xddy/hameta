@@ -1,6 +1,9 @@
 use crate::batcher::{AcceptedTorrentItem, TorrentBatcher};
 use crate::hot_batcher::{HotBatcher, HotQueueItem};
-use crate::ipc::{IndexerIpcState, notify_panel_ready, notify_panel_register, start_ipc_server};
+use crate::ipc::{
+    IndexerIpcState, IngestEventReporter, notify_panel_ready, notify_panel_register,
+    start_ipc_server,
+};
 use crate::manticore::ManticoreClient;
 use crate::stats::{IndexerAppStats, build_indexer_snapshot};
 use crate::streams::{ParsedTorrentEntry, RedisStreamsConsumer};
@@ -103,6 +106,13 @@ pub async fn run_indexer_worker(bootstrap: WorkerBootstrap) -> Result<()> {
         .await?;
     }
 
+    let (ingest_reporter, ingest_handle) = IngestEventReporter::spawn(
+        bootstrap.panel_ipc_port,
+        &bootstrap.ipc_token,
+        &bootstrap.instance_id,
+        ipc_shutdown.clone(),
+    );
+
     let (torrent_tx, torrent_rx) =
         mpsc::channel::<AcceptedTorrentItem>(worker_cfg.channel_buffer_size.max(16));
     let (hot_tx, hot_rx) =
@@ -113,7 +123,8 @@ pub async fn run_indexer_worker(bootstrap: WorkerBootstrap) -> Result<()> {
         streams.clone(),
         worker_cfg.clone(),
         app_stats.clone(),
-    );
+    )
+    .with_ingest_reporter(bootstrap.instance_id.clone(), ingest_reporter.clone());
     let batcher_handle = tokio::spawn(torrent_batcher.run(torrent_rx));
 
     let hot_batcher = HotBatcher::new(
@@ -121,7 +132,8 @@ pub async fn run_indexer_worker(bootstrap: WorkerBootstrap) -> Result<()> {
         streams.clone(),
         worker_cfg.clone(),
         app_stats.clone(),
-    );
+    )
+    .with_ingest_reporter(bootstrap.instance_id.clone(), ingest_reporter);
     let hot_handle = tokio::spawn(hot_batcher.run(hot_rx));
 
     let mut consumer_handles = Vec::new();
@@ -380,6 +392,7 @@ pub async fn run_indexer_worker(bootstrap: WorkerBootstrap) -> Result<()> {
     drain_completed.store(true, Ordering::Relaxed);
     tokio::time::sleep(Duration::from_millis(100)).await;
     ipc_shutdown.cancel();
+    let _ = tokio::time::timeout(Duration::from_secs(2), ingest_handle).await;
 
     tracing::info!(
         "hameta indexer worker 已优雅退出: {}",

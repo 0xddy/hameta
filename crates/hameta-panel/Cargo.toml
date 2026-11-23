@@ -14,6 +14,7 @@ hameta-common = { workspace = true }
 hameta-filter = { workspace = true }
 hameta-indexer = { path = "../hameta-indexer" }
 hameta-storage = { workspace = true }
+maxminddb = { workspace = true }
 mime_guess = { workspace = true }
 redis = { workspace = true }
 reqwest = { workspace = true }

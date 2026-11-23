@@ -110,7 +110,9 @@ pub fn evaluate_playground_one(
     sample_index: usize,
     sample: &TorrentMessage,
 ) -> PlaygroundItemResult {
-    let cleaning_trace = engine.cleaner().refine_with_trace(&sample.name);
+    let cleaning_trace = engine
+        .cleaner()
+        .refine_with_files_trace(&sample.name, &sample.files);
     let outcome = engine.evaluate(sample);
 
     match outcome {

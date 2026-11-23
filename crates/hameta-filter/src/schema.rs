@@ -26,6 +26,14 @@ fn default_space() -> String {
     " ".to_string()
 }
 
+fn default_min_refined_name_length() -> ToggleUsize {
+    ToggleUsize::off(2)
+}
+
+fn default_span_ad_threshold() -> u8 {
+    65
+}
+
 /// 将文件扩展名标准化为小写、无前导点号形式（例如 `.MKV` -> `mkv`）。
 pub fn normalize_extension(ext: &str) -> String {
     ext.trim().trim_start_matches('.').to_ascii_lowercase()
@@ -150,12 +158,14 @@ impl Default for FilterGates {
     }
 }
 
-/// 阶段 2：标题清洗 8 个内置阶段开关与空标题处理开关。
+/// 阶段 2：标题清洗多阶段开关与清洗后标题处理选项。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct CleanerOptions {
     #[serde(default = "default_true")]
     pub enable_nfkc: bool,
+    #[serde(default = "default_true")]
+    pub enable_confusable_norm: bool,
     #[serde(default = "default_true")]
     pub enable_deobfuscate_brackets: bool,
     #[serde(default = "default_true")]
@@ -169,23 +179,36 @@ pub struct CleanerOptions {
     #[serde(default = "default_true")]
     pub enable_ad_phrases: bool,
     #[serde(default = "default_true")]
+    pub enable_span_ad_scoring: bool,
+    #[serde(default = "default_span_ad_threshold")]
+    pub span_ad_threshold: u8,
+    #[serde(default = "default_true")]
+    pub enable_filename_cross_clean: bool,
+    #[serde(default = "default_true")]
     pub enable_cleanup: bool,
     #[serde(default = "default_true")]
     pub reject_if_empty_after_clean: bool,
+    #[serde(default = "default_min_refined_name_length")]
+    pub min_refined_name_length: ToggleUsize,
 }
 
 impl Default for CleanerOptions {
     fn default() -> Self {
         Self {
             enable_nfkc: true,
+            enable_confusable_norm: true,
             enable_deobfuscate_brackets: true,
             enable_collapse_spaced_chars: true,
             enable_strip_leading_site_prefix: true,
             enable_strip_urls_and_domains: true,
             enable_ad_regexes: true,
             enable_ad_phrases: true,
+            enable_span_ad_scoring: true,
+            span_ad_threshold: default_span_ad_threshold(),
+            enable_filename_cross_clean: true,
             enable_cleanup: true,
             reject_if_empty_after_clean: true,
+            min_refined_name_length: default_min_refined_name_length(),
         }
     }
 }

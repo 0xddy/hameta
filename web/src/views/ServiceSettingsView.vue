@@ -1,455 +1,806 @@
 <script setup lang="ts">
-import { computed, onMounted, reactive, ref, watch } from "vue";
-import { ElMessage, ElMessageBox } from "element-plus";
-import { History, RotateCcw, Save, Zap } from "lucide-vue-next";
-import { ApiError } from "@/api/client";
+import { computed, onMounted, ref, watch } from "vue";
+import { useRoute, useRouter } from "vue-router";
+import { ElMessage } from "element-plus";
 import {
+  CheckCircle2,
+  Database,
+  Download,
+  ExternalLink,
+  Globe2,
+  History,
+  RefreshCw,
+  RotateCcw,
+  Server,
+  ShieldCheck,
+  XCircle,
+} from "lucide-vue-next";
+import {
+  DEFAULT_GEOIP_DOWNLOAD_URL,
+  DEFAULT_GEOIP_RELEASES_URL,
+  defaultGeoIpConfig,
+  detectSettingsServices,
+  downloadGeoIpMmdb,
+  getGeoIpSettings,
   getServicesSettings,
   initManticoreTable,
   listSettingsHistory,
+  reloadGeoIpSettings,
   rollbackSettings,
   testManticoreSettings,
   testRedisSettings,
+  updateGeoIpSettings,
   updateManticoreSettings,
   updateRedisSettings,
   type AffectedWorkerItem,
+  type CrawlerGeoIpReloadResult,
+  type DownloadGeoIpResponse,
+  type GeoIpConfig,
+  type GeoIpSettingsResponse,
   type ServiceHistoryItem,
   type WorkerRestartOutcome,
 } from "@/api/settings";
 import {
   defaultManticoreConfig,
   defaultRedisConfig,
+  normalizeManticoreConfig,
+  type DetectedManticoreService,
+  type DetectedRedisService,
   type ManticoreServiceConfig,
   type ManticoreTestReport,
   type RedisServiceConfig,
   type RedisTestReport,
+  type ServiceDiscoveryReport,
 } from "@/api/setup";
 import ManticoreConfigFields from "@/components/ManticoreConfigFields.vue";
 import RedisConfigFields from "@/components/RedisConfigFields.vue";
+import ServiceDiscoveryBar from "@/components/ServiceDiscoveryBar.vue";
+import ObsNumberInput from "@/components/ui/ObsNumberInput.vue";
+import ObsSelect from "@/components/ui/ObsSelect.vue";
+import { GLOBE_HOME_HUBS } from "@/data/globeGeo";
+import { useTelemetryStore } from "@/stores/telemetry";
+import { fmtBytes, fmtCount, fmtDurMs, formatDateTime } from "@/utils/format";
 
-const activeTab = ref<"redis" | "manticore" | "history">("redis");
-const loading = ref(true);
+const route = useRoute();
+const router = useRouter();
+const telemetry = useTelemetryStore();
 
-const redisMeta = reactive({
-  version: 0,
-  last_test_ok: null as boolean | null,
-  last_test_message: null as string | null,
-  updated_by: "",
-  note: "",
-  affected: [] as AffectedWorkerItem[],
+type SettingsTab = "redis" | "manticore" | "geoip" | "history";
+const activeTab = ref<SettingsTab>("redis");
+
+const loading = ref(false);
+const discovery = ref<ServiceDiscoveryReport>({
+  docker_available: false,
+  redis: [],
+  manticore: [],
 });
-const redisForm = ref<RedisServiceConfig>(defaultRedisConfig());
+const detecting = ref(false);
+
+// Redis state
+const redisCfg = ref<RedisServiceConfig>(defaultRedisConfig());
+const redisVersion = ref(0);
 const redisNote = ref("");
-const redisReport = ref<RedisTestReport | null>(null);
-const testingRedis = ref(false);
-const savingRedis = ref(false);
+const redisTest = ref<RedisTestReport | null>(null);
+const redisTesting = ref(false);
+const redisSaving = ref(false);
+const redisRestartAffected = ref(true);
+const redisAffectedWorkers = ref<AffectedWorkerItem[]>([]);
+const redisOutcomes = ref<WorkerRestartOutcome[]>([]);
 
-const manticoreMeta = reactive({
-  version: 0,
-  last_test_ok: null as boolean | null,
-  last_test_message: null as string | null,
-  updated_by: "",
-  note: "",
-  affected: [] as AffectedWorkerItem[],
-});
-const manticoreForm = ref<ManticoreServiceConfig>(defaultManticoreConfig());
+// Manticore state
+const manticoreCfg = ref<ManticoreServiceConfig>(defaultManticoreConfig());
+const manticoreVersion = ref(0);
 const manticoreNote = ref("");
-const manticoreReport = ref<ManticoreTestReport | null>(null);
-const testingManticore = ref(false);
-const savingManticore = ref(false);
-const creatingTable = ref(false);
+const manticoreTest = ref<ManticoreTestReport | null>(null);
+const manticoreTesting = ref(false);
+const manticoreInitializing = ref(false);
+const manticoreSaving = ref(false);
+const manticoreRestartAffected = ref(true);
+const manticoreAffectedWorkers = ref<AffectedWorkerItem[]>([]);
+const manticoreOutcomes = ref<WorkerRestartOutcome[]>([]);
 
-const restartOutcomes = ref<WorkerRestartOutcome[]>([]);
+// GeoIP state
+const geoCfg = ref<GeoIpConfig>(defaultGeoIpConfig());
+const geoInfo = ref<GeoIpSettingsResponse | null>(null);
+const geoSaving = ref(false);
+const geoReloading = ref(false);
+const geoDownloading = ref(false);
+const geoDownloadInfo = ref<DownloadGeoIpResponse | null>(null);
+const geoReloadResults = ref<CrawlerGeoIpReloadResult[]>([]);
 
+// History state
 const historyKind = ref<"redis" | "manticore">("redis");
-const historyRows = ref<ServiceHistoryItem[]>([]);
-const loadingHistory = ref(false);
-const snapshotDialogVisible = ref(false);
-const selectedSnapshotJson = ref("");
+const historyItems = ref<ServiceHistoryItem[]>([]);
+const historyLoading = ref(false);
+const rollbackBusyVer = ref<number | null>(null);
+const rollbackRestart = ref(true);
 
-const currentHistoryKind = computed(() => historyKind.value);
+const HOME_COUNTRY_OPTIONS = computed(() =>
+  Object.values(GLOBE_HOME_HUBS).map((h) => ({
+    value: h.code,
+    label: h.name,
+  })),
+);
 
-async function loadOverview() {
+async function runDiscover() {
+  detecting.value = true;
+  try {
+    discovery.value = await detectSettingsServices();
+  } catch {
+    // ignore scan error
+  } finally {
+    detecting.value = false;
+  }
+}
+
+async function fetchServices() {
   loading.value = true;
   try {
     const res = await getServicesSettings();
-    redisForm.value = { ...res.redis.config };
-    redisMeta.version = res.redis.version;
-    redisMeta.last_test_ok = res.redis.last_test_ok;
-    redisMeta.last_test_message = res.redis.last_test_message;
-    redisMeta.updated_by = res.redis.updated_by;
-    redisMeta.note = res.redis.note;
-    redisMeta.affected = res.redis.affected_running_workers;
+    redisCfg.value = { ...defaultRedisConfig(), ...res.redis.config };
+    redisVersion.value = res.redis.version;
+    redisAffectedWorkers.value = res.redis.affected_running_workers;
 
-    manticoreForm.value = { ...res.manticore.config };
-    manticoreMeta.version = res.manticore.version;
-    manticoreMeta.last_test_ok = res.manticore.last_test_ok;
-    manticoreMeta.last_test_message = res.manticore.last_test_message;
-    manticoreMeta.updated_by = res.manticore.updated_by;
-    manticoreMeta.note = res.manticore.note;
-    manticoreMeta.affected = res.manticore.affected_running_workers;
-  } catch (err) {
-    ElMessage.error(err instanceof ApiError ? err.message : "加载服务配置失败");
+    manticoreCfg.value = normalizeManticoreConfig(res.manticore.config);
+    manticoreVersion.value = res.manticore.version;
+    manticoreAffectedWorkers.value = res.manticore.affected_running_workers;
+  } catch (e) {
+    ElMessage.error(e instanceof Error ? e.message : "加载服务设置失败");
   } finally {
     loading.value = false;
   }
 }
 
-async function loadHistory() {
-  loadingHistory.value = true;
+async function fetchGeoIp() {
   try {
-    historyRows.value = await listSettingsHistory(currentHistoryKind.value, 30);
-  } catch (err) {
-    ElMessage.error(err instanceof ApiError ? err.message : "加载变更历史失败");
-  } finally {
-    loadingHistory.value = false;
+    const res = await getGeoIpSettings();
+    geoInfo.value = res;
+    geoCfg.value = {
+      ...defaultGeoIpConfig(),
+      ...res.config,
+      download_url: res.config.download_url?.trim() || DEFAULT_GEOIP_DOWNLOAD_URL,
+    };
+  } catch (e) {
+    ElMessage.error(e instanceof Error ? e.message : "读取 GeoIP 配置失败");
   }
 }
 
-watch([activeTab, historyKind], ([tab]) => {
-  if (tab === "history") {
-    void loadHistory();
+async function fetchHistory() {
+  historyLoading.value = true;
+  try {
+    historyItems.value = await listSettingsHistory(historyKind.value, 25);
+  } catch (e) {
+    ElMessage.error(e instanceof Error ? e.message : "加载历史版本失败");
+  } finally {
+    historyLoading.value = false;
   }
-});
+}
 
-onMounted(() => {
-  void loadOverview();
-});
+function selectDetectedRedis(item: DetectedRedisService) {
+  redisCfg.value = {
+    ...redisCfg.value,
+    url: "",
+    host: item.host,
+    port: item.port,
+  };
+  ElMessage.info(`已填充候选 Redis ${item.host}:${item.port}`);
+}
+
+function selectDetectedManticore(item: DetectedManticoreService) {
+  manticoreCfg.value = {
+    ...manticoreCfg.value,
+    url: item.url,
+  };
+  ElMessage.info(`已填充候选 Manticore ${item.url}`);
+}
 
 async function handleTestRedis() {
-  testingRedis.value = true;
+  redisTesting.value = true;
   try {
-    redisReport.value = await testRedisSettings(redisForm.value);
-    if (redisReport.value.ok) {
-      ElMessage.success(redisReport.value.message);
-    } else {
-      ElMessage.error(redisReport.value.message);
-    }
-    await loadOverview();
-  } catch (err) {
-    ElMessage.error(err instanceof ApiError ? err.message : "测试 Redis 连接失败");
+    redisTest.value = await testRedisSettings(redisCfg.value);
+  } catch (e) {
+    ElMessage.error(e instanceof Error ? e.message : "测试 Redis 失败");
   } finally {
-    testingRedis.value = false;
+    redisTesting.value = false;
   }
 }
 
-async function handleSaveRedis(withRestart: boolean) {
-  if (withRestart && redisMeta.affected.length > 0) {
-    const names = redisMeta.affected.map((w) => `${w.id} (${w.role})`).join("、");
-    try {
-      await ElMessageBox.confirm(
-        `保存新版 Redis 配置后，将依次优雅排空并重启以下运行中的节点：${names}。是否继续？`,
-        "确认滚动重启受影响 Worker",
-        { type: "warning", confirmButtonText: "保存并滚动重启", cancelButtonText: "取消" },
-      );
-    } catch {
-      return;
-    }
-  }
-
-  savingRedis.value = true;
-  restartOutcomes.value = [];
+async function handleSaveRedis() {
+  redisSaving.value = true;
   try {
-    const res = await updateRedisSettings(redisForm.value, redisNote.value, withRestart);
-    restartOutcomes.value = res.restarted_workers;
-    ElMessage.success(`已保存 Redis 配置 v${res.version}`);
+    const res = await updateRedisSettings(
+      redisCfg.value,
+      redisNote.value.trim() || "通过系统配置页面更新 Redis",
+      redisRestartAffected.value,
+    );
+    redisVersion.value = res.version;
+    redisOutcomes.value = res.restarted_workers;
     redisNote.value = "";
-    await loadOverview();
-  } catch (err) {
-    ElMessage.error(err instanceof ApiError ? err.message : "保存 Redis 配置失败");
+    ElMessage.success(`Redis 配置已保存为 v${res.version}`);
+  } catch (e) {
+    ElMessage.error(e instanceof Error ? e.message : "保存 Redis 配置失败");
   } finally {
-    savingRedis.value = false;
+    redisSaving.value = false;
   }
 }
 
 async function handleTestManticore() {
-  testingManticore.value = true;
+  manticoreTesting.value = true;
   try {
-    manticoreReport.value = await testManticoreSettings(manticoreForm.value);
-    if (manticoreReport.value.ok) {
-      ElMessage.success(manticoreReport.value.message);
-    } else {
-      ElMessage.warning(manticoreReport.value.message);
-    }
-    await loadOverview();
-  } catch (err) {
-    ElMessage.error(err instanceof ApiError ? err.message : "测试 Manticore 失败");
+    manticoreTest.value = await testManticoreSettings(manticoreCfg.value);
+  } catch (e) {
+    ElMessage.error(e instanceof Error ? e.message : "测试 Manticore 失败");
   } finally {
-    testingManticore.value = false;
+    manticoreTesting.value = false;
   }
 }
 
 async function handleInitManticoreTable() {
+  manticoreInitializing.value = true;
   try {
-    await ElMessageBox.confirm(
-      "确认为当前空 Manticore 实例初始化 torrents 表？若表已存在，系统将自动拒绝并保护存量数据。",
-      "显式初始化建表确认",
-      { type: "warning", confirmButtonText: "确认建表", cancelButtonText: "取消" },
-    );
-  } catch {
-    return;
-  }
-
-  creatingTable.value = true;
-  try {
-    const res = await initManticoreTable(manticoreForm.value);
-    ElMessage.success(res.message);
+    const res = await initManticoreTable(manticoreCfg.value);
+    if (res.ok) ElMessage.success(res.message);
+    else ElMessage.warning(res.message);
     await handleTestManticore();
-  } catch (err) {
-    ElMessage.error(err instanceof ApiError ? err.message : "初始化建表失败");
+    await telemetry.refreshSnapshot().catch(() => {});
+  } catch (e) {
+    ElMessage.error(e instanceof Error ? e.message : "建表失败");
   } finally {
-    creatingTable.value = false;
+    manticoreInitializing.value = false;
   }
 }
 
-async function handleSaveManticore(withRestart: boolean) {
-  if (withRestart && manticoreMeta.affected.length > 0) {
-    const names = manticoreMeta.affected.map((w) => w.id).join("、");
-    try {
-      await ElMessageBox.confirm(
-        `保存新版 Manticore 配置后，将依次排空并重启以下运行中的索引节点：${names}。是否继续？`,
-        "确认滚动重启 Indexer",
-        { type: "warning", confirmButtonText: "保存并滚动重启", cancelButtonText: "取消" },
-      );
-    } catch {
-      return;
-    }
-  }
-
-  savingManticore.value = true;
-  restartOutcomes.value = [];
+async function handleSaveManticore() {
+  manticoreSaving.value = true;
   try {
-    const res = await updateManticoreSettings(manticoreForm.value, manticoreNote.value, withRestart);
-    restartOutcomes.value = res.restarted_workers;
-    ElMessage.success(`已保存 Manticore 配置 v${res.version}`);
-    manticoreNote.value = "";
-    await loadOverview();
-  } catch (err) {
-    ElMessage.error(err instanceof ApiError ? err.message : "保存 Manticore 配置失败");
-  } finally {
-    savingManticore.value = false;
-  }
-}
-
-function viewSnapshot(row: ServiceHistoryItem) {
-  selectedSnapshotJson.value = JSON.stringify(row.config, null, 2);
-  snapshotDialogVisible.value = true;
-}
-
-async function handleRollback(row: ServiceHistoryItem) {
-  let restart = false;
-  try {
-    await ElMessageBox.confirm(
-      `确认将 ${row.kind.toUpperCase()} 回滚至 v${row.version}（将生成新的激活版本号）？`,
-      "确认回滚配置版本",
-      {
-        type: "warning",
-        distinguishCancelAndClose: true,
-        confirmButtonText: "回滚并重启受影响节点",
-        cancelButtonText: "仅回滚配置",
-      },
+    const res = await updateManticoreSettings(
+      manticoreCfg.value,
+      manticoreNote.value.trim() || "通过系统配置页面更新 Manticore",
+      manticoreRestartAffected.value,
     );
-    restart = true;
-  } catch (action) {
-    if (action !== "cancel") {
-      return;
-    }
-    restart = false;
-  }
-
-  try {
-    const res = await rollbackSettings(row.kind, row.version, restart);
-    restartOutcomes.value = res.restarted_workers;
-    ElMessage.success(`已回滚 ${row.kind} 并生成激活版本 v${res.version}`);
-    await loadOverview();
-    await loadHistory();
-  } catch (err) {
-    ElMessage.error(err instanceof ApiError ? err.message : "回滚失败");
+    manticoreVersion.value = res.version;
+    manticoreOutcomes.value = res.restarted_workers;
+    manticoreNote.value = "";
+    ElMessage.success(`Manticore 配置已保存为 v${res.version}`);
+  } catch (e) {
+    ElMessage.error(e instanceof Error ? e.message : "保存 Manticore 配置失败");
+  } finally {
+    manticoreSaving.value = false;
   }
 }
+
+async function handleSaveGeoIp() {
+  geoSaving.value = true;
+  try {
+    const res = await updateGeoIpSettings(geoCfg.value, true);
+    geoCfg.value = { ...res.config };
+    geoReloadResults.value = res.reload_results;
+    if (geoInfo.value) {
+      geoInfo.value = {
+        ...geoInfo.value,
+        ...res.inspect,
+        config: res.config,
+      };
+    }
+    const okCnt = res.reload_results.filter((r) => r.ok).length;
+    ElMessage.success(
+      `GeoIP 配置已保存` + (res.reload_results.length > 0 ? `，${okCnt}/${res.reload_results.length} 个爬虫热重载完成` : ""),
+    );
+  } catch (e) {
+    ElMessage.error(e instanceof Error ? e.message : "保存 GeoIP 配置失败");
+  } finally {
+    geoSaving.value = false;
+  }
+}
+
+async function handleReloadGeoIpOnly() {
+  geoReloading.value = true;
+  try {
+    const res = await reloadGeoIpSettings();
+    geoReloadResults.value = res.reload_results;
+    if (geoInfo.value) {
+      geoInfo.value = {
+        ...geoInfo.value,
+        ...res.inspect,
+      };
+    }
+    await telemetry.refreshSnapshot().catch(() => {});
+    ElMessage.success("已触发所有运行中爬虫热重载 MMDB");
+  } catch (e) {
+    ElMessage.error(e instanceof Error ? e.message : "热重载失败");
+  } finally {
+    geoReloading.value = false;
+  }
+}
+
+async function handleDownloadGeoIp() {
+  geoDownloading.value = true;
+  try {
+    const targetPath = geoCfg.value.mmdb_path.trim() || "GeoLite2-Country.mmdb";
+    const downloadUrl = geoCfg.value.download_url.trim() || DEFAULT_GEOIP_DOWNLOAD_URL;
+    const res = await downloadGeoIpMmdb({
+      mmdb_path: targetPath,
+      download_url: downloadUrl,
+      reload_crawlers: true,
+    });
+    geoCfg.value = {
+      ...defaultGeoIpConfig(),
+      ...res.config,
+      download_url: res.config.download_url?.trim() || DEFAULT_GEOIP_DOWNLOAD_URL,
+    };
+    geoReloadResults.value = res.reload_results;
+    geoDownloadInfo.value = res;
+    if (geoInfo.value) {
+      geoInfo.value = {
+        ...geoInfo.value,
+        ...res.inspect,
+        config: geoCfg.value,
+      };
+    } else {
+      await fetchGeoIp();
+    }
+    await telemetry.refreshSnapshot().catch(() => {});
+    ElMessage.success(res.message);
+  } catch (e) {
+    ElMessage.error(e instanceof Error ? e.message : "下载或更新 GeoIP 数据库失败");
+  } finally {
+    geoDownloading.value = false;
+  }
+}
+
+async function handleRollback(ver: number) {
+  rollbackBusyVer.value = ver;
+  try {
+    await rollbackSettings(historyKind.value, ver, rollbackRestart.value);
+    ElMessage.success(`已将 ${historyKind.value} 回滚并生成新激活版本`);
+    await Promise.all([fetchServices(), fetchHistory()]);
+  } catch (e) {
+    ElMessage.error(e instanceof Error ? e.message : "回滚失败");
+  } finally {
+    rollbackBusyVer.value = null;
+  }
+}
+
+function applyTabQuery() {
+  const t = route.query.tab;
+  if (t === "redis" || t === "manticore" || t === "geoip" || t === "history") {
+    activeTab.value = t;
+    void router.replace({ path: "/settings/services", query: {} });
+  }
+}
+
+watch(activeTab, (tab) => {
+  if (tab === "manticore" && !loading.value && manticoreTest.value === null) {
+    void handleTestManticore();
+  }
+  if (tab === "geoip") void fetchGeoIp();
+  if (tab === "history") void fetchHistory();
+});
+
+watch(historyKind, () => {
+  if (activeTab.value === "history") void fetchHistory();
+});
+
+watch(
+  () => route.query.tab,
+  () => {
+    applyTabQuery();
+  },
+);
+
+onMounted(async () => {
+  applyTabQuery();
+  await Promise.all([fetchServices(), fetchGeoIp(), runDiscover()]);
+  if (activeTab.value === "manticore" && manticoreTest.value === null) {
+    void handleTestManticore();
+  }
+  if (activeTab.value === "history") void fetchHistory();
+});
 </script>
 
 <template>
-  <div class="max-w-5xl mx-auto space-y-6">
-    <div v-if="restartOutcomes.length > 0" class="rounded-xl border border-slate-200 bg-white p-4">
-      <div class="text-sm font-medium text-slate-800 mb-2">联动滚动重启结果</div>
-      <div class="grid grid-cols-1 md:grid-cols-2 gap-2">
-        <el-alert
-          v-for="item in restartOutcomes"
-          :key="item.id"
-          :type="item.ok ? 'success' : 'error'"
-          :title="`${item.id} (${item.role}): ${item.message}`"
-          :closable="false"
-          show-icon
-        />
+  <section class="obs-card rounded-xl overflow-hidden">
+    <!-- Unified Rounded Pill Tab Bar + Auto-Detect Trigger -->
+    <div class="px-4 py-2.5 border-b border-slate-800/80 bg-[#0b0f17] flex flex-wrap items-center justify-between gap-2 text-xs">
+      <div class="flex flex-wrap items-center gap-1.5">
+        <button
+          type="button"
+          class="px-3 py-1.5 rounded-lg font-medium inline-flex items-center gap-1.5 border transition cursor-pointer"
+          :class="activeTab === 'redis' ? 'obs-tab-active' : 'border-transparent text-slate-400 hover:text-slate-200 hover:bg-slate-800/40'"
+          @click="activeTab = 'redis'"
+        >
+          <Server class="w-3.5 h-3.5" />
+          Redis 连接配置 (v{{ redisVersion }})
+        </button>
+        <button
+          type="button"
+          class="px-3 py-1.5 rounded-lg font-medium inline-flex items-center gap-1.5 border transition cursor-pointer"
+          :class="activeTab === 'manticore' ? 'obs-tab-active' : 'border-transparent text-slate-400 hover:text-slate-200 hover:bg-slate-800/40'"
+          @click="activeTab = 'manticore'"
+        >
+          <Database class="w-3.5 h-3.5" />
+          Manticore Search (v{{ manticoreVersion }})
+        </button>
+        <button
+          type="button"
+          class="px-3 py-1.5 rounded-lg font-medium inline-flex items-center gap-1.5 border transition cursor-pointer"
+          :class="activeTab === 'geoip' ? 'obs-tab-active' : 'border-transparent text-slate-400 hover:text-slate-200 hover:bg-slate-800/40'"
+          @click="activeTab = 'geoip'"
+        >
+          <Globe2 class="w-3.5 h-3.5" />
+          GeoIP 离线库 (MMDB)
+        </button>
+        <button
+          type="button"
+          class="px-3 py-1.5 rounded-lg font-medium inline-flex items-center gap-1.5 border transition cursor-pointer"
+          :class="activeTab === 'history' ? 'obs-tab-active' : 'border-transparent text-slate-400 hover:text-slate-200 hover:bg-slate-800/40'"
+          @click="activeTab = 'history'"
+        >
+          <History class="w-3.5 h-3.5" />
+          历史版本审计
+        </button>
+      </div>
+
+      <div class="flex items-center gap-2">
+        <button
+          type="button"
+          class="obs-btn obs-btn-ghost px-2.5! py-1! text-xs! inline-flex items-center gap-1"
+          :disabled="detecting"
+          @click="runDiscover"
+        >
+          <span>📡</span>
+          {{ detecting ? "探测中…" : "自动检测候选服务" }}
+        </button>
+        <button
+          type="button"
+          class="obs-btn obs-btn-ghost px-2.5! py-1! text-xs! inline-flex items-center gap-1"
+          @click="fetchServices(); fetchGeoIp()"
+        >
+          <RefreshCw class="w-3.5 h-3.5" :class="loading ? 'animate-spin text-emerald-400' : ''" />
+          刷新配置
+        </button>
       </div>
     </div>
 
-    <div class="rounded-xl border border-slate-200 bg-white p-6 shadow-sm" v-loading="loading">
-      <el-tabs v-model="activeTab">
-        <!-- Redis Tab -->
-        <el-tab-pane label="Redis 服务配置" name="redis">
-          <div class="mb-4 flex flex-wrap items-center justify-between gap-2 rounded-lg bg-slate-50 px-4 py-2.5 text-xs text-slate-600">
-            <div class="flex flex-wrap gap-4">
-              <span>当前版本: <strong class="font-mono">v{{ redisMeta.version }}</strong></span>
-              <span v-if="redisMeta.updated_by">修改人: {{ redisMeta.updated_by }}</span>
-              <span v-if="redisMeta.last_test_message">上次检测: {{ redisMeta.last_test_message }}</span>
-            </div>
-            <div>
-              运行中受影响节点:
-              <strong class="text-indigo-600">{{ redisMeta.affected.length }}</strong>
-              <span v-if="redisMeta.affected.length > 0" class="ml-1 text-slate-500">
-                ({{ redisMeta.affected.map((w) => w.id).join(", ") }})
-              </span>
-            </div>
-          </div>
+    <div class="p-4 md:p-5 space-y-4">
+      <!-- TAB 1: REDIS -->
+      <section v-if="activeTab === 'redis'" class="space-y-4">
+        <ServiceDiscoveryBar
+          kind="redis"
+          :loading="detecting"
+          :docker-available="discovery.docker_available"
+          :redis-items="discovery.redis"
+          :active-key="`${redisCfg.host}:${redisCfg.port}`"
+          @rescan="runDiscover"
+          @select-redis="selectDetectedRedis"
+        />
 
-          <el-form label-position="top">
-            <RedisConfigFields v-model="redisForm" :test-report="redisReport" />
+        <div class="obs-inset rounded-xl p-5 space-y-4">
+          <RedisConfigFields v-model="redisCfg" :test-report="redisTest" :lock-indexed-prefix="true" />
 
-            <el-form-item label="本次变更备注" class="mt-4">
-              <el-input v-model="redisNote" placeholder="例如：更换主库 Redis 密码 / 调整连接池大小" />
-            </el-form-item>
-
-            <div class="mt-4 flex flex-wrap justify-end gap-3">
-              <el-button :loading="testingRedis" @click="handleTestRedis">
-                <Zap class="h-4 w-4 mr-1" />
-                一键测试连接
-              </el-button>
-              <el-button type="primary" plain :loading="savingRedis" @click="handleSaveRedis(false)">
-                <Save class="h-4 w-4 mr-1" />
-                仅保存配置
-              </el-button>
-              <el-button
-                type="primary"
-                :loading="savingRedis"
-                @click="handleSaveRedis(true)"
-              >
-                <RotateCcw class="h-4 w-4 mr-1" />
-                保存并滚动重启受影响节点 ({{ redisMeta.affected.length }})
-              </el-button>
+          <div class="pt-3 border-t border-slate-800 flex flex-wrap items-center justify-between gap-3 text-xs">
+            <div class="flex flex-wrap items-center gap-3 flex-1 min-w-[240px]">
+              <input v-model="redisNote" type="text" placeholder="配置变更备注（可选）" class="obs-input rounded-lg px-3 py-1.5 text-xs max-w-xs" />
+              <label v-if="redisAffectedWorkers.length > 0" class="inline-flex items-center gap-1.5 text-slate-300 cursor-pointer">
+                <input v-model="redisRestartAffected" type="checkbox" class="obs-checkbox" />
+                保存后自动重启 {{ redisAffectedWorkers.length }} 个受影响运行中子进程
+              </label>
             </div>
-          </el-form>
-        </el-tab-pane>
 
-        <!-- Manticore Tab -->
-        <el-tab-pane label="Manticore Search 配置" name="manticore">
-          <div class="mb-4 flex flex-wrap items-center justify-between gap-2 rounded-lg bg-slate-50 px-4 py-2.5 text-xs text-slate-600">
-            <div class="flex flex-wrap gap-4">
-              <span>当前版本: <strong class="font-mono">v{{ manticoreMeta.version }}</strong></span>
-              <span v-if="manticoreMeta.updated_by">修改人: {{ manticoreMeta.updated_by }}</span>
-              <span v-if="manticoreMeta.last_test_message">上次检测: {{ manticoreMeta.last_test_message }}</span>
-            </div>
-            <div>
-              运行中受影响索引节点:
-              <strong class="text-indigo-600">{{ manticoreMeta.affected.length }}</strong>
-              <span v-if="manticoreMeta.affected.length > 0" class="ml-1 text-slate-500">
-                ({{ manticoreMeta.affected.map((w) => w.id).join(", ") }})
-              </span>
+            <div class="flex items-center gap-2">
+              <button type="button" class="obs-btn obs-btn-ghost px-3.5! py-1.5! text-xs!" :disabled="redisTesting" @click="handleTestRedis">
+                {{ redisTesting ? "测试中…" : "测试 Redis 连通性" }}
+              </button>
+              <button type="button" class="obs-btn obs-btn-primary px-4! py-1.5! text-xs!" :disabled="redisSaving" @click="handleSaveRedis">
+                {{ redisSaving ? "保存中…" : "保存 Redis 配置" }}
+              </button>
             </div>
           </div>
 
-          <el-form label-position="top">
-            <ManticoreConfigFields v-model="manticoreForm" :test-report="manticoreReport" />
+          <div v-if="redisOutcomes.length > 0" class="bg-[#0b0f17] border border-slate-800 p-3 rounded-lg space-y-1 text-[11px] font-mono">
+            <div v-for="o in redisOutcomes" :key="o.id" :class="o.ok ? 'text-emerald-300' : 'text-rose-300'">
+              [{{ o.id }}] {{ o.message }}
+            </div>
+          </div>
+        </div>
+      </section>
 
-            <el-form-item label="本次变更备注" class="mt-4">
-              <el-input v-model="manticoreNote" placeholder="例如：切换新 Manticore 实例 / 调整连接上限" />
-            </el-form-item>
+      <!-- TAB 2: MANTICORE -->
+      <section v-else-if="activeTab === 'manticore'" class="space-y-4">
+        <ServiceDiscoveryBar
+          kind="manticore"
+          :loading="detecting"
+          :docker-available="discovery.docker_available"
+          :manticore-items="discovery.manticore"
+          :active-key="manticoreCfg.url"
+          @rescan="runDiscover"
+          @select-manticore="selectDetectedManticore"
+        />
 
-            <div class="mt-4 flex flex-wrap justify-end gap-3">
-              <el-button
-                v-if="manticoreReport?.schema && !manticoreReport.schema.table_exists"
-                type="warning"
-                :loading="creatingTable"
+        <div class="obs-inset rounded-xl p-5 space-y-4">
+          <ManticoreConfigFields v-model="manticoreCfg" :test-report="manticoreTest" />
+
+          <div class="pt-3 border-t border-slate-800 flex flex-wrap items-center justify-between gap-3 text-xs">
+            <div class="flex flex-wrap items-center gap-3 flex-1 min-w-[240px]">
+              <input v-model="manticoreNote" type="text" placeholder="配置变更备注（可选）" class="obs-input rounded-lg px-3 py-1.5 text-xs max-w-xs" />
+              <label v-if="manticoreAffectedWorkers.length > 0" class="inline-flex items-center gap-1.5 text-slate-300 cursor-pointer">
+                <input v-model="manticoreRestartAffected" type="checkbox" class="obs-checkbox" />
+                保存后自动重启 {{ manticoreAffectedWorkers.length }} 个受影响运行中子进程
+              </label>
+            </div>
+
+            <div class="flex flex-wrap items-center gap-2">
+              <button type="button" class="obs-btn obs-btn-ghost px-3.5! py-1.5! text-xs!" :disabled="manticoreTesting" @click="handleTestManticore">
+                {{ manticoreTesting ? "检测中…" : "测试连接 & 校验表结构" }}
+              </button>
+              <button
+                v-if="manticoreTest?.schema && !manticoreTest.schema.table_exists"
+                type="button"
+                class="obs-btn px-3.5! py-1.5! text-xs! rounded-lg border-amber-500/45! bg-amber-500/15 text-amber-200 hover:bg-amber-500/25"
+                :disabled="manticoreInitializing"
                 @click="handleInitManticoreTable"
               >
-                初始化新建 torrents 表（仅空库）
-              </el-button>
-              <el-button :loading="testingManticore" @click="handleTestManticore">
-                <Zap class="h-4 w-4 mr-1" />
-                测试连接并核验表结构
-              </el-button>
-              <el-button
-                type="primary"
-                plain
-                :loading="savingManticore"
-                @click="handleSaveManticore(false)"
-              >
-                <Save class="h-4 w-4 mr-1" />
-                仅保存配置
-              </el-button>
-              <el-button
-                type="primary"
-                :loading="savingManticore"
-                @click="handleSaveManticore(true)"
-              >
-                <RotateCcw class="h-4 w-4 mr-1" />
-                保存并滚动重启受影响 Indexer ({{ manticoreMeta.affected.length }})
-              </el-button>
+                {{ manticoreInitializing ? "建表中…" : "自动创建 torrents 表" }}
+              </button>
+              <button type="button" class="obs-btn obs-btn-primary px-4! py-1.5! text-xs!" :disabled="manticoreSaving" @click="handleSaveManticore">
+                {{ manticoreSaving ? "保存中…" : "保存 Manticore 配置" }}
+              </button>
             </div>
-          </el-form>
-        </el-tab-pane>
-
-        <!-- History Tab -->
-        <el-tab-pane name="history">
-          <template #label>
-            <span class="inline-flex items-center gap-1">
-              <History class="h-3.5 w-3.5" />
-              历史版本与回滚
-            </span>
-          </template>
-
-          <div class="mb-4 flex items-center justify-between">
-            <el-radio-group v-model="historyKind" size="small">
-              <el-radio-button value="redis">Redis 配置历史</el-radio-button>
-              <el-radio-button value="manticore">Manticore 配置历史</el-radio-button>
-            </el-radio-group>
-            <el-button size="small" @click="loadHistory">刷新列表</el-button>
           </div>
 
-          <el-table :data="historyRows" v-loading="loadingHistory" stripe size="small">
-            <el-table-column label="版本" width="90">
-              <template #default="{ row }">
-                <span class="font-mono font-semibold">v{{ row.version }}</span>
-                <el-tag v-if="row.is_active" size="small" type="success" class="ml-1">当前</el-tag>
-              </template>
-            </el-table-column>
-            <el-table-column prop="created_by" label="操作人" width="110" />
-            <el-table-column prop="note" label="变更备注" min-width="180" />
-            <el-table-column label="检测结论" min-width="180">
-              <template #default="{ row }">
-                <span v-if="row.last_test_message" class="text-xs">{{ row.last_test_message }}</span>
-                <span v-else class="text-xs text-slate-400">未记录</span>
-              </template>
-            </el-table-column>
-            <el-table-column label="时间" width="165">
-              <template #default="{ row }">
-                {{ new Date(row.created_at * 1000).toLocaleString() }}
-              </template>
-            </el-table-column>
-            <el-table-column label="操作" width="170" fixed="right">
-              <template #default="{ row }">
-                <el-button link type="primary" size="small" @click="viewSnapshot(row)">
-                  查看完整参数
-                </el-button>
-                <el-button
-                  v-if="!row.is_active"
-                  link
-                  type="warning"
-                  size="small"
-                  @click="handleRollback(row)"
-                >
-                  回滚
-                </el-button>
-              </template>
-            </el-table-column>
-          </el-table>
-        </el-tab-pane>
-      </el-tabs>
-    </div>
+          <div v-if="manticoreOutcomes.length > 0" class="bg-[#0b0f17] border border-slate-800 p-3 rounded-lg space-y-1 text-[11px] font-mono">
+            <div v-for="o in manticoreOutcomes" :key="o.id" :class="o.ok ? 'text-emerald-300' : 'text-rose-300'">
+              [{{ o.id }}] {{ o.message }}
+            </div>
+          </div>
+        </div>
+      </section>
 
-    <el-dialog v-model="snapshotDialogVisible" title="完整配置版本快照（所见即所得）" width="600px">
-      <pre class="rounded-lg bg-slate-900 text-slate-100 p-4 text-xs overflow-auto max-h-96 font-mono">{{ selectedSnapshotJson }}</pre>
-    </el-dialog>
-  </div>
+      <!-- TAB 3: GEOIP (MMDB) -->
+      <section v-else-if="activeTab === 'geoip'" class="space-y-4">
+        <div v-if="geoInfo" class="obs-inset rounded-xl p-4 space-y-3 text-xs">
+          <div class="flex flex-wrap items-center justify-between gap-2">
+            <div class="flex items-center gap-2">
+              <ShieldCheck v-if="geoInfo.mmdb_valid" class="w-4 h-4 text-emerald-400" />
+              <XCircle v-else class="w-4 h-4 text-amber-400" />
+              <span class="font-semibold text-white">
+                {{ geoInfo.mmdb_valid ? "GeoLite2 MMDB 离线库校验有效" : "MMDB 离线库未就绪或校验失败" }}
+              </span>
+            </div>
+
+            <div class="flex flex-wrap items-center gap-2.5">
+              <span class="font-mono text-[11px] text-slate-400">
+                在线爬虫 {{ geoInfo.running_crawlers.length }} 个
+              </span>
+              <button
+                v-if="!geoInfo.mmdb_exists || !geoInfo.mmdb_valid"
+                type="button"
+                class="obs-btn obs-btn-primary px-3! py-1.5! text-xs! inline-flex items-center gap-1.5"
+                :disabled="geoDownloading || geoSaving || geoReloading"
+                @click="handleDownloadGeoIp"
+              >
+                <Download class="w-3.5 h-3.5" :class="geoDownloading ? 'animate-bounce' : ''" />
+                {{ geoDownloading ? "下载中…" : "下载数据库" }}
+              </button>
+              <button
+                v-else
+                type="button"
+                class="obs-btn obs-btn-ghost px-3! py-1.5! text-xs! border-emerald-500/35! text-emerald-300! inline-flex items-center gap-1.5"
+                :disabled="geoDownloading || geoSaving || geoReloading"
+                @click="handleDownloadGeoIp"
+              >
+                <RefreshCw class="w-3.5 h-3.5 text-emerald-400" :class="geoDownloading ? 'animate-spin' : ''" />
+                {{ geoDownloading ? "更新中…" : "更新数据库" }}
+              </button>
+            </div>
+          </div>
+
+          <div class="bg-[#0b0f17] border border-slate-800 p-3 rounded-lg grid grid-cols-1 md:grid-cols-3 gap-3 font-mono text-[11px]">
+            <div class="md:col-span-3">
+              <span class="text-slate-500">解析绝对路径：</span>
+              <span class="text-cyan-200 break-all">{{ geoInfo.resolved_path }}</span>
+            </div>
+            <div>
+              <span class="text-slate-500 block">库类型 / 前缀树条目数</span>
+              <span class="text-emerald-300 font-mono-num">{{ geoInfo.database_type ?? "—" }} · {{ fmtCount(geoInfo.node_count) }}</span>
+            </div>
+            <div>
+              <span class="text-slate-500 block">文件体积</span>
+              <span class="text-sky-300 font-mono-num">{{ geoInfo.mmdb_exists ? fmtBytes(geoInfo.mmdb_size_bytes) : "文件不存在" }}</span>
+            </div>
+            <div>
+              <span class="text-slate-500 block">构建时间</span>
+              <span class="text-slate-200 font-mono-num">{{ geoInfo.mmdb_build_epoch ? formatDateTime(geoInfo.mmdb_build_epoch) : "—" }}</span>
+            </div>
+          </div>
+
+          <div class="flex flex-wrap items-center justify-between gap-2 text-[11px] font-mono">
+            <span class="text-slate-400">{{ geoInfo.status_message }}</span>
+            <a
+              :href="DEFAULT_GEOIP_RELEASES_URL"
+              target="_blank"
+              rel="noopener noreferrer"
+              class="text-cyan-400 hover:text-cyan-300 inline-flex items-center gap-1 transition-colors"
+            >
+              <span>P3TERX/GeoLite.mmdb Releases</span>
+              <ExternalLink class="w-3 h-3" />
+            </a>
+          </div>
+
+          <div
+            v-if="geoDownloadInfo"
+            class="px-3 py-2 rounded-lg bg-emerald-500/10 border border-emerald-500/30 text-[11px] font-mono text-emerald-200 flex flex-wrap items-center justify-between gap-2"
+          >
+            <span>{{ geoDownloadInfo.message }}</span>
+            <span class="text-slate-300 font-mono-num">
+              {{ fmtBytes(geoDownloadInfo.downloaded_bytes) }} · {{ fmtDurMs(geoDownloadInfo.duration_ms) }}<template v-if="geoDownloadInfo.release_tag"> · {{ geoDownloadInfo.release_tag }}</template>
+            </span>
+          </div>
+        </div>
+
+        <div class="obs-inset rounded-xl p-5 space-y-4 text-xs">
+          <div class="flex flex-wrap items-center justify-between gap-3">
+            <label class="inline-flex items-center gap-2 text-slate-200 cursor-pointer font-medium">
+              <input v-model="geoCfg.enabled" type="checkbox" class="obs-checkbox" />
+              启用 3D 全球雷达 GeoIP UDP 来源国采样
+            </label>
+
+            <button
+              type="button"
+              class="obs-btn obs-btn-ghost px-3! py-1.5! text-xs!"
+              :disabled="geoReloading || geoDownloading || geoSaving"
+              @click="handleReloadGeoIpOnly"
+            >
+              {{ geoReloading ? "重载中…" : "仅立即热重载 MMDB" }}
+            </button>
+          </div>
+
+          <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+            <div class="md:col-span-2">
+              <div class="flex items-center justify-between gap-2 mb-1">
+                <label class="text-[11px] text-slate-400">IP 数据库下载地址 (GitHub Release 直链)</label>
+                <button
+                  v-if="geoCfg.download_url.trim() !== DEFAULT_GEOIP_DOWNLOAD_URL"
+                  type="button"
+                  class="text-[11px] text-cyan-400 hover:underline cursor-pointer"
+                  @click="geoCfg.download_url = DEFAULT_GEOIP_DOWNLOAD_URL"
+                >
+                  恢复默认源
+                </button>
+              </div>
+              <input
+                v-model="geoCfg.download_url"
+                type="url"
+                :placeholder="DEFAULT_GEOIP_DOWNLOAD_URL"
+                class="obs-input w-full rounded-lg px-3 py-1.5 text-xs font-mono"
+              />
+              <p class="mt-1 text-[10px] text-slate-500">
+                点击上方「下载数据库 / 更新数据库」将流式拉取最新 Release、校验 MMDB 格式、原子替换到下方目录并热重载所有运行中爬虫。
+              </p>
+            </div>
+            <div>
+              <label class="block text-[11px] text-slate-400 mb-1">MaxMind GeoLite2-Country.mmdb 文件路径</label>
+              <input
+                v-model="geoCfg.mmdb_path"
+                type="text"
+                placeholder="GeoLite2-Country.mmdb 或 /opt/geoip/GeoLite2-Country.mmdb"
+                class="obs-input w-full rounded-lg px-3 py-1.5 text-xs font-mono"
+              />
+            </div>
+            <div>
+              <label class="block text-[11px] text-slate-400 mb-1">本机部署归属国家/地区 (HOME HUB)</label>
+              <ObsSelect v-model="geoCfg.home_country" :options="HOME_COUNTRY_OPTIONS" class="w-full" />
+            </div>
+            <div>
+              <label class="block text-[11px] text-slate-400 mb-1">IP /24 前缀 LRU 缓存槽位数</label>
+              <ObsNumberInput v-model="geoCfg.prefix_cache_slots" :min="1024" :max="1048576" />
+            </div>
+            <div>
+              <label class="block text-[11px] text-slate-400 mb-1">自适应降采样触发阈值 (PPS)</label>
+              <ObsNumberInput v-model="geoCfg.adaptive_sample_threshold_pps" :min="1000" :step="1000" />
+            </div>
+            <div>
+              <label class="block text-[11px] text-slate-400 mb-1">无锁环形采样队列容量</label>
+              <ObsNumberInput v-model="geoCfg.sample_queue_capacity" :min="512" :step="512" />
+            </div>
+          </div>
+
+          <div class="pt-3 border-t border-slate-800 flex justify-end">
+            <button
+              type="button"
+              class="obs-btn obs-btn-primary px-4! py-1.5! text-xs!"
+              :disabled="geoSaving || geoDownloading || geoReloading"
+              @click="handleSaveGeoIp"
+            >
+              {{ geoSaving ? "保存并通知爬虫重载中…" : "保存 GeoIP 配置并热重载所有运行中爬虫" }}
+            </button>
+          </div>
+
+          <div v-if="geoReloadResults.length > 0" class="bg-[#0b0f17] border border-slate-800 p-3 rounded-lg space-y-1.5 text-[11px] font-mono">
+            <div
+              v-for="r in geoReloadResults"
+              :key="r.instance_id"
+              class="flex items-center gap-2"
+              :class="r.ok ? 'text-emerald-300' : 'text-rose-300'"
+            >
+              <CheckCircle2 v-if="r.ok" class="w-3.5 h-3.5 shrink-0" />
+              <XCircle v-else class="w-3.5 h-3.5 shrink-0" />
+              <span>[{{ r.instance_id }}] {{ r.message }}</span>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- TAB 4: HISTORY -->
+      <section v-else class="obs-inset rounded-xl overflow-hidden">
+        <div class="p-4 border-b border-slate-800 bg-[#0b0f17] flex flex-wrap items-center justify-between gap-3 text-xs">
+          <div class="bg-[#06090f] border border-slate-800 p-0.5 rounded-lg inline-flex">
+            <button
+              type="button"
+              class="px-3 py-1 rounded-md transition cursor-pointer"
+              :class="historyKind === 'redis' ? 'bg-emerald-500/15 text-emerald-300 font-medium' : 'text-slate-400 hover:text-slate-200'"
+              @click="historyKind = 'redis'"
+            >
+              Redis 配置历史
+            </button>
+            <button
+              type="button"
+              class="px-3 py-1 rounded-md transition cursor-pointer"
+              :class="historyKind === 'manticore' ? 'bg-emerald-500/15 text-emerald-300 font-medium' : 'text-slate-400 hover:text-slate-200'"
+              @click="historyKind = 'manticore'"
+            >
+              Manticore 配置历史
+            </button>
+          </div>
+
+          <label class="inline-flex items-center gap-2 text-slate-300 cursor-pointer">
+            <input v-model="rollbackRestart" type="checkbox" class="obs-checkbox" />
+            回滚时自动重启受影响子进程
+          </label>
+        </div>
+
+        <div v-if="historyLoading" class="py-12 text-center text-xs font-mono text-slate-400">
+          正在加载配置版本审计历史…
+        </div>
+
+        <div v-else class="divide-y divide-slate-800/60">
+          <div v-for="item in historyItems" :key="item.id" class="p-4 flex flex-wrap items-center justify-between gap-3 text-xs">
+            <div class="space-y-1 min-w-0">
+              <div class="flex flex-wrap items-center gap-2">
+                <span class="font-mono font-bold text-emerald-300">v{{ item.version }}</span>
+                <span v-if="item.is_active" class="px-2 py-0.5 rounded-md bg-emerald-500/15 text-emerald-300 border border-emerald-500/30 text-[10px] font-mono">
+                  ACTIVE
+                </span>
+                <span
+                  v-if="item.last_test_ok !== null"
+                  class="px-2 py-0.5 rounded-md text-[10px] font-mono"
+                  :class="item.last_test_ok ? 'bg-sky-500/10 text-sky-300' : 'bg-rose-500/10 text-rose-300'"
+                >
+                  {{ item.last_test_ok ? "TEST PASS" : "TEST FAIL" }}
+                </span>
+                <span class="text-white">{{ item.note || "无变更说明" }}</span>
+              </div>
+              <div class="text-[11px] font-mono text-slate-500">
+                {{ item.created_by }} · {{ formatDateTime(item.created_at) }}
+                <template v-if="item.last_test_message"> · {{ item.last_test_message }}</template>
+              </div>
+            </div>
+
+            <button
+              v-if="!item.is_active"
+              type="button"
+              class="obs-btn obs-btn-ghost px-3! py-1.5! text-xs! inline-flex items-center gap-1"
+              :disabled="rollbackBusyVer === item.version"
+              @click="handleRollback(item.version)"
+            >
+              <RotateCcw class="w-3.5 h-3.5" />
+              {{ rollbackBusyVer === item.version ? "回滚中…" : "回滚至此版本" }}
+            </button>
+          </div>
+
+          <div v-if="historyItems.length === 0" class="py-12 text-center text-xs text-slate-500">暂无配置历史</div>
+        </div>
+      </section>
+    </div>
+  </section>
 </template>

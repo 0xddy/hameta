@@ -1,9 +1,10 @@
 use crate::api::error::{ApiError, extract_client_ip};
 use crate::auth::{SESSION_TTL_SECS, build_session_cookie};
+use crate::discovery::{ServiceDiscoveryReport, detect_services};
 use crate::server::PanelState;
 use crate::services::{
     InitTableError, ManticoreTestReport, RedisTestReport, init_manticore_table_if_absent,
-    test_manticore_connection, test_redis_connection,
+    sanitize_secret_in_text, test_manticore_connection, test_redis_connection,
 };
 use axum::Json;
 use axum::extract::{FromRequestParts, State};
@@ -114,6 +115,12 @@ pub async fn setup_status_handler(
     }))
 }
 
+pub async fn setup_detect_services_handler(
+    _: RequireUninitialized,
+) -> Result<Json<ServiceDiscoveryReport>, ApiError> {
+    Ok(Json(detect_services().await))
+}
+
 pub async fn setup_test_redis_handler(
     _: RequireUninitialized,
     Json(req): Json<SetupTestRedisRequest>,
@@ -176,8 +183,9 @@ pub async fn setup_init_handler(
         ));
     }
 
+    let manticore_cfg = req.manticore.normalized();
     req.redis.validate()?;
-    req.manticore.validate()?;
+    manticore_cfg.validate()?;
 
     let mut bundle = req
         .filter_bundle
@@ -215,7 +223,7 @@ pub async fn setup_init_handler(
 
     let redis_json = serde_json::to_string(&req.redis)
         .map_err(|e| ApiError::internal("序列化 Redis 配置失败").with_detail(e.to_string()))?;
-    let manticore_json = serde_json::to_string(&req.manticore)
+    let manticore_json = serde_json::to_string(&manticore_cfg)
         .map_err(|e| ApiError::internal("序列化 Manticore 配置失败").with_detail(e.to_string()))?;
     let filter_rules_json = serde_json::to_string(&bundle.policy)
         .map_err(|e| ApiError::internal("序列化过滤规则失败").with_detail(e.to_string()))?;
@@ -296,8 +304,15 @@ pub async fn setup_init_handler(
         }
     }
 
+    if let Err(err) = init_manticore_table_if_absent(&manticore_cfg).await
+        && !matches!(err, InitTableError::AlreadyExists)
+    {
+        tracing::warn!("初始化向导自动建表 torrents 跳过: {err:?}");
+    }
+
     state.db.mark_initialized().await?;
     state.services.init_from_db(&state.db).await;
+    state.metrics.invalidate_service_caches().await;
 
     let client_ip = extract_client_ip(&headers);
     let user_agent = headers
@@ -321,7 +336,8 @@ pub async fn setup_init_handler(
         "username": admin.username,
         "redis_host": req.redis.host,
         "redis_port": req.redis.port,
-        "manticore_url": req.manticore.url,
+        "manticore_url": sanitize_secret_in_text(&manticore_cfg.url),
+        "manticore_auth_mode": manticore_cfg.auth_mode.as_str(),
         "filter_version": published_filter.version,
         "created_workers": created_workers,
     })

@@ -2,8 +2,10 @@ use anyhow::{Context, Result};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 use chrono::Utc;
-use hameta_common::{ManticoreServiceConfig, TABLE_TORRENTS, TorrentRecord, hash_to_id};
-use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderValue};
+use hameta_common::{
+    ManticoreAuthMode, ManticoreServiceConfig, TABLE_TORRENTS, TorrentRecord, hash_to_id,
+};
+use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderName, HeaderValue};
 use reqwest::{Client, ClientBuilder};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -66,12 +68,38 @@ impl ManticoreClient {
             .tcp_keepalive(Duration::from_secs(60))
             .tcp_nodelay(true);
 
-        if let Some((username, password)) = config.basic_auth() {
-            let token = STANDARD.encode(format!("{username}:{password}"));
-            let value = HeaderValue::from_str(&format!("Basic {token}"))
-                .context("构造 Manticore Authorization 请求头失败")?;
-            let mut headers = HeaderMap::new();
-            headers.insert(AUTHORIZATION, value);
+        let mut headers = HeaderMap::new();
+        match config.effective_auth_mode() {
+            ManticoreAuthMode::None => {}
+            ManticoreAuthMode::Basic => {
+                if let Some((username, password)) = config.basic_auth() {
+                    let token = STANDARD.encode(format!("{username}:{password}"));
+                    let mut value = HeaderValue::from_str(&format!("Basic {token}"))
+                        .context("构造 Manticore Basic Authorization 请求头失败")?;
+                    value.set_sensitive(true);
+                    headers.insert(AUTHORIZATION, value);
+                }
+            }
+            ManticoreAuthMode::Bearer => {
+                if let Some(token) = config.bearer_token() {
+                    let mut value = HeaderValue::from_str(&format!("Bearer {token}"))
+                        .context("构造 Manticore Bearer Authorization 请求头失败")?;
+                    value.set_sensitive(true);
+                    headers.insert(AUTHORIZATION, value);
+                }
+            }
+            ManticoreAuthMode::Header => {
+                if let Some((name, val)) = config.custom_header_auth() {
+                    let header_name = HeaderName::from_bytes(name.as_bytes())
+                        .context("解析 Manticore 自定义鉴权请求头名称失败")?;
+                    let mut value = HeaderValue::from_str(val)
+                        .context("构造 Manticore 自定义鉴权请求头值失败")?;
+                    value.set_sensitive(true);
+                    headers.insert(header_name, value);
+                }
+            }
+        }
+        if !headers.is_empty() {
             builder = builder.default_headers(headers);
         }
 
@@ -114,7 +142,11 @@ impl ManticoreClient {
                     message: format!("Manticore 中不存在表 {TABLE_TORRENTS}"),
                 });
             }
-            anyhow::bail!("Manticore DESCRIBE 请求失败 (HTTP {status}): {text}");
+            return Err(format_manticore_http_error(
+                "Manticore DESCRIBE 请求",
+                status,
+                &text,
+            ));
         }
 
         parse_describe_response(&text)
@@ -196,7 +228,11 @@ impl ManticoreClient {
         let status = resp.status();
         let text = resp.text().await.context("读取 Manticore SQL 响应失败")?;
         if !status.is_success() {
-            anyhow::bail!("Manticore SQL HTTP {status}: {text}");
+            return Err(format_manticore_http_error(
+                "Manticore SQL 执行",
+                status,
+                &text,
+            ));
         }
         validate_sql_response(&text)
     }
@@ -216,7 +252,11 @@ impl ManticoreClient {
             .await
             .context("读取 Manticore /search 响应失败")?;
         if !status.is_success() {
-            anyhow::bail!("Manticore /search HTTP {status}: {text}");
+            return Err(format_manticore_http_error(
+                "Manticore /search 请求",
+                status,
+                &text,
+            ));
         }
         serde_json::from_str(&text).context("解析 Manticore /search JSON 响应失败")
     }
@@ -342,7 +382,11 @@ impl ManticoreClient {
             } else {
                 let st = resp.status();
                 let err_body = resp.text().await.unwrap_or_default();
-                anyhow::bail!("查询 Manticore 存量热度返回异常 HTTP {st}: {err_body}");
+                return Err(format_manticore_http_error(
+                    "查询 Manticore 存量热度",
+                    st,
+                    &err_body,
+                ));
             }
         }
 
@@ -444,11 +488,34 @@ impl ManticoreClient {
         let status = resp.status();
         let text = resp.text().await.context("读取 Manticore /bulk 响应失败")?;
         if !status.is_success() {
-            anyhow::bail!("Manticore /bulk HTTP {status}: {text}");
+            return Err(format_manticore_http_error(
+                "Manticore /bulk 请求",
+                status,
+                &text,
+            ));
         }
 
         let operations = body.lines().filter(|line| !line.trim().is_empty()).count();
         validate_bulk_response(&text, operations, expected_writes)
+    }
+}
+
+fn format_manticore_http_error(
+    action: &str,
+    status: reqwest::StatusCode,
+    body: &str,
+) -> anyhow::Error {
+    if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+        return anyhow::anyhow!(
+            "{action}鉴权失败 (HTTP {status})：反向代理拒绝访问，请检查 Manticore 鉴权模式与凭据配置"
+        );
+    }
+    let trimmed = body.trim();
+    let snippet: String = trimmed.chars().take(512).collect();
+    if trimmed.chars().count() > 512 {
+        anyhow::anyhow!("{action}失败 (HTTP {status}): {snippet}...")
+    } else {
+        anyhow::anyhow!("{action}失败 (HTTP {status}): {snippet}")
     }
 }
 
@@ -488,11 +555,12 @@ fn response_has_error(value: Option<&Value>) -> bool {
     }
 }
 
-fn is_missing_table_error(text: &str) -> bool {
+pub fn is_missing_table_error(text: &str) -> bool {
     let lower = text.to_ascii_lowercase();
     lower.contains("unknown table")
         || lower.contains("does not exist")
         || lower.contains("no such table")
+        || lower.contains("requires an existing table")
 }
 
 pub fn parse_describe_response(text: &str) -> Result<SchemaCheckReport> {
@@ -851,5 +919,118 @@ mod tests {
 
         assert_eq!(parse_hit_id(&json!(12345)), 12345);
         assert_eq!(parse_hit_id(&json!("67890")), 67890);
+    }
+
+    #[tokio::test]
+    async fn manticore_client_sends_reverse_proxy_auth_headers_and_reports_401() {
+        use axum::Router;
+        use axum::extract::State;
+        use axum::http::{HeaderMap as AxumHeaders, StatusCode};
+        use axum::response::IntoResponse;
+        use axum::routing::post;
+        use std::sync::{Arc, Mutex};
+
+        let expected: Arc<Mutex<(String, String)>> = Arc::new(Mutex::new((
+            "authorization".to_string(),
+            format!("Basic {}", STANDARD.encode("nginx_user:nginx_pass")),
+        )));
+
+        async fn mock_sql(
+            State(expected): State<Arc<Mutex<(String, String)>>>,
+            headers: AxumHeaders,
+        ) -> impl IntoResponse {
+            let (name, val) = expected.lock().unwrap().clone();
+            let got = headers
+                .get(name.as_str())
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or_default();
+            if got == val {
+                let body = json!([{
+                    "columns": [{"Field":{"type":"string"}}, {"Type":{"type":"string"}}, {"Properties":{"type":"string"}}],
+                    "data": [
+                        {"Field": "id", "Type": "bigint", "Properties": ""},
+                        {"Field": "info_hash", "Type": "string", "Properties": ""},
+                        {"Field": "raw_name", "Type": "text", "Properties": ""},
+                        {"Field": "refine_name", "Type": "text", "Properties": ""},
+                        {"Field": "file_count", "Type": "uint", "Properties": ""},
+                        {"Field": "file_info", "Type": "json", "Properties": ""},
+                        {"Field": "hot", "Type": "uint", "Properties": ""},
+                        {"Field": "created_at", "Type": "timestamp", "Properties": ""},
+                        {"Field": "updated_at", "Type": "timestamp", "Properties": ""}
+                    ],
+                    "error": ""
+                }])
+                .to_string();
+                (StatusCode::OK, body)
+            } else {
+                (
+                    StatusCode::UNAUTHORIZED,
+                    "<html><body>401 Authorization Required (nginx)</body></html>".to_string(),
+                )
+            }
+        }
+
+        let app = Router::new()
+            .route("/sql", post(mock_sql))
+            .with_state(expected.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_task = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let base_url = format!("http://{addr}");
+
+        // 1. Basic Auth
+        let basic_client = ManticoreClient::new(&ManticoreServiceConfig {
+            url: base_url.clone(),
+            auth_mode: ManticoreAuthMode::Basic,
+            username: "nginx_user".to_string(),
+            password: "nginx_pass".to_string(),
+            ..ManticoreServiceConfig::default()
+        })
+        .unwrap();
+        let report = basic_client.describe_torrents().await.unwrap();
+        assert!(report.table_exists && report.compatible);
+
+        // 2. Bearer Token（传入带 "Bearer " 前缀的输入也应规整发送）
+        *expected.lock().unwrap() = (
+            "authorization".to_string(),
+            "Bearer proxy-secret".to_string(),
+        );
+        let bearer_client = ManticoreClient::new(&ManticoreServiceConfig {
+            url: base_url.clone(),
+            auth_mode: ManticoreAuthMode::Bearer,
+            bearer_token: "Bearer proxy-secret".to_string(),
+            ..ManticoreServiceConfig::default()
+        })
+        .unwrap();
+        assert!(bearer_client.describe_torrents().await.unwrap().compatible);
+
+        // 3. 自定义请求头 API Key
+        *expected.lock().unwrap() = ("x-api-key".to_string(), "k-42".to_string());
+        let header_client = ManticoreClient::new(&ManticoreServiceConfig {
+            url: base_url.clone(),
+            auth_mode: ManticoreAuthMode::Header,
+            header_name: "X-API-Key".to_string(),
+            header_value: "k-42".to_string(),
+            ..ManticoreServiceConfig::default()
+        })
+        .unwrap();
+        assert!(header_client.describe_torrents().await.unwrap().compatible);
+
+        // 4. 凭据不匹配时 HTTP 401 清晰报错
+        let unauth_client = ManticoreClient::new(&ManticoreServiceConfig {
+            url: base_url,
+            auth_mode: ManticoreAuthMode::None,
+            ..ManticoreServiceConfig::default()
+        })
+        .unwrap();
+        let err = unauth_client.describe_torrents().await.unwrap_err();
+        let err_msg = err.to_string();
+        assert!(err_msg.contains("鉴权失败"), "unexpected err: {err_msg}");
+        assert!(err_msg.contains("401"), "unexpected err: {err_msg}");
+
+        server_task.abort();
     }
 }
