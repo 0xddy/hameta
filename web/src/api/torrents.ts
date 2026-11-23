@@ -152,8 +152,9 @@ export function batchDeleteTorrents(
   });
 }
 
-export type TorrentTaskKind = "sync_total_size" | "reclean_titles";
+export type TorrentTaskKind = "sync_total_size" | "reclean_titles" | "clean_garbled";
 export type RecleanScope = "all" | "empty_or_unchanged";
+export type GarbledCheckMode = "all" | "strict_replacement";
 export type TorrentTaskStatus = "running" | "paused" | "completed" | "cancelled" | "failed";
 
 export interface TorrentTaskParams {
@@ -165,6 +166,8 @@ export interface TorrentTaskParams {
   clean_scope: RecleanScope;
   skip_empty_result: boolean;
   rule_version: number | null;
+  garbled_mode?: GarbledCheckMode;
+  evict_redis_indexed?: boolean;
 }
 
 export interface TaskSampleDiff {
@@ -215,6 +218,8 @@ export interface CreateTorrentTaskPayload {
   only_missing?: boolean;
   clean_scope?: RecleanScope;
   skip_empty_result?: boolean;
+  garbled_mode?: GarbledCheckMode;
+  evict_redis_indexed?: boolean;
 }
 
 export function listTorrentTasks(limit = 30): Promise<TorrentTasksOverview> {

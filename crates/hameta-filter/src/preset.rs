@@ -258,6 +258,7 @@ pub fn default_online_filter_policy() -> FilterPolicy {
         preset_id: Some("online_standard".to_string()),
         gates: FilterGates {
             reject_empty_name: true,
+            reject_garbled_name: true,
             min_name_length: ToggleUsize::on(4),
             max_name_length: ToggleUsize::on(128),
             reject_empty_files: true,
@@ -387,6 +388,7 @@ pub fn default_online_filter_policy() -> FilterPolicy {
                 matcher: RuleMatcher::TitlePatternPreset {
                     patterns: vec![
                         TitlePatternKind::Cyrillic,
+                        TitlePatternKind::GarbledText,
                         TitlePatternKind::DigitsOnly,
                         TitlePatternKind::Sha1Hex,
                         TitlePatternKind::Md5Hex,
@@ -491,6 +493,7 @@ fn media_focused_policy() -> FilterPolicy {
         preset_id: Some("media_focused".to_string()),
         gates: FilterGates {
             reject_empty_name: true,
+            reject_garbled_name: true,
             min_name_length: ToggleUsize::on(4),
             max_name_length: ToggleUsize::on(160),
             reject_empty_files: true,
@@ -586,6 +589,7 @@ fn media_focused_policy() -> FilterPolicy {
                 matcher: RuleMatcher::TitlePatternPreset {
                     patterns: vec![
                         TitlePatternKind::Cyrillic,
+                        TitlePatternKind::GarbledText,
                         TitlePatternKind::DigitsOnly,
                         TitlePatternKind::Sha1Hex,
                         TitlePatternKind::Md5Hex,
@@ -654,6 +658,7 @@ fn relaxed_archive_policy() -> FilterPolicy {
         preset_id: Some("relaxed_archive".to_string()),
         gates: FilterGates {
             reject_empty_name: true,
+            reject_garbled_name: true,
             min_name_length: ToggleUsize::on(2),
             max_name_length: ToggleUsize::on(256),
             reject_empty_files: true,
@@ -719,6 +724,7 @@ fn relaxed_archive_policy() -> FilterPolicy {
                 note: "清理无可读标题的纯哈希与 URL 垃圾条目".to_string(),
                 matcher: RuleMatcher::TitlePatternPreset {
                     patterns: vec![
+                        TitlePatternKind::GarbledText,
                         TitlePatternKind::DigitsOnly,
                         TitlePatternKind::Sha1Hex,
                         TitlePatternKind::Md5Hex,
@@ -755,6 +761,7 @@ fn minimal_clean_policy() -> FilterPolicy {
         preset_id: Some("minimal_clean".to_string()),
         gates: FilterGates {
             reject_empty_name: true,
+            reject_garbled_name: true,
             min_name_length: ToggleUsize::on(2),
             max_name_length: ToggleUsize::off(256),
             reject_empty_files: true,
@@ -1061,6 +1068,7 @@ pub fn builtin_preset_catalog() -> FilterPresetCatalog {
                 matcher: RuleMatcher::TitlePatternPreset {
                     patterns: vec![
                         TitlePatternKind::Cyrillic,
+                        TitlePatternKind::GarbledText,
                         TitlePatternKind::DigitsOnly,
                         TitlePatternKind::Sha1Hex,
                         TitlePatternKind::Md5Hex,

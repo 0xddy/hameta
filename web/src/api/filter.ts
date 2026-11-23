@@ -3,6 +3,7 @@ import type { WorkerRuntimeState } from "./overview";
 
 export type FilterCategory =
   | "empty_name"
+  | "garbled_name"
   | "title_length"
   | "empty_files"
   | "all_empty_files"
@@ -28,6 +29,7 @@ export type KeywordMatchMode = "contains" | "word_boundary";
 export type ExtensionScope = "torrent_name" | "any_file" | "all_files";
 export type TitlePatternKind =
   | "cyrillic"
+  | "garbled_text"
   | "digits_only"
   | "sha1_hex"
   | "md5_hex"
@@ -57,6 +59,7 @@ export interface DensityGate {
 
 export interface FilterGates {
   reject_empty_name: boolean;
+  reject_garbled_name: boolean;
   min_name_length: ToggleUsize;
   max_name_length: ToggleUsize;
   reject_empty_files: boolean;

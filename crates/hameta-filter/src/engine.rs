@@ -24,6 +24,7 @@ fn file_basename(path: &str) -> &str {
 #[serde(rename_all = "snake_case")]
 pub enum FilterCategory {
     EmptyName,
+    GarbledName,
     TitleLength,
     EmptyFiles,
     AllEmptyFiles,
@@ -343,6 +344,18 @@ impl CompiledFilterEngine {
                 "gate:empty_name",
                 "空标题检查",
                 "种子标题为空",
+            );
+        }
+
+        if self.gates.reject_garbled_name
+            && let Some(reason) = detect_garbled_title(trimmed_name)
+        {
+            return rejected(
+                None,
+                FilterCategory::GarbledName,
+                "gate:garbled_name",
+                "编码乱码标题检查",
+                format!("标题疑似编码损坏/乱码 ({reason})"),
             );
         }
 
@@ -1260,6 +1273,164 @@ fn check_split_archive(text: &str) -> bool {
         || split_rz_re().is_match(text)
 }
 
+fn is_latin1_mojibake_char(c: char) -> bool {
+    ('\u{00A1}'..='\u{00FF}').contains(&c)
+        && !matches!(c, '·' | '×' | '©' | '®' | '°' | '«' | '»' | '²' | '³' | '÷')
+}
+
+fn is_cp1252_high_punct(c: char) -> bool {
+    matches!(
+        c,
+        '€' | '‚'
+            | 'ƒ'
+            | '„'
+            | '…'
+            | '†'
+            | '‡'
+            | 'ˆ'
+            | '‰'
+            | 'Š'
+            | '‹'
+            | 'Œ'
+            | 'Ž'
+            | '‘'
+            | '’'
+            | '“'
+            | '”'
+            | '•'
+            | '–'
+            | '—'
+            | '˜'
+            | '™'
+            | 'š'
+            | '›'
+            | 'œ'
+            | 'ž'
+            | 'Ÿ'
+    )
+}
+
+fn is_utf8_lead_as_latin1(c: char) -> bool {
+    matches!(c, '\u{00C2}'..='\u{00F4}')
+}
+
+/// 2 字节 UTF-8 错解 GBK/传统编码时高频命中的冷僻码位区：
+/// - Latin Extended-B / IPA 音标 (`U+0180..=U+02AF`，排除罗马尼亚语 `ȘșȚț`)
+/// - 希腊冷僻符号/科普特字母 (`U+03D0..=U+03FF`，如 `ϰ`)
+/// - 非斯拉夫扩展西里尔与西里尔补充 (`U+0460..=U+052F`，如 `ԭ`/`Ӱ`/`Ӣ`；正常俄语/乌克兰语在 `U+0400..=U+045F`)
+/// - 下划/覆盖类组合音标 (`U+0330..=U+036F`，如 `̳`)
+fn is_exotic_2byte_mojibake_char(c: char) -> bool {
+    matches!(
+        c,
+        '\u{0180}'..='\u{0217}'
+            | '\u{021C}'..='\u{02AF}'
+            | '\u{0330}'..='\u{036F}'
+            | '\u{03D0}'..='\u{03FF}'
+            | '\u{0460}'..='\u{052F}'
+    )
+}
+
+/// 保守乱码检测：仅命中包含 `U+FFFD` ()、C0/C1 非法控制字符或私有区字符 (PUA) 的明确损坏文本（零误杀）。
+pub fn detect_garbled_title_strict_only(text: &str) -> Option<&'static str> {
+    let mut pua_count = 0usize;
+    for c in text.chars() {
+        if c == '\u{FFFD}' {
+            return Some("包含 Unicode 替换符 (U+FFFD)");
+        }
+        if ('\u{0080}'..='\u{009F}').contains(&c)
+            || (c.is_control() && !matches!(c, '\t' | '\n' | '\r'))
+        {
+            return Some("包含异常控制字符");
+        }
+        if ('\u{E000}'..='\u{F8FF}').contains(&c) {
+            pua_count += 1;
+        }
+    }
+    if pua_count >= 2 {
+        return Some("包含私有区乱码字符 (PUA)");
+    }
+    None
+}
+
+/// 综合乱码检测：覆盖 `U+FFFD` ()、控制符、私有区、典型 GBK/UTF-8 误解码为 Latin-1/CP1252 的 Mojibake 及怪异扩展脚本混杂。
+/// 对正常中文、日文、韩文、西欧重音（法/德/西/葡）、越南语及常规俄语零误杀。
+pub fn detect_garbled_title(text: &str) -> Option<&'static str> {
+    if let Some(reason) = detect_garbled_title_strict_only(text) {
+        return Some(reason);
+    }
+
+    let mut non_space_chars = 0usize;
+    let mut latin1_count = 0usize;
+    let mut latin1_run = 0usize;
+    let mut max_latin1_run = 0usize;
+    let mut cp1252_mojibake_pairs = 0usize;
+    let mut exotic_mojibake_count = 0usize;
+    let mut combining_run = 0usize;
+    let mut max_combining_run = 0usize;
+    let mut stray_combining_count = 0usize;
+    let mut prev: Option<char> = None;
+
+    for c in text.chars() {
+        if !c.is_whitespace() {
+            non_space_chars += 1;
+        }
+
+        if is_latin1_mojibake_char(c) {
+            latin1_count += 1;
+            latin1_run += 1;
+            if latin1_run > max_latin1_run {
+                max_latin1_run = latin1_run;
+            }
+        } else {
+            latin1_run = 0;
+        }
+
+        if let Some(p) = prev
+            && is_utf8_lead_as_latin1(p)
+            && is_cp1252_high_punct(c)
+        {
+            cp1252_mojibake_pairs += 1;
+        }
+
+        if is_exotic_2byte_mojibake_char(c) {
+            exotic_mojibake_count += 1;
+        }
+
+        if ('\u{0300}'..='\u{036F}').contains(&c) {
+            combining_run += 1;
+            if combining_run > max_combining_run {
+                max_combining_run = combining_run;
+            }
+            let attached_to_non_letter =
+                prev.is_none_or(|p| !p.is_alphabetic() || ('\u{0300}'..='\u{036F}').contains(&p));
+            if attached_to_non_letter {
+                stray_combining_count += 1;
+            }
+        } else {
+            combining_run = 0;
+        }
+
+        prev = Some(c);
+    }
+
+    if max_latin1_run >= 4 {
+        return Some("包含连续 Latin-1 编码乱码串");
+    }
+    if latin1_count >= 6 && non_space_chars > 0 && latin1_count * 100 >= non_space_chars * 40 {
+        return Some("Latin-1 乱码字符占比过高");
+    }
+    if cp1252_mojibake_pairs >= 2 {
+        return Some("疑似 UTF-8 误解码为 CP1252 乱码");
+    }
+    if exotic_mojibake_count >= 2 {
+        return Some("包含典型 GBK/UTF-8 错解怪异字符");
+    }
+    if max_combining_run >= 3 || stray_combining_count >= 2 {
+        return Some("包含异常组合音标乱码");
+    }
+    None
+}
+
 fn matches_title_pattern(trimmed_name: &str, kind: TitlePatternKind, min_cyrillic: usize) -> bool {
     match kind {
         TitlePatternKind::Cyrillic => {
@@ -1271,6 +1442,7 @@ fn matches_title_pattern(trimmed_name: &str, kind: TitlePatternKind, min_cyrilli
             re.find_iter(trimmed_name)
                 .any(|m| m.as_str().chars().count() >= min_cyrillic)
         }
+        TitlePatternKind::GarbledText => detect_garbled_title(trimmed_name).is_some(),
         TitlePatternKind::DigitsOnly => {
             !trimmed_name.is_empty() && trimmed_name.bytes().all(|b| b.is_ascii_digit())
         }
@@ -1312,6 +1484,7 @@ fn matches_title_pattern(trimmed_name: &str, kind: TitlePatternKind, min_cyrilli
 fn title_pattern_label(kind: TitlePatternKind) -> &'static str {
     match kind {
         TitlePatternKind::Cyrillic => "西里尔字母文本",
+        TitlePatternKind::GarbledText => "编码乱码标题",
         TitlePatternKind::DigitsOnly => "纯数字标题",
         TitlePatternKind::Sha1Hex => "40位 SHA1 哈希标题",
         TitlePatternKind::Md5Hex => "32位 MD5 哈希标题",

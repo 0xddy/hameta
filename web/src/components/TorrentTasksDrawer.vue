@@ -10,6 +10,7 @@ import {
   Pause,
   Play,
   RefreshCw,
+  ShieldAlert,
   Sparkles,
   Square,
   Trash2,
@@ -22,6 +23,7 @@ import {
   listTorrentTasks,
   pauseTorrentTask,
   resumeTorrentTask,
+  type GarbledCheckMode,
   type RecleanScope,
   type TorrentTaskItem,
   type TorrentTaskKind,
@@ -60,6 +62,8 @@ const form = reactive({
   only_missing: true,
   clean_scope: "all" as RecleanScope,
   skip_empty_result: true,
+  garbled_mode: "all" as GarbledCheckMode,
+  evict_redis_indexed: true,
 });
 
 const BATCH_SIZE_OPTIONS = [
@@ -80,6 +84,11 @@ const BATCH_DELAY_OPTIONS = [
 const CLEAN_SCOPE_OPTIONS: Array<{ label: string; value: RecleanScope }> = [
   { label: "全量按最新规则重新清洗", value: "all" },
   { label: "仅清洗空标题或未清洗记录", value: "empty_or_unchanged" },
+];
+
+const GARBLED_MODE_OPTIONS: Array<{ label: string; value: GarbledCheckMode }> = [
+  { label: "全面检测（U+FFFD 替换符 + 控制符 + Mojibake / GBK 错解）", value: "all" },
+  { label: "保守模式（仅含 U+FFFD 替换符 / 非法控制符 / 私有区）", value: "strict_replacement" },
 ];
 
 let pollTimer: number | null = null;
@@ -149,6 +158,8 @@ async function startTask() {
       only_missing: form.only_missing,
       clean_scope: form.clean_scope,
       skip_empty_result: form.skip_empty_result,
+      garbled_mode: form.garbled_mode,
+      evict_redis_indexed: form.evict_redis_indexed,
     });
     ElMessage.success(
       `已启动任务 #${task.id}（${taskKindLabel(task.kind)}${task.params.dry_run ? " · 预演模式" : ""}）`,
@@ -221,7 +232,15 @@ function toggleDiffExpand(id: number) {
 }
 
 function taskKindLabel(kind: TorrentTaskKind): string {
-  return kind === "sync_total_size" ? "同步文件大小" : "清洗标题";
+  if (kind === "sync_total_size") return "同步文件大小";
+  if (kind === "clean_garbled") return "清洗乱码";
+  return "清洗标题";
+}
+
+function taskKindBadgeClass(kind: TorrentTaskKind): string {
+  if (kind === "sync_total_size") return "bg-cyan-500/15 text-cyan-300 border-cyan-500/30";
+  if (kind === "clean_garbled") return "bg-rose-500/15 text-rose-300 border-rose-500/30";
+  return "bg-violet-500/15 text-violet-300 border-violet-500/30";
 }
 
 function taskStatusMeta(status: TorrentTaskItem["status"]): { label: string; cls: string } {
@@ -304,6 +323,19 @@ onUnmounted(() => {
               <Sparkles class="w-3.5 h-3.5" />
               清洗标题
             </button>
+            <button
+              type="button"
+              class="px-3 py-1.5 rounded-md text-xs transition inline-flex items-center gap-1.5 cursor-pointer"
+              :class="
+                selectedKind === 'clean_garbled'
+                  ? 'bg-rose-500/20 text-rose-200 font-semibold'
+                  : 'text-slate-400 hover:text-slate-200'
+              "
+              @click="selectedKind = 'clean_garbled'"
+            >
+              <ShieldAlert class="w-3.5 h-3.5" />
+              清洗乱码
+            </button>
           </div>
 
           <div class="flex items-center gap-2 font-mono-num text-[11px]">
@@ -347,8 +379,11 @@ onUnmounted(() => {
           <template v-if="selectedKind === 'sync_total_size'">
             分批扫描 Manticore <code class="text-cyan-300">torrents</code> 表，从 <code class="text-cyan-300">file_info</code> 精确累加总字节数并回写 <code class="text-cyan-300">total_size</code>（保持原 <code class="text-slate-300">created_at / updated_at</code> 不变，不打乱入库排序）。
           </template>
-          <template v-else>
+          <template v-else-if="selectedKind === 'reclean_titles'">
             使用当前已发布的 11 阶段智能标题清洗规则，分批对存量种子重新清洗 <code class="text-cyan-300">raw_name → refine_name</code>，仅回写有变化的记录（同时保留原始时间戳，顺带补全空 <code class="text-cyan-300">total_size</code>）。
+          </template>
+          <template v-else>
+            轻量扫描存量 <code class="text-cyan-300">raw_name / refine_name</code>（跳过大体积 <code class="text-slate-300">file_info</code> 以提速），批量删除历史编码损坏/乱码记录；勾选释放 Redis 缓存后，新版爬虫在下次遇见该 Hash 时会自动按 GBK/Big5/Shift_JIS 正确解码重抓。
           </template>
         </p>
 
@@ -397,7 +432,7 @@ onUnmounted(() => {
           </label>
         </div>
 
-        <div v-else class="space-y-2.5">
+        <div v-else-if="selectedKind === 'reclean_titles'" class="space-y-2.5">
           <div class="grid grid-cols-1 sm:grid-cols-2 gap-3 items-end">
             <div>
               <label class="text-[11px] text-slate-400 block mb-1">标题清洗范围</label>
@@ -415,6 +450,29 @@ onUnmounted(() => {
               <label class="inline-flex items-center gap-1.5 cursor-pointer select-none">
                 <input v-model="form.dry_run" type="checkbox" class="obs-checkbox" />
                 <span class="text-amber-300">预演模式 (Dry Run)</span>
+              </label>
+            </div>
+          </div>
+        </div>
+
+        <div v-else class="space-y-2.5">
+          <div class="grid grid-cols-1 sm:grid-cols-2 gap-3 items-end">
+            <div>
+              <label class="text-[11px] text-slate-400 block mb-1">乱码判定严格度</label>
+              <ObsSelect
+                v-model="form.garbled_mode"
+                :options="GARBLED_MODE_OPTIONS"
+                trigger-class="px-2.5! py-1.5! text-xs!"
+              />
+            </div>
+            <div class="flex flex-wrap items-center gap-x-5 gap-y-2 text-[11px] text-slate-300 pb-1">
+              <label class="inline-flex items-center gap-1.5 cursor-pointer select-none">
+                <input v-model="form.evict_redis_indexed" type="checkbox" class="obs-checkbox" />
+                <span>释放 Redis 已索引缓存（允许重抓正常名）</span>
+              </label>
+              <label class="inline-flex items-center gap-1.5 cursor-pointer select-none">
+                <input v-model="form.dry_run" type="checkbox" class="obs-checkbox" />
+                <span class="text-amber-300">预演模式 (Dry Run · 只抽样不删库)</span>
               </label>
             </div>
           </div>
@@ -468,7 +526,7 @@ onUnmounted(() => {
           v-if="!overview || overview.tasks.length === 0"
           class="obs-inset rounded-xl py-12 text-center text-slate-500 text-xs"
         >
-          暂无异步维护任务记录，可在上方按需启动「同步文件大小」或「清洗标题」任务
+          暂无异步维护任务记录，可在上方按需启动「同步文件大小」、「清洗标题」或「清洗乱码」任务
         </div>
 
         <div v-else class="space-y-3">
@@ -484,11 +542,7 @@ onUnmounted(() => {
                 <span class="text-slate-400 font-semibold">#{{ task.id }}</span>
                 <span
                   class="px-2 py-0.5 rounded text-[10px] border"
-                  :class="
-                    task.kind === 'sync_total_size'
-                      ? 'bg-cyan-500/15 text-cyan-300 border-cyan-500/30'
-                      : 'bg-violet-500/15 text-violet-300 border-violet-500/30'
-                  "
+                  :class="taskKindBadgeClass(task.kind)"
                 >
                   {{ taskKindLabel(task.kind) }}
                 </span>
@@ -566,7 +620,8 @@ onUnmounted(() => {
                 <span class="text-slate-300">
                   已扫描 <strong class="text-slate-100">{{ fmtExact(task.scanned_count) }}</strong>
                   <template v-if="task.estimated_total > 0"> / {{ fmtExact(task.estimated_total) }}</template>
-                  · 已更新 <strong class="text-emerald-300">{{ fmtExact(task.updated_count) }}</strong>
+                  · {{ task.kind === "clean_garbled" ? (task.params.dry_run ? "预演命中" : "已删除") : "已更新" }}
+                  <strong :class="task.kind === 'clean_garbled' ? 'text-rose-300' : 'text-emerald-300'">{{ fmtExact(task.updated_count) }}</strong>
                   · 跳过 {{ fmtCount(task.skipped_count) }}
                 </span>
                 <span class="text-cyan-300 font-semibold">
@@ -633,9 +688,15 @@ onUnmounted(() => {
                 <table class="w-full text-left border-collapse text-[11px] font-mono">
                   <thead class="bg-[#0b0f17] border-b border-slate-800 text-[10px] text-slate-500">
                     <tr>
-                      <th class="px-2.5 py-1.5 whitespace-nowrap">InfoHash / 标题</th>
-                      <th class="px-2.5 py-1.5 whitespace-nowrap">修改前</th>
-                      <th class="px-2.5 py-1.5 whitespace-nowrap">修改后</th>
+                      <th class="px-2.5 py-1.5 whitespace-nowrap">
+                        {{ task.kind === "clean_garbled" ? "InfoHash / 命中原因" : "InfoHash / 标题" }}
+                      </th>
+                      <th class="px-2.5 py-1.5 whitespace-nowrap">
+                        {{ task.kind === "clean_garbled" ? "乱码标题" : "修改前" }}
+                      </th>
+                      <th class="px-2.5 py-1.5 whitespace-nowrap">
+                        {{ task.kind === "clean_garbled" ? "处理结果" : "修改后" }}
+                      </th>
                     </tr>
                   </thead>
                   <tbody class="divide-y divide-slate-800/50">

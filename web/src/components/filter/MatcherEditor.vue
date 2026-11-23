@@ -87,6 +87,7 @@ const FILE_MODE_OPTIONS = [
 
 const TITLE_PATTERNS: Array<{ value: TitlePatternKind; label: string; desc: string }> = [
   { value: "cyrillic", label: "西里尔字母标题", desc: "常见俄语推广/ spam" },
+  { value: "garbled_text", label: "编码乱码标题", desc: "含 U+FFFD 替换符 / Mojibake 乱码" },
   { value: "digits_only", label: "纯数字标题", desc: "无意义的纯编号" },
   { value: "sha1_hex", label: "40 位十六进制 Hash", desc: "纯哈希充当标题" },
   { value: "md5_hex", label: "32 位 MD5 字符串", desc: "纯哈希字符串" },

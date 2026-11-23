@@ -343,7 +343,9 @@ function focusSearchInputIfRequested() {
 }
 
 function taskKindLabel(kind: TorrentTaskItem["kind"]): string {
-  return kind === "sync_total_size" ? "同步文件大小" : "清洗标题";
+  if (kind === "sync_total_size") return "同步文件大小";
+  if (kind === "clean_garbled") return "清洗乱码";
+  return "清洗标题";
 }
 
 function formatTaskEta(secs: number | null): string {

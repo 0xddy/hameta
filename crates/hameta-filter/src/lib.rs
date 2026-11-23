@@ -14,7 +14,10 @@ pub const FILTER_ENGINE_API_VERSION: u32 = 2;
 
 pub use cleaner::{CleaningStep, CleaningTrace, TitleCleaner};
 pub use discovery::{AdDiscoveryTracker, DiscoveredAdCandidate, merge_discovered_candidates};
-pub use engine::{CompiledFilterEngine, FilterCategory, FilterOutcome, RuleHit};
+pub use engine::{
+    CompiledFilterEngine, FilterCategory, FilterOutcome, RuleHit, detect_garbled_title,
+    detect_garbled_title_strict_only,
+};
 pub use error::FilterError;
 pub use legacy::{
     ImportedFilterData, LegacyLimitsConfig, import_any_filter_json, parse_legacy_filter_json,
@@ -1498,5 +1501,72 @@ mod tests {
         assert!(opts.enable_span_ad_scoring);
         assert_eq!(opts.span_ad_threshold, 65);
         assert!(opts.enable_filename_cross_clean);
+    }
+
+    #[test]
+    fn garbled_title_detector_catches_mojibake_without_false_positives() {
+        // 真实线上反馈样本（含 U+FFFD 替换符 + GBK 误按 UTF-8 lossy 解码）
+        let with_fffd = "ԭ\u{FFFD}\u{FFFD}\u{FFFD}\u{FFFD}ƻ\u{FFFD}\u{FFFD}@\u{FFFD}ϰ\u{FFFD}Ӱ\u{FFFD}\u{FFFD}\u{FFFD}\u{FFFD}̳\u{FFFD}\u{FFFD}\u{FFFD}X-Ӣ\u{FFFD}\u{FFFD}12\u{FFFD}q\u{FFFD}\u{FFFD}Ů";
+        assert!(detect_garbled_title(with_fffd).is_some());
+        assert!(detect_garbled_title_strict_only(with_fffd).is_some());
+        // 即使去掉 U+FFFD 后残留的 GBK->UTF-8 2 字节错解怪字符也能被综合检测捕获
+        assert!(detect_garbled_title("ԭƻ@ϰӰ̳X-Ӣ12qŮ").is_some());
+        // 典型 GBK-as-Latin1 与 UTF-8-as-CP1252 / Latin1 乱码
+        assert!(detect_garbled_title("¡¾ÖÐÎÄ×ÖÄ»¡¿µçÓ°2020.rmvb").is_some());
+        assert!(detect_garbled_title("æˆ‘çš„ç”µå½±2024.mkv").is_some());
+        assert!(detect_garbled_title("ÐŸÑ€Ð¸Ð²ÐµÑ‚ Ð¼Ð¸Ñ€").is_some());
+        assert!(detect_garbled_title("bad\u{0088}control").is_some());
+
+        // 合法多语种标题零误杀
+        for clean in [
+            "流浪地球2.The.Wandering.Earth.II.2023.2160p.WEB-DL.mkv",
+            "進撃の巨人 The Final Season 完結編 [1080p].mkv",
+            "기생충 Parasite (2019) 1080p BluRay.mkv",
+            "Les Misérables - Édition Spéciale (2012) [1080p].mkv",
+            "Amélie Poulain · 2001 · Français.mkv",
+            "Überraschung für Mädchen (2023).mp4",
+            "Coração de Mãe - Edição Especial.mkv",
+            "Tiếng Việt Có Dấu 2024.mp4",
+            "Коллекция фильмов 2024.mkv",
+            "Ελληνική Ταινία 2024.mkv",
+            "Știință și Tehnologie 2024.mkv",
+        ] {
+            assert!(
+                detect_garbled_title(clean).is_none(),
+                "false positive on clean title: {clean}"
+            );
+        }
+    }
+
+    #[test]
+    fn garbled_name_gate_blocks_even_under_media_whitelist_and_defaults_true_for_legacy_json() {
+        // 1. 旧版保存的 FilterGates JSON 未含 reject_garbled_name 时默认自动开启
+        let legacy_gates: FilterGates = serde_json::from_value(json!({
+            "reject_empty_name": true
+        }))
+        .unwrap();
+        assert!(legacy_gates.reject_garbled_name);
+
+        let sample_with_fffd = "ԭ\u{FFFD}\u{FFFD}\u{FFFD}\u{FFFD}ƻ\u{FFFD}\u{FFFD}@\u{FFFD}ϰ\u{FFFD}Ӱ\u{FFFD}\u{FFFD}\u{FFFD}\u{FFFD}̳\u{FFFD}\u{FFFD}\u{FFFD}X-Ӣ\u{FFFD}\u{FFFD}12\u{FFFD}q\u{FFFD}\u{FFFD}Ů";
+
+        // 2. 即使在影视精选（含 >= 300MB 主视频白名单）下，前置门禁也能拦截 1 GB 乱码标题
+        let media_bundle = policy_preset_bundle("media_focused").unwrap();
+        let engine = CompiledFilterEngine::compile(&media_bundle).unwrap();
+        let outcome = engine.evaluate(&torrent_message(sample_with_fffd));
+        assert!(!outcome.is_accepted());
+        let hit = outcome.hit().unwrap();
+        assert_eq!(hit.category, FilterCategory::GarbledName);
+        assert_eq!(hit.rule_id, "gate:garbled_name");
+
+        // 3. 关闭门禁后可通过 TitlePatternKind::GarbledText 规则按需拦截
+        let mut policy = default_online_filter_policy();
+        policy.gates.reject_garbled_name = false;
+        let engine2 = make_engine(policy);
+        let outcome2 = engine2.evaluate(&torrent_message(sample_with_fffd));
+        assert!(!outcome2.is_accepted());
+        assert_eq!(
+            outcome2.hit().unwrap().category,
+            FilterCategory::TitlePatternPreset
+        );
     }
 }

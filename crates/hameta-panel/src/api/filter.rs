@@ -285,6 +285,7 @@ fn count_rules(bundle: &FilterBundle) -> FilterRuleCountsDto {
     let g = &bundle.policy.gates;
     let enabled_gates = [
         g.reject_empty_name,
+        g.reject_garbled_name,
         g.min_name_length.enabled,
         g.max_name_length.enabled,
         g.reject_empty_files,

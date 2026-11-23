@@ -2,7 +2,7 @@ use crate::services::ServiceRuntimePool;
 use crate::supervisor::load_published_filter_bundle;
 use anyhow::Result;
 use hameta_common::{FileInfo, TABLE_TORRENTS};
-use hameta_filter::TitleCleaner;
+use hameta_filter::{TitleCleaner, detect_garbled_title, detect_garbled_title_strict_only};
 use hameta_indexer::{
     MaintenanceTorrentDoc, ManticoreClient, normalize_file_info_value, sum_file_info_json,
 };
@@ -32,6 +32,7 @@ const BATCH_MAX_RETRIES: usize = 3;
 pub enum TorrentTaskKind {
     SyncTotalSize,
     RecleanTitles,
+    CleanGarbled,
 }
 
 impl TorrentTaskKind {
@@ -39,12 +40,14 @@ impl TorrentTaskKind {
         match self {
             Self::SyncTotalSize => "sync_total_size",
             Self::RecleanTitles => "reclean_titles",
+            Self::CleanGarbled => "clean_garbled",
         }
     }
 
     pub fn from_db_str(raw: &str) -> Self {
         match raw {
             "reclean_titles" => Self::RecleanTitles,
+            "clean_garbled" => Self::CleanGarbled,
             _ => Self::SyncTotalSize,
         }
     }
@@ -56,6 +59,16 @@ pub enum RecleanScope {
     #[default]
     All,
     EmptyOrUnchanged,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum GarbledCheckMode {
+    /// 全面检测（U+FFFD 替换符 + 控制符 + 私有区 + Latin-1/CP1252 Mojibake + GBK 错解怪字符）
+    #[default]
+    All,
+    /// 保守模式：仅检测包含 U+FFFD () / 非法控制符 / 私有区的明确损坏标题
+    StrictReplacement,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -80,6 +93,12 @@ pub struct TorrentTaskParams {
     /// `reclean_titles` 启动时记录的当前已发布过滤规则版本
     #[serde(default)]
     pub rule_version: Option<i64>,
+    /// `clean_garbled` 专用：乱码判定模式
+    #[serde(default)]
+    pub garbled_mode: GarbledCheckMode,
+    /// `clean_garbled` 专用：删库后同步清除 Redis 已索引键，允许新版爬虫重新抓取正确编码标题
+    #[serde(default = "default_true")]
+    pub evict_redis_indexed: bool,
 }
 
 impl Default for TorrentTaskParams {
@@ -93,6 +112,8 @@ impl Default for TorrentTaskParams {
             clean_scope: RecleanScope::All,
             skip_empty_result: true,
             rule_version: None,
+            garbled_mode: GarbledCheckMode::All,
+            evict_redis_indexed: true,
         }
     }
 }
@@ -171,6 +192,10 @@ pub struct CreateTorrentTaskRequest {
     pub clean_scope: RecleanScope,
     #[serde(default = "default_true")]
     pub skip_empty_result: bool,
+    #[serde(default)]
+    pub garbled_mode: GarbledCheckMode,
+    #[serde(default = "default_true")]
+    pub evict_redis_indexed: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -310,6 +335,8 @@ impl TorrentTaskManager {
             clean_scope: req.clean_scope,
             skip_empty_result: req.skip_empty_result,
             rule_version: None,
+            garbled_mode: req.garbled_mode,
+            evict_redis_indexed: req.evict_redis_indexed,
         };
         params.normalize();
 
@@ -646,6 +673,7 @@ impl TorrentTaskManager {
                 batch_limit,
                 kind == TorrentTaskKind::SyncTotalSize && params.only_missing,
                 has_total_size,
+                kind == TorrentTaskKind::CleanGarbled,
                 &cancel_token,
             )
             .await;
@@ -671,6 +699,8 @@ impl TorrentTaskManager {
             }
 
             let mut dirty_docs: Vec<MaintenanceTorrentDoc> = Vec::new();
+            let mut garbled_ids: Vec<i64> = Vec::new();
+            let mut garbled_hashes: Vec<String> = Vec::new();
             let mut batch_max_id = cursor_id;
             let mut batch_skipped: i64 = 0;
 
@@ -751,10 +781,47 @@ impl TorrentTaskManager {
                             batch_skipped += 1;
                         }
                     }
+                    TorrentTaskKind::CleanGarbled => {
+                        let check_fn = match params.garbled_mode {
+                            GarbledCheckMode::All => detect_garbled_title,
+                            GarbledCheckMode::StrictReplacement => detect_garbled_title_strict_only,
+                        };
+                        let hit_reason =
+                            check_fn(&doc.raw_name).or_else(|| check_fn(&doc.refine_name));
+                        if let Some(reason) = hit_reason {
+                            if sample_diffs.len() < MAX_SAMPLE_DIFFS {
+                                let title_preview = if !doc.raw_name.is_empty() {
+                                    doc.raw_name.clone()
+                                } else {
+                                    doc.refine_name.clone()
+                                };
+                                let action_desc = if params.dry_run {
+                                    "预演命中（待删除）"
+                                } else if params.evict_redis_indexed {
+                                    "已删除并释放 Redis 缓存（允许重抓）"
+                                } else {
+                                    "已从磁力库删除"
+                                };
+                                sample_diffs.push(TaskSampleDiff {
+                                    id: doc.id.to_string(),
+                                    info_hash: doc.info_hash.clone(),
+                                    label: format!("命中: {reason}"),
+                                    before: title_preview,
+                                    after: action_desc.to_string(),
+                                });
+                            }
+                            garbled_ids.push(doc.id);
+                            if !doc.info_hash.is_empty() {
+                                garbled_hashes.push(doc.info_hash);
+                            }
+                        } else {
+                            batch_skipped += 1;
+                        }
+                    }
                 }
             }
 
-            // 2) 非预演模式下仅把实际发生变化的文档整批回写 Manticore
+            // 2) 非预演模式下执行批量回写或批量删除乱码记录
             if !dirty_docs.is_empty() {
                 if params.dry_run {
                     updated_count += i64::try_from(dirty_docs.len()).unwrap_or(i64::MAX);
@@ -781,6 +848,37 @@ impl TorrentTaskManager {
                             }
                             error_count += 1;
                             break ("failed", Some(format!("批量回写 Manticore 失败: {err:#}")));
+                        }
+                    }
+                }
+            }
+
+            if !garbled_ids.is_empty() {
+                if params.dry_run {
+                    updated_count += i64::try_from(garbled_ids.len()).unwrap_or(i64::MAX);
+                } else {
+                    match delete_batch_with_retry(&client, &garbled_ids, &cancel_token).await {
+                        Ok(deleted) => {
+                            updated_count += i64::try_from(deleted).unwrap_or(i64::MAX);
+                            if params.evict_redis_indexed && !garbled_hashes.is_empty() {
+                                evict_redis_indexed_best_effort(&self.services, &garbled_hashes)
+                                    .await;
+                            }
+                        }
+                        Err(err) => {
+                            if cancel_token.is_cancelled() {
+                                let st = if stop_mode.load(Ordering::SeqCst) == STOP_CANCEL {
+                                    "cancelled"
+                                } else {
+                                    "paused"
+                                };
+                                break (st, None);
+                            }
+                            error_count += 1;
+                            break (
+                                "failed",
+                                Some(format!("批量删除 Manticore 乱码记录失败: {err:#}")),
+                            );
                         }
                     }
                 }
@@ -890,6 +988,7 @@ async fn fetch_batch_with_retry(
     limit: usize,
     only_zero_total_size: bool,
     has_total_size: bool,
+    lite_title_only: bool,
     cancel: &CancellationToken,
 ) -> Result<Vec<MaintenanceTorrentDoc>> {
     let mut last_err = None;
@@ -900,6 +999,7 @@ async fn fetch_batch_with_retry(
             limit,
             only_zero_total_size,
             has_total_size,
+            lite_title_only,
         )
         .await
         {
@@ -918,6 +1018,50 @@ async fn fetch_batch_with_retry(
         }
     }
     Err(last_err.unwrap_or_else(|| anyhow::anyhow!("未知 Manticore 查询错误")))
+}
+
+async fn delete_batch_with_retry(
+    client: &ManticoreClient,
+    ids: &[i64],
+    cancel: &CancellationToken,
+) -> Result<usize> {
+    let mut last_err = None;
+    for attempt in 0..BATCH_MAX_RETRIES {
+        match client.delete_by_ids(ids).await {
+            Ok(n) => return Ok(n),
+            Err(err) => {
+                last_err = Some(err);
+                if attempt + 1 < BATCH_MAX_RETRIES {
+                    let delay =
+                        Duration::from_millis(500 * u64::try_from(attempt + 1).unwrap_or(1));
+                    tokio::select! {
+                        _ = cancel.cancelled() => break,
+                        _ = tokio::time::sleep(delay) => {}
+                    }
+                }
+            }
+        }
+    }
+    Err(last_err.unwrap_or_else(|| anyhow::anyhow!("未知 Manticore 批量删除错误")))
+}
+
+async fn evict_redis_indexed_best_effort(services: &ServiceRuntimePool, hashes: &[String]) {
+    let Some((cfg, pool)) = services.redis_pool().await else {
+        return;
+    };
+    let Ok(mut conn) = pool.get().await else {
+        return;
+    };
+    let mut pipe = redis::pipe();
+    for hash in hashes {
+        let indexed_key = format!("{}{hash}", cfg.indexed_key_prefix);
+        let pending_key = format!("hameta:lock:pending:{hash}");
+        pipe.del(&indexed_key).ignore();
+        pipe.del(&pending_key).ignore();
+    }
+    if let Err(err) = pipe.query_async::<()>(&mut conn).await {
+        tracing::debug!("清洗乱码同步释放 Redis 已索引缓存失败（已忽略，不影响删库）: {err}");
+    }
 }
 
 async fn write_batch_with_retry(
@@ -955,6 +1099,7 @@ async fn fetch_batch_after_cursor(
     limit: usize,
     only_zero_total_size: bool,
     has_total_size: bool,
+    lite_title_only: bool,
 ) -> Result<Vec<MaintenanceTorrentDoc>> {
     let query = if only_zero_total_size && has_total_size {
         json!({
@@ -969,19 +1114,24 @@ async fn fetch_batch_after_cursor(
         json!({ "range": { "id": { "gt": cursor_id } } })
     };
 
-    let mut source_fields = vec![
-        "info_hash",
-        "raw_name",
-        "refine_name",
-        "file_count",
-        "file_info",
-        "hot",
-        "created_at",
-        "updated_at",
-    ];
-    if has_total_size {
-        source_fields.push("total_size");
-    }
+    let source_fields: Vec<&str> = if lite_title_only {
+        vec!["info_hash", "raw_name", "refine_name"]
+    } else {
+        let mut fields = vec![
+            "info_hash",
+            "raw_name",
+            "refine_name",
+            "file_count",
+            "file_info",
+            "hot",
+            "created_at",
+            "updated_at",
+        ];
+        if has_total_size {
+            fields.push("total_size");
+        }
+        fields
+    };
 
     let body = json!({
         "index": TABLE_TORRENTS,
@@ -1142,5 +1292,17 @@ mod tests {
         assert_eq!(dto.cursor_id, "1745280108080464937");
         assert!((dto.progress_percent - 25.0).abs() < 0.01);
         assert_eq!(dto.eta_secs, Some(15));
+    }
+
+    #[test]
+    fn clean_garbled_kind_and_params_roundtrip_compatibly() {
+        assert_eq!(
+            TorrentTaskKind::from_db_str(TorrentTaskKind::CleanGarbled.as_str()),
+            TorrentTaskKind::CleanGarbled
+        );
+        // 旧版 SQLite JSON 缺少新字段时默认回退到安全配置
+        let legacy: TorrentTaskParams = serde_json::from_str("{}").unwrap();
+        assert_eq!(legacy.garbled_mode, GarbledCheckMode::All);
+        assert!(legacy.evict_redis_indexed);
     }
 }

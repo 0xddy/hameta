@@ -127,6 +127,8 @@ impl DensityGate {
 pub struct FilterGates {
     #[serde(default = "default_true")]
     pub reject_empty_name: bool,
+    #[serde(default = "default_true")]
+    pub reject_garbled_name: bool,
     pub min_name_length: ToggleUsize,
     pub max_name_length: ToggleUsize,
     #[serde(default = "default_true")]
@@ -144,6 +146,7 @@ impl Default for FilterGates {
     fn default() -> Self {
         Self {
             reject_empty_name: true,
+            reject_garbled_name: true,
             min_name_length: ToggleUsize::off(4),
             max_name_length: ToggleUsize::off(128),
             reject_empty_files: true,
@@ -252,6 +255,7 @@ pub enum ExtensionScope {
 #[serde(rename_all = "snake_case")]
 pub enum TitlePatternKind {
     Cyrillic,
+    GarbledText,
     DigitsOnly,
     Sha1Hex,
     Md5Hex,

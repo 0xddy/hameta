@@ -90,6 +90,7 @@ function makeFallbackBundle(): FilterBundle {
       preset_id: null,
       gates: {
         reject_empty_name: true,
+        reject_garbled_name: true,
         min_name_length: { enabled: false, value: 2 },
         max_name_length: { enabled: false, value: 512 },
         reject_empty_files: true,
@@ -352,6 +353,10 @@ function applyLoadedState(st: Awaited<ReturnType<typeof getFilterState>>) {
   onlineIndexers.value = st.online_indexers;
   const activeBundle = st.draft?.bundle ?? st.published?.bundle ?? makeFallbackBundle();
   const cloned = deepClone(activeBundle);
+  cloned.policy.gates = {
+    ...makeFallbackBundle().policy.gates,
+    ...(cloned.policy.gates ?? {}),
+  };
   cloned.policy.cleaner = {
     ...makeFallbackBundle().policy.cleaner,
     ...(cloned.policy.cleaner ?? {}),
@@ -1044,7 +1049,7 @@ onMounted(async () => {
               <h3 class="text-xs font-semibold text-white">前置基础结构闸门 (Structural Gates)</h3>
               <p class="text-[11px] text-slate-400">硬性完整性保护先于一切放行/拦截策略执行</p>
             </div>
-            <span class="text-[10px] font-mono text-slate-500 uppercase tracking-wider">11 Built-in Guards</span>
+            <span class="text-[10px] font-mono text-slate-500 uppercase tracking-wider">12 Built-in Guards</span>
           </div>
 
           <div class="grid grid-cols-1 md:grid-cols-3 gap-3 text-xs">
@@ -1056,6 +1061,13 @@ onMounted(async () => {
               <label class="flex items-center gap-2 text-slate-200 cursor-pointer">
                 <input v-model="bundle.policy.gates.reject_empty_name" type="checkbox" class="obs-checkbox" @change="markDirty" />
                 <span>拒绝空标题种子</span>
+              </label>
+              <label
+                class="flex items-center gap-2 text-slate-200 cursor-pointer"
+                title="拦截含 U+FFFD 替换符、控制符或典型 GBK/UTF-8 错解 Mojibake 的不可读乱码标题（先于白名单执行）"
+              >
+                <input v-model="bundle.policy.gates.reject_garbled_name" type="checkbox" class="obs-checkbox" @change="markDirty" />
+                <span>拒绝编码乱码标题 (U+FFFD / Mojibake)</span>
               </label>
               <div class="flex items-center justify-between gap-2">
                 <label class="inline-flex items-center gap-2 text-slate-300 cursor-pointer">

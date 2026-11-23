@@ -276,6 +276,7 @@ fn convert_mixed_to_v2(
     // 1. 门禁转换
     let mut gates = FilterGates {
         reject_empty_name: true,
+        reject_garbled_name: true,
         min_name_length: if mixed.limits.min_name_length > 0 {
             ToggleUsize::on(mixed.limits.min_name_length)
         } else {
