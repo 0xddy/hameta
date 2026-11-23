@@ -673,6 +673,77 @@ async fn console_ingest_stream_replays_resumes_and_filters_live_events() {
     .await;
     assert!(live_chunk.contains("id: 4"));
     assert!(live_chunk.contains("dddddddddddddddddddddddddddddddddddddddd"));
+    drop(resume_sse);
+
+    // 4) SSE max_eps=2 服务端限流与 lagged(reason=rate_limit) 上报验证
+    let mut throttled_sse = client
+        .get(format!(
+            "http://{addr}/api/v1/console/ingest-stream?replay=0&event_type=indexed&max_eps=2"
+        ))
+        .header(COOKIE, &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(throttled_sse.status(), StatusCode::OK);
+    let ready_frame = read_sse_until(&mut throttled_sse, "\"max_eps\":2", 3).await;
+    assert!(ready_frame.contains("event: ready"));
+
+    let burst: Vec<IngestEventItem> = (1..=5)
+        .map(|i| IngestEventItem {
+            info_hash: format!("{i:040x}"),
+            event_type: IngestEventType::Indexed,
+            worker_id: "indexer-1".to_string(),
+            manticore_id: 5000 + i,
+            batch_id: 10,
+            raw_name: format!("Burst-{i}.iso"),
+            refine_name: format!("Burst-{i}.iso"),
+            cleaned: false,
+            total_size: 1024,
+            file_count: 1,
+            files_preview: Vec::new(),
+            hot: 1,
+            hot_delta: 1,
+            latency_ms: 2,
+            updated_at: 1_763_800_010 + i,
+        })
+        .collect();
+    state.supervisor.ingest_hub().publish_batch(burst);
+
+    let first_window = read_sse_until(&mut throttled_sse, &format!("{:040x}", 2), 3).await;
+    assert!(first_window.contains(&format!("{:040x}", 1)));
+    assert!(first_window.contains(&format!("{:040x}", 2)));
+
+    // 跨过 1 秒限流窗口后再推第 6 条，应先收到 skipped=3 的 lagged 帧，再收到第 6 条，且第 3~5 条被限流丢弃
+    tokio::time::sleep(Duration::from_millis(1_050)).await;
+    state
+        .supervisor
+        .ingest_hub()
+        .publish_batch(vec![IngestEventItem {
+            info_hash: format!("{:040x}", 6),
+            event_type: IngestEventType::Indexed,
+            worker_id: "indexer-1".to_string(),
+            manticore_id: 5006,
+            batch_id: 11,
+            raw_name: "Burst-6.iso".to_string(),
+            refine_name: "Burst-6.iso".to_string(),
+            cleaned: false,
+            total_size: 1024,
+            file_count: 1,
+            files_preview: Vec::new(),
+            hot: 1,
+            hot_delta: 1,
+            latency_ms: 2,
+            updated_at: 1_763_800_020,
+        }]);
+    let second_window = read_sse_until(&mut throttled_sse, &format!("{:040x}", 6), 3).await;
+    assert!(second_window.contains("event: lagged"));
+    assert!(second_window.contains("\"reason\":\"rate_limit\""));
+    assert!(second_window.contains("\"skipped\":3"));
+    assert!(second_window.contains(&format!("{:040x}", 6)));
+    assert!(!second_window.contains(&format!("{:040x}", 3)));
+    assert!(!second_window.contains(&format!("{:040x}", 4)));
+    assert!(!second_window.contains(&format!("{:040x}", 5)));
+    drop(throttled_sse);
 
     srv_cancel.cancel();
     state.supervisor.shutdown_all().await;

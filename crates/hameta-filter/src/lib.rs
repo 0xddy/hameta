@@ -787,7 +787,44 @@ mod tests {
                 false,
                 torrent_message_with_file("www.example.com", "movie.mkv", 200 * 1024 * 1024),
             ),
+            // 正常正片 + 夹带小广告 mp4（< 10 MiB）应由 AtLeastOneMatched 放行，避免误杀
+            (
+                true,
+                torrent_message_with_files(
+                    "Normal.Movie.2026.1080p",
+                    vec![
+                        ("【mitaocang.com】视频1.mp4", 8_982_559),
+                        ("Normal.Movie.2026.1080p.mp4", 1_500_000_000),
+                    ],
+                ),
+            ),
+            // 全是小广告视频（所有视频均 < 10 MiB）仍应拦截
+            (
+                false,
+                torrent_message_with_files(
+                    "Only.Ad.Clips.Pack",
+                    vec![
+                        ("【mitaocang.com】视频1.mp4", 8_982_559),
+                        ("【mitaocang.com】视频2.mp4", 3_000_000),
+                    ],
+                ),
+            ),
         ];
+
+        // 验证默认预设整词边界不再误伤常见英文片名子串
+        for ok_title in [
+            "Hacksaw.Ridge.2016.1080p.BluRay",
+            "The.Nutcracker.2018.1080p",
+            "Dispatch.2025.WEB-DL.1080p",
+            "Bookworm.2024.1080p",
+        ] {
+            let msg = torrent_message_with_file(ok_title, "main_feature.mkv", 1_200_000_000);
+            assert!(
+                online_engine.is_valid(&msg),
+                "online_standard should not falsely reject normal title `{ok_title}`: {:?}",
+                online_engine.evaluate(&msg)
+            );
+        }
 
         for (idx, (expected_accept, msg)) in matrix.iter().enumerate() {
             let r1 = online_engine.is_valid(msg);

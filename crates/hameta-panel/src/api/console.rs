@@ -10,11 +10,12 @@ use hameta_common::IngestEventType;
 use serde::{Deserialize, Serialize};
 use std::convert::Infallible;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const DEFAULT_RECENT_LIMIT: usize = 100;
 const MAX_RECENT_LIMIT: usize = 500;
 const DEFAULT_SSE_REPLAY: usize = 50;
+const MAX_SSE_EPS: u32 = 200;
 
 #[derive(Debug, Deserialize)]
 pub struct ConsoleRecentQuery {
@@ -34,6 +35,19 @@ pub struct ConsoleStreamQuery {
     pub event_type: Option<String>,
     pub worker_id: Option<String>,
     pub replay: Option<usize>,
+    pub max_eps: Option<u32>,
+}
+
+struct StreamUnfoldState {
+    rx: tokio::sync::broadcast::Receiver<ConsoleIngestEvent>,
+    last_sent_seq: u64,
+    event_type: Option<IngestEventType>,
+    worker_id: Option<String>,
+    max_eps: Option<u32>,
+    window_start: Instant,
+    sent_in_window: u32,
+    throttled_dropped: u64,
+    pending_event: Option<ConsoleIngestEvent>,
 }
 
 pub async fn console_recent_handler(
@@ -80,6 +94,10 @@ pub async fn console_ingest_stream_handler(
     let hub = state.supervisor.ingest_hub();
     let event_type = parse_event_type_filter(query.event_type.as_deref());
     let worker_id = normalize_worker_filter(query.worker_id.as_deref());
+    let max_eps = query
+        .max_eps
+        .filter(|&v| v > 0)
+        .map(|v| v.clamp(1, MAX_SSE_EPS));
     let last_event_id = parse_last_event_id(&headers);
     let replay_limit = if last_event_id.is_some() {
         MAX_RECENT_LIMIT
@@ -111,6 +129,7 @@ pub async fn console_ingest_stream_handler(
         "ring_len": stats.ring_len,
         "ring_capacity": stats.ring_capacity,
         "resumed_from": last_event_id,
+        "max_eps": max_eps,
     });
     let ready_event = Event::default()
         .event("ready")
@@ -127,43 +146,85 @@ pub async fn console_ingest_stream_handler(
     }
     let head = stream::iter(initial_frames);
 
-    let tail = stream::unfold(
-        (rx, last_sent_seq, event_type, worker_id),
-        |(mut rx, mut last_sent_seq, event_type, worker_id)| async move {
-            loop {
-                match rx.recv().await {
-                    Ok(ev) => {
-                        if ev.seq <= last_sent_seq {
-                            continue;
-                        }
-                        if !matches_console_filters(&ev, event_type, worker_id.as_deref()) {
-                            last_sent_seq = ev.seq;
-                            continue;
-                        }
-                        last_sent_seq = ev.seq;
-                        let data = serde_json::to_string(&ev).unwrap_or_else(|_| "{}".to_string());
-                        let frame = Event::default()
-                            .id(ev.seq.to_string())
-                            .event("ingest")
-                            .data(data);
-                        return Some((
-                            Ok::<Event, Infallible>(frame),
-                            (rx, last_sent_seq, event_type, worker_id),
-                        ));
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
-                        let lag_payload = serde_json::json!({ "skipped": skipped }).to_string();
-                        let frame = Event::default().event("lagged").data(lag_payload);
-                        return Some((
-                            Ok::<Event, Infallible>(frame),
-                            (rx, last_sent_seq, event_type, worker_id),
-                        ));
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
+    let init_state = StreamUnfoldState {
+        rx,
+        last_sent_seq,
+        event_type,
+        worker_id,
+        max_eps,
+        window_start: Instant::now(),
+        sent_in_window: 0,
+        throttled_dropped: 0,
+        pending_event: None,
+    };
+
+    let tail = stream::unfold(init_state, |mut st| async move {
+        loop {
+            if let Some(ev) = st.pending_event.take() {
+                if st.max_eps.is_some() {
+                    st.sent_in_window = st.sent_in_window.saturating_add(1);
                 }
+                let data = serde_json::to_string(&ev).unwrap_or_else(|_| "{}".to_string());
+                let frame = Event::default()
+                    .id(ev.seq.to_string())
+                    .event("ingest")
+                    .data(data);
+                return Some((Ok::<Event, Infallible>(frame), st));
             }
-        },
-    );
+
+            match st.rx.recv().await {
+                Ok(ev) => {
+                    if ev.seq <= st.last_sent_seq {
+                        continue;
+                    }
+                    if !matches_console_filters(&ev, st.event_type, st.worker_id.as_deref()) {
+                        st.last_sent_seq = ev.seq;
+                        continue;
+                    }
+                    st.last_sent_seq = ev.seq;
+
+                    if let Some(cap) = st.max_eps {
+                        if st.window_start.elapsed() >= Duration::from_secs(1) {
+                            st.window_start = Instant::now();
+                            st.sent_in_window = 0;
+                            if st.throttled_dropped > 0 {
+                                let skipped = st.throttled_dropped;
+                                st.throttled_dropped = 0;
+                                st.pending_event = Some(ev);
+                                let lag_payload = serde_json::json!({
+                                    "skipped": skipped,
+                                    "reason": "rate_limit"
+                                })
+                                .to_string();
+                                let frame = Event::default().event("lagged").data(lag_payload);
+                                return Some((Ok::<Event, Infallible>(frame), st));
+                            }
+                        }
+                        if st.sent_in_window >= cap {
+                            st.throttled_dropped = st.throttled_dropped.saturating_add(1);
+                            continue;
+                        }
+                        st.sent_in_window = st.sent_in_window.saturating_add(1);
+                    }
+
+                    let data = serde_json::to_string(&ev).unwrap_or_else(|_| "{}".to_string());
+                    let frame = Event::default()
+                        .id(ev.seq.to_string())
+                        .event("ingest")
+                        .data(data);
+                    return Some((Ok::<Event, Infallible>(frame), st));
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                    let total_skipped = skipped.saturating_add(st.throttled_dropped);
+                    st.throttled_dropped = 0;
+                    let lag_payload = serde_json::json!({ "skipped": total_skipped }).to_string();
+                    let frame = Event::default().event("lagged").data(lag_payload);
+                    return Some((Ok::<Event, Infallible>(frame), st));
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
+            }
+        }
+    });
 
     let merged = futures::StreamExt::chain(head, tail);
     Sse::new(merged).keep_alive(KeepAlive::new().interval(Duration::from_secs(15)))

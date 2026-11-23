@@ -124,7 +124,7 @@ pub async fn run_indexer_worker(bootstrap: WorkerBootstrap) -> Result<()> {
         worker_cfg.clone(),
         app_stats.clone(),
     )
-    .with_ingest_reporter(bootstrap.instance_id.clone(), ingest_reporter.clone());
+    .with_ingest_reporter(bootstrap.instance_id.clone(), ingest_reporter);
     let batcher_handle = tokio::spawn(torrent_batcher.run(torrent_rx));
 
     let hot_batcher = HotBatcher::new(
@@ -132,8 +132,7 @@ pub async fn run_indexer_worker(bootstrap: WorkerBootstrap) -> Result<()> {
         streams.clone(),
         worker_cfg.clone(),
         app_stats.clone(),
-    )
-    .with_ingest_reporter(bootstrap.instance_id.clone(), ingest_reporter);
+    );
     let hot_handle = tokio::spawn(hot_batcher.run(hot_rx));
 
     let mut consumer_handles = Vec::new();

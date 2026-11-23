@@ -44,6 +44,7 @@ export interface ConsoleStreamQueryParams {
   replay?: number;
   event_type?: string;
   worker_id?: string;
+  max_eps?: number;
 }
 
 export function getConsoleRecent(params?: ConsoleStreamQueryParams): Promise<ConsoleRecentResponse> {
@@ -67,6 +68,9 @@ export function buildConsoleStreamUrl(params?: ConsoleStreamQueryParams): string
   }
   if (params?.worker_id && params.worker_id !== "all") {
     qs.set("worker_id", params.worker_id);
+  }
+  if (params?.max_eps && params.max_eps > 0) {
+    qs.set("max_eps", String(params.max_eps));
   }
   const q = qs.toString();
   return `/api/v1/console/ingest-stream${q ? `?${q}` : ""}`;

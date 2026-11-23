@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, ref, watch } from "vue";
+import { computed, onMounted, onUnmounted, ref, shallowRef, watch } from "vue";
 import { RouterLink } from "vue-router";
 import { ElMessage } from "element-plus";
 import {
@@ -31,32 +31,40 @@ const telemetry = useTelemetryStore();
 
 const streamStatus = ref<"connecting" | "live" | "paused" | "reconnecting" | "disconnected">("connecting");
 const userDisconnected = ref(false);
-const eventTypeFilter = ref<"all" | "indexed" | "hot_updated" | "cleaned">("all");
+const eventTypeFilter = ref<"all" | "cleaned">("all");
 const workerFilter = ref<string>("all");
 const keywordFilter = ref("");
-const maxBuffer = ref<number>(300);
+const maxBuffer = ref<number>(500);
+const maxEps = ref<number>(15);
 const viewMode = ref<"table" | "terminal">("table");
 const paused = ref(false);
 
 const MAX_BUFFER_OPTIONS = [
-  { label: "缓冲 100 条", value: 100 },
-  { label: "缓冲 300 条", value: 300 },
+  { label: "缓冲 200 条", value: 200 },
   { label: "缓冲 500 条", value: 500 },
+  { label: "缓冲 1000 条", value: 1000 },
 ];
 
-const TYPE_FILTER_PILLS: Array<{ key: "all" | "indexed" | "hot_updated" | "cleaned"; label: string }> = [
-  { key: "all", label: "全部" },
-  { key: "indexed", label: "新入库" },
-  { key: "hot_updated", label: "热度更新" },
+const MAX_EPS_OPTIONS = [
+  { label: "流控 5/s", value: 5 },
+  { label: "流控 15/s", value: 15 },
+  { label: "流控 30/s", value: 30 },
+  { label: "流控 60/s", value: 60 },
+  { label: "不限速", value: 0 },
+];
+
+const TYPE_FILTER_PILLS: Array<{ key: "all" | "cleaned"; label: string }> = [
+  { key: "all", label: "全部新入库" },
   { key: "cleaned", label: "已清洗标题" },
 ];
 
-const events = ref<ConsoleIngestEvent[]>([]);
-const pendingBuffer = ref<ConsoleIngestEvent[]>([]);
+// shallowRef 避免高频入库事件触发深度响应式 Proxy 包装，大幅降低内存与 GC 压力
+const events = shallowRef<ConsoleIngestEvent[]>([]);
+const pendingCount = ref(0);
 const stats = ref<IngestHubStats>({
   latest_seq: 0,
   ring_len: 0,
-  ring_capacity: 256,
+  ring_capacity: 500,
   subscribers: 0,
   total_published: 0,
 });
@@ -68,13 +76,50 @@ const drawerVisible = ref(false);
 const drawerTorrentId = ref<number | null>(null);
 const drawerFallbackEvent = ref<ConsoleIngestEvent | null>(null);
 
-// Sliding timestamps (ms) for real-time EPS rate calculation
-const arrivalTimestamps = ref<number[]>([]);
-const nowTick = ref(Date.now());
+// 非响应式批处理队列：250ms 合批刷新（最高 4 FPS 渲染），防止高频刷屏卡死主线程
+const FLUSH_INTERVAL_MS = 250;
+let incomingQueue: ConsoleIngestEvent[] = [];
+let pendingBuffer: ConsoleIngestEvent[] = [];
+const seenSeqs = new Set<number>();
+let arrivalTimestamps: number[] = [];
+const epsRate = ref(0);
+
+// 虚拟列表状态（表格 54px 行高 / 终端 28px 行高）
+const VIEWPORT_HEIGHT = 560;
+const TABLE_ROW_HEIGHT = 54;
+const TERM_ROW_HEIGHT = 28;
+const VIRTUAL_OVERSCAN = 6;
+
+const tableScrollRef = ref<HTMLElement | null>(null);
+const termScrollRef = ref<HTMLElement | null>(null);
+const tableScrollTop = ref(0);
+const termScrollTop = ref(0);
+
+let tableScrollRaf: number | null = null;
+let termScrollRaf: number | null = null;
+
+function onTableScroll(e: Event) {
+  const el = e.target as HTMLElement;
+  if (tableScrollRaf !== null) return;
+  tableScrollRaf = window.requestAnimationFrame(() => {
+    tableScrollTop.value = el.scrollTop;
+    tableScrollRaf = null;
+  });
+}
+
+function onTermScroll(e: Event) {
+  const el = e.target as HTMLElement;
+  if (termScrollRaf !== null) return;
+  termScrollRaf = window.requestAnimationFrame(() => {
+    termScrollTop.value = el.scrollTop;
+    termScrollRaf = null;
+  });
+}
 
 let es: EventSource | null = null;
 let reconnectTimer: number | null = null;
 let reconnectAttempt = 0;
+let flushTimer: number | null = null;
 let tickTimer: number | null = null;
 
 const workerOptions = computed(() => {
@@ -92,20 +137,14 @@ const workerOptions = computed(() => {
   return opts;
 });
 
-const serverEventTypeFilter = computed(() =>
-  eventTypeFilter.value === "cleaned" ? "all" : eventTypeFilter.value,
-);
-
 const filteredEvents = computed(() => {
   const kw = keywordFilter.value.trim().toLowerCase();
-  return events.value.filter((ev) => {
+  const list = events.value;
+  if (eventTypeFilter.value === "all" && workerFilter.value === "all" && !kw) {
+    return list;
+  }
+  return list.filter((ev) => {
     if (eventTypeFilter.value === "cleaned" && !ev.cleaned) return false;
-    if (
-      (eventTypeFilter.value === "indexed" || eventTypeFilter.value === "hot_updated") &&
-      ev.event_type !== eventTypeFilter.value
-    ) {
-      return false;
-    }
     if (workerFilter.value !== "all" && ev.worker_id !== workerFilter.value) return false;
     if (kw) {
       const hay = `${ev.info_hash} ${ev.raw_name} ${ev.refine_name} ${ev.worker_id}`.toLowerCase();
@@ -113,6 +152,46 @@ const filteredEvents = computed(() => {
     }
     return true;
   });
+});
+
+const tableVirtual = computed(() => {
+  const list = filteredEvents.value;
+  const total = list.length;
+  if (total === 0) {
+    return { items: [] as ConsoleIngestEvent[], topPad: 0, bottomPad: 0 };
+  }
+  const visibleCount = Math.ceil(VIEWPORT_HEIGHT / TABLE_ROW_HEIGHT) + VIRTUAL_OVERSCAN * 2;
+  const maxStart = Math.max(0, total - visibleCount);
+  const start = Math.min(
+    maxStart,
+    Math.max(0, Math.floor(tableScrollTop.value / TABLE_ROW_HEIGHT) - VIRTUAL_OVERSCAN),
+  );
+  const end = Math.min(total, start + visibleCount);
+  return {
+    items: list.slice(start, end),
+    topPad: start * TABLE_ROW_HEIGHT,
+    bottomPad: Math.max(0, (total - end) * TABLE_ROW_HEIGHT),
+  };
+});
+
+const termVirtual = computed(() => {
+  const list = filteredEvents.value;
+  const total = list.length;
+  if (total === 0) {
+    return { items: [] as ConsoleIngestEvent[], topPad: 0, bottomPad: 0 };
+  }
+  const visibleCount = Math.ceil(VIEWPORT_HEIGHT / TERM_ROW_HEIGHT) + VIRTUAL_OVERSCAN * 2;
+  const maxStart = Math.max(0, total - visibleCount);
+  const start = Math.min(
+    maxStart,
+    Math.max(0, Math.floor(termScrollTop.value / TERM_ROW_HEIGHT) - VIRTUAL_OVERSCAN),
+  );
+  const end = Math.min(total, start + visibleCount);
+  return {
+    items: list.slice(start, end),
+    topPad: start * TERM_ROW_HEIGHT,
+    bottomPad: Math.max(0, (total - end) * TERM_ROW_HEIGHT),
+  };
 });
 
 const selectedEvent = computed<ConsoleIngestEvent | null>(() => {
@@ -123,25 +202,27 @@ const selectedEvent = computed<ConsoleIngestEvent | null>(() => {
   return filteredEvents.value[0] ?? events.value[0] ?? null;
 });
 
-const epsRate = computed(() => {
-  const cutoff = nowTick.value - 5000;
-  const recent = arrivalTimestamps.value.filter((t) => t >= cutoff);
-  return recent.length / 5;
+const indexedCount = computed(() => events.value.length);
+const cleanedCount = computed(() => {
+  let c = 0;
+  for (const e of events.value) {
+    if (e.cleaned) c += 1;
+  }
+  return c;
 });
 
-const indexedCount = computed(() => events.value.filter((e) => e.event_type === "indexed").length);
-const hotUpdatedCount = computed(() => events.value.filter((e) => e.event_type === "hot_updated").length);
-const cleanedCount = computed(() => events.value.filter((e) => e.cleaned).length);
-
 const avgLatencyMs = computed(() => {
-  if (events.value.length === 0) return 0;
-  const sum = events.value.reduce((acc, e) => acc + (e.latency_ms || 0), 0);
-  return Math.round(sum / events.value.length);
+  const list = events.value;
+  if (list.length === 0) return 0;
+  let sum = 0;
+  for (const e of list) sum += e.latency_ms || 0;
+  return Math.round(sum / list.length);
 });
 
 const p95LatencyMs = computed(() => {
-  if (events.value.length === 0) return 0;
-  const sorted = events.value.map((e) => e.latency_ms || 0).sort((a, b) => a - b);
+  const list = events.value;
+  if (list.length === 0) return 0;
+  const sorted = list.map((e) => e.latency_ms || 0).sort((a, b) => a - b);
   const idx = Math.min(sorted.length - 1, Math.floor(sorted.length * 0.95));
   return sorted[idx];
 });
@@ -179,33 +260,76 @@ function closeStream() {
   }
 }
 
-function pushIncomingEvent(ev: ConsoleIngestEvent) {
-  stats.value.latest_seq = Math.max(stats.value.latest_seq, ev.seq);
-  stats.value.total_published += 1;
-  arrivalTimestamps.value = [...arrivalTimestamps.value.slice(-199), Date.now()];
+function rebuildSeenSeqs(list: ConsoleIngestEvent[]) {
+  seenSeqs.clear();
+  for (const item of list) {
+    seenSeqs.add(item.seq);
+  }
+}
+
+function enqueueIncomingEvent(ev: ConsoleIngestEvent) {
+  if (ev.event_type !== "indexed") return;
+  if (seenSeqs.has(ev.seq)) return;
+  seenSeqs.add(ev.seq);
+
+  const now = Date.now();
+  arrivalTimestamps.push(now);
+  if (arrivalTimestamps.length > 600) {
+    arrivalTimestamps = arrivalTimestamps.slice(-300);
+  }
 
   if (paused.value) {
-    pendingBuffer.value = [ev, ...pendingBuffer.value].slice(0, maxBuffer.value);
+    pendingBuffer.push(ev);
+    if (pendingBuffer.length > maxBuffer.value) {
+      pendingBuffer = pendingBuffer.slice(pendingBuffer.length - maxBuffer.value);
+    }
+    pendingCount.value = pendingBuffer.length;
     return;
   }
 
-  if (events.value.some((x) => x.seq === ev.seq)) return;
-  events.value = [ev, ...events.value].slice(0, maxBuffer.value);
-  newestSeq.value = ev.seq;
-  if (selectedSeq.value === null) selectedSeq.value = ev.seq;
+  incomingQueue.push(ev);
+}
+
+function flushIncomingQueue() {
+  if (incomingQueue.length === 0) return;
+  const batch = incomingQueue;
+  incomingQueue = [];
+
+  // 最新事件在顶部（倒序）
+  batch.reverse();
+  const prev = events.value;
+  const merged = [...batch, ...prev].slice(0, maxBuffer.value);
+  events.value = merged;
+
+  const latest = batch[0];
+  stats.value.latest_seq = Math.max(stats.value.latest_seq, latest.seq);
+  stats.value.total_published += batch.length;
+  newestSeq.value = latest.seq;
+  if (selectedSeq.value === null) {
+    selectedSeq.value = latest.seq;
+  }
+
+  // 防止 seenSeqs 随长时间运行无限增长
+  if (seenSeqs.size > maxBuffer.value * 3) {
+    rebuildSeenSeqs(merged);
+  }
 }
 
 async function fetchInitialRecent() {
   try {
     const res = await getConsoleRecent({
       limit: Math.min(200, maxBuffer.value),
-      event_type: serverEventTypeFilter.value,
+      event_type: "indexed",
       worker_id: workerFilter.value,
     });
     stats.value = res.stats;
-    // API may return ascending or descending; keep newest first
-    const sorted = [...res.events].sort((a, b) => b.seq - a.seq).slice(0, maxBuffer.value);
+    const sorted = res.events
+      .filter((e) => e.event_type === "indexed")
+      .sort((a, b) => b.seq - a.seq)
+      .slice(0, maxBuffer.value);
+    incomingQueue = [];
     events.value = sorted;
+    rebuildSeenSeqs(sorted);
     if (sorted.length > 0 && selectedSeq.value === null) {
       selectedSeq.value = sorted[0].seq;
     }
@@ -225,8 +349,9 @@ function openStream(replay = 40) {
 
   const url = buildConsoleStreamUrl({
     replay,
-    event_type: serverEventTypeFilter.value,
+    event_type: "indexed",
     worker_id: workerFilter.value,
+    max_eps: maxEps.value > 0 ? maxEps.value : undefined,
   });
 
   const conn = new EventSource(url, { withCredentials: true });
@@ -253,7 +378,7 @@ function openStream(replay = 40) {
   conn.addEventListener("ingest", (msg: MessageEvent<string>) => {
     try {
       const ev = JSON.parse(msg.data) as ConsoleIngestEvent;
-      pushIncomingEvent(ev);
+      enqueueIncomingEvent(ev);
     } catch {
       // ignore malformed SSE frame
     }
@@ -304,30 +429,45 @@ function toggleConnection() {
 function togglePause() {
   paused.value = !paused.value;
   if (!paused.value) {
-    if (pendingBuffer.value.length > 0) {
-      const seen = new Set(events.value.map((e) => e.seq));
-      const fresh = pendingBuffer.value.filter((e) => !seen.has(e.seq));
-      events.value = [...fresh, ...events.value].slice(0, maxBuffer.value);
-      pendingBuffer.value = [];
+    if (pendingBuffer.length > 0) {
+      const batch = pendingBuffer.reverse();
+      pendingBuffer = [];
+      pendingCount.value = 0;
+      const merged = [...batch, ...events.value].slice(0, maxBuffer.value);
+      events.value = merged;
+      rebuildSeenSeqs(merged);
     }
     streamStatus.value = userDisconnected.value ? "disconnected" : es ? "live" : "connecting";
     telemetry.consoleBadge = userDisconnected.value ? "OFF" : "SSE";
   } else {
+    flushIncomingQueue();
     streamStatus.value = userDisconnected.value ? "disconnected" : "paused";
     telemetry.consoleBadge = userDisconnected.value ? "OFF" : "PAUSE";
   }
 }
 
 function clearFeed() {
+  incomingQueue = [];
+  pendingBuffer = [];
+  pendingCount.value = 0;
   events.value = [];
-  pendingBuffer.value = [];
+  seenSeqs.clear();
   selectedSeq.value = null;
+  laggedSkipped.value = 0;
+  tableScrollTop.value = 0;
+  termScrollTop.value = 0;
+  if (tableScrollRef.value) tableScrollRef.value.scrollTop = 0;
+  if (termScrollRef.value) termScrollRef.value.scrollTop = 0;
 }
 
 function resetFilters() {
   eventTypeFilter.value = "all";
   workerFilter.value = "all";
   keywordFilter.value = "";
+  tableScrollTop.value = 0;
+  termScrollTop.value = 0;
+  if (tableScrollRef.value) tableScrollRef.value.scrollTop = 0;
+  if (termScrollRef.value) termScrollRef.value.scrollTop = 0;
 }
 
 async function manualReload() {
@@ -364,13 +504,27 @@ async function handleCopy(text: string, label: string) {
   else ElMessage.warning("剪贴板复制失败");
 }
 
-watch([serverEventTypeFilter, workerFilter], () => {
+watch([workerFilter, maxEps], () => {
   void manualReload();
 });
 
+watch([eventTypeFilter, keywordFilter, viewMode], () => {
+  tableScrollTop.value = 0;
+  termScrollTop.value = 0;
+  if (tableScrollRef.value) tableScrollRef.value.scrollTop = 0;
+  if (termScrollRef.value) termScrollRef.value.scrollTop = 0;
+});
+
 watch(maxBuffer, (next) => {
-  events.value = events.value.slice(0, next);
-  pendingBuffer.value = pendingBuffer.value.slice(0, next);
+  if (events.value.length > next) {
+    const trimmed = events.value.slice(0, next);
+    events.value = trimmed;
+    rebuildSeenSeqs(trimmed);
+  }
+  if (pendingBuffer.length > next) {
+    pendingBuffer = pendingBuffer.slice(pendingBuffer.length - next);
+    pendingCount.value = pendingBuffer.length;
+  }
   if (events.value.length < next && !userDisconnected.value) {
     void fetchInitialRecent();
   }
@@ -379,17 +533,32 @@ watch(maxBuffer, (next) => {
 onMounted(async () => {
   await fetchInitialRecent();
   openStream(50);
+  flushTimer = window.setInterval(flushIncomingQueue, FLUSH_INTERVAL_MS);
   tickTimer = window.setInterval(() => {
-    nowTick.value = Date.now();
+    const cutoff = Date.now() - 5000;
+    arrivalTimestamps = arrivalTimestamps.filter((t) => t >= cutoff);
+    epsRate.value = arrivalTimestamps.length / 5;
   }, 1000);
 });
 
 onUnmounted(() => {
   closeStream();
   telemetry.consoleBadge = "SSE";
+  if (flushTimer !== null) {
+    window.clearInterval(flushTimer);
+    flushTimer = null;
+  }
   if (tickTimer !== null) {
     window.clearInterval(tickTimer);
     tickTimer = null;
+  }
+  if (tableScrollRaf !== null) {
+    window.cancelAnimationFrame(tableScrollRaf);
+    tableScrollRaf = null;
+  }
+  if (termScrollRaf !== null) {
+    window.cancelAnimationFrame(termScrollRaf);
+    termScrollRaf = null;
   }
 });
 </script>
@@ -459,7 +628,7 @@ onUnmounted(() => {
           <span class="text-xs font-normal text-slate-400">ev/s</span>
         </div>
         <div class="pt-1 border-t border-slate-800/80 font-mono-num text-[11px] text-slate-500 truncate">
-          新入库 {{ indexedCount }} · 热度 {{ hotUpdatedCount }} · 内核 {{ stats.ring_len }}/{{ stats.ring_capacity }}
+          新入库 {{ indexedCount }} · 流控 {{ maxEps > 0 ? `${maxEps}/s` : "不限" }} · 内核 {{ stats.ring_len }}/{{ stats.ring_capacity }}
         </div>
       </div>
 
@@ -490,7 +659,7 @@ onUnmounted(() => {
           {{ fmtDurMs(avgLatencyMs) }}
         </div>
         <div class="pt-1 border-t border-slate-800/80 font-mono-num text-[11px] text-slate-400 truncate">
-          P95 {{ fmtDurMs(p95LatencyMs) }} · 清洗命中 {{ cleanedCount }} 条<template v-if="laggedSkipped > 0"> · 跳过 {{ laggedSkipped }}</template>
+          P95 {{ fmtDurMs(p95LatencyMs) }} · 清洗命中 {{ cleanedCount }} 条<template v-if="laggedSkipped > 0"> · 跳过 {{ fmtCount(laggedSkipped) }}</template>
         </div>
       </div>
     </div>
@@ -510,10 +679,10 @@ onUnmounted(() => {
             <span>{{ paused ? "恢复实时" : "暂停刷屏" }}</span>
           </button>
           <span
-            v-if="paused && pendingBuffer.length > 0"
+            v-if="paused && pendingCount > 0"
             class="px-2 py-1 rounded-lg bg-amber-500/15 border border-amber-500/35 text-amber-300 font-mono-num text-[11px]"
           >
-            +{{ pendingBuffer.length }} 积压
+            +{{ pendingCount }} 积压
           </span>
           <button
             type="button"
@@ -587,12 +756,20 @@ onUnmounted(() => {
             trigger-class="px-2.5! py-1.5! text-xs!"
           />
           <ObsSelect
+            :model-value="maxEps"
+            :options="MAX_EPS_OPTIONS"
+            mono
+            class="w-32"
+            trigger-class="px-2.5! py-1.5! text-xs!"
+            @update:model-value="maxEps = Number($event) || 0"
+          />
+          <ObsSelect
             :model-value="maxBuffer"
             :options="MAX_BUFFER_OPTIONS"
             mono
             class="w-32"
             trigger-class="px-2.5! py-1.5! text-xs!"
-            @update:model-value="maxBuffer = Number($event) || 300"
+            @update:model-value="maxBuffer = Number($event) || 500"
           />
           <input
             v-model="keywordFilter"
@@ -613,25 +790,32 @@ onUnmounted(() => {
             <span class="font-mono-num text-[10px] px-1.5 py-0.5 rounded bg-cyan-500/15 text-cyan-300 border border-cyan-500/25">
               text/event-stream
             </span>
+            <span class="font-mono-num text-[10px] px-1.5 py-0.5 rounded bg-emerald-500/10 text-emerald-300/90 border border-emerald-500/20">
+              虚拟列表 · {{ maxEps > 0 ? `≤${maxEps}/s` : "不限速" }}
+            </span>
           </div>
           <div class="flex flex-wrap items-center gap-3 text-[11px]">
             <span class="font-mono-num text-slate-400">
-              显示 {{ filteredEvents.length }} / 缓冲 {{ events.length }} 条
+              渲染 {{ viewMode === "table" ? tableVirtual.items.length : termVirtual.items.length }} / 匹配 {{ filteredEvents.length }} / 缓冲 {{ events.length }} 条
             </span>
             <span class="hidden sm:inline-flex items-center gap-2 text-slate-500">
               <span class="inline-flex items-center gap-1"><span class="h-1.5 w-1.5 rounded-full bg-emerald-400"></span>NEW 新入库</span>
-              <span class="inline-flex items-center gap-1"><span class="h-1.5 w-1.5 rounded-full bg-amber-400"></span>HOT 热度更新</span>
               <span class="inline-flex items-center gap-1"><span class="h-1.5 w-1.5 rounded-full bg-cyan-400"></span>已清洗</span>
             </span>
           </div>
         </div>
 
-        <!-- Table mode -->
-        <div v-if="viewMode === 'table'" class="h-[560px] overflow-auto obs-scroll">
+        <!-- Table mode (Virtual List) -->
+        <div
+          v-if="viewMode === 'table'"
+          ref="tableScrollRef"
+          class="h-[560px] overflow-auto obs-scroll"
+          @scroll.passive="onTableScroll"
+        >
           <table class="w-full min-w-[780px] table-fixed text-left text-xs border-collapse">
             <colgroup>
               <col class="w-[100px]" />
-              <col class="w-[74px]" />
+              <col class="w-[64px]" />
               <col class="w-[132px]" />
               <col />
               <col class="w-[108px]" />
@@ -649,11 +833,14 @@ onUnmounted(() => {
                 <th class="py-2.5 pl-2 pr-4 text-right whitespace-nowrap">操作</th>
               </tr>
             </thead>
-            <tbody class="divide-y divide-slate-800/60">
+            <tbody>
+              <tr v-if="tableVirtual.topPad > 0" aria-hidden="true">
+                <td colspan="7" :style="{ height: `${tableVirtual.topPad}px`, padding: 0, border: 0 }"></td>
+              </tr>
               <tr
-                v-for="ev in filteredEvents"
+                v-for="ev in tableVirtual.items"
                 :key="ev.seq"
-                class="cursor-pointer transition"
+                class="h-[54px] border-b border-slate-800/60 cursor-pointer transition"
                 :class="[
                   selectedEvent?.seq === ev.seq ? 'console-row-selected' : 'hover:bg-slate-800/35',
                   ev.seq === newestSeq ? 'console-row-new' : '',
@@ -662,31 +849,26 @@ onUnmounted(() => {
                 @dblclick="openTorrentDetail(ev)"
               >
                 <td
-                  class="py-2.5 pl-4 pr-2 font-mono-num text-[11px] text-slate-400 whitespace-nowrap"
+                  class="py-1.5 pl-4 pr-2 font-mono-num text-[11px] text-slate-400 whitespace-nowrap"
                   :title="`#${ev.seq}`"
                 >
                   {{ formatTimeMs(ev.updated_at > 1e12 ? ev.updated_at : ev.updated_at * 1000) }}
                 </td>
-                <td class="py-2.5 px-2 whitespace-nowrap">
+                <td class="py-1.5 px-2 whitespace-nowrap">
                   <span
-                    class="px-1.5 py-0.5 rounded font-mono-num text-[10px] border whitespace-nowrap"
-                    :class="
-                      ev.event_type === 'indexed'
-                        ? 'bg-emerald-500/15 text-emerald-300 border-emerald-500/25'
-                        : 'bg-amber-500/15 text-amber-300 border-amber-500/25'
-                    "
+                    class="px-1.5 py-0.5 rounded font-mono-num text-[10px] border whitespace-nowrap bg-emerald-500/15 text-emerald-300 border-emerald-500/25"
                   >
-                    {{ ev.event_type === "indexed" ? "NEW" : `HOT +${ev.hot_delta}` }}
+                    NEW
                   </span>
                 </td>
                 <td
-                  class="py-2.5 px-2 font-mono-num text-[11px] text-cyan-300 whitespace-nowrap truncate"
+                  class="py-1.5 px-2 font-mono-num text-[11px] text-cyan-300 whitespace-nowrap truncate"
                   :title="ev.info_hash"
                 >
                   {{ ev.info_hash.slice(0, 10) }}…{{ ev.info_hash.slice(-4) }}
                 </td>
-                <td class="py-2.5 px-2 overflow-hidden">
-                  <div class="flex items-center gap-1.5 min-w-0">
+                <td class="py-1.5 px-2 overflow-hidden">
+                  <div class="flex items-center gap-1.5 min-w-0 leading-tight">
                     <span class="text-slate-100 font-medium truncate" :title="ev.raw_name">
                       {{ ev.refine_name || ev.raw_name }}
                     </span>
@@ -699,22 +881,22 @@ onUnmounted(() => {
                   </div>
                   <div
                     v-if="ev.cleaned && ev.raw_name && ev.raw_name !== ev.refine_name"
-                    class="text-[10px] text-slate-500 truncate mt-0.5"
+                    class="text-[10px] leading-tight text-slate-500 truncate mt-0.5"
                     :title="ev.raw_name"
                   >
                     原: {{ ev.raw_name }}
                   </div>
                 </td>
-                <td class="py-2.5 px-2 font-mono-num text-[11px] text-slate-200 whitespace-nowrap truncate">
+                <td class="py-1.5 px-2 font-mono-num text-[11px] text-slate-200 whitespace-nowrap truncate">
                   <span>{{ fmtBytes(ev.total_size) }}</span>
                   <span class="text-slate-600 mx-1">·</span>
                   <span class="text-slate-400">{{ fmtCount(ev.file_count) }}</span>
                 </td>
-                <td class="py-2.5 px-2 font-mono-num text-[11px] whitespace-nowrap">
+                <td class="py-1.5 px-2 font-mono-num text-[11px] whitespace-nowrap leading-tight">
                   <div class="text-slate-300 truncate" :title="ev.worker_id">{{ ev.worker_id }}</div>
                   <div class="text-[10px] text-slate-500">{{ fmtDurMs(ev.latency_ms) }}</div>
                 </td>
-                <td class="py-2.5 pl-2 pr-4 text-right whitespace-nowrap" @click.stop>
+                <td class="py-1.5 pl-2 pr-4 text-right whitespace-nowrap" @click.stop>
                   <div class="inline-flex items-center gap-1">
                     <button
                       type="button"
@@ -735,6 +917,9 @@ onUnmounted(() => {
                   </div>
                 </td>
               </tr>
+              <tr v-if="tableVirtual.bottomPad > 0" aria-hidden="true">
+                <td colspan="7" :style="{ height: `${tableVirtual.bottomPad}px`, padding: 0, border: 0 }"></td>
+              </tr>
 
               <tr v-if="filteredEvents.length === 0">
                 <td colspan="7" class="py-24 px-6 text-center text-xs">
@@ -749,7 +934,7 @@ onUnmounted(() => {
                       {{
                         events.length > 0
                           ? "请调整事件类型、Indexer 筛选条件或清空搜索关键字后查看"
-                          : "当 Indexer 子进程批量写入或更新热度至 Manticore 时，毫秒级推送将自动出现在此面板"
+                          : "当 Indexer 子进程批量写入新种至 Manticore 时，实时推送将自动出现在此面板"
                       }}
                     </p>
                     <div>
@@ -778,47 +963,51 @@ onUnmounted(() => {
           </table>
         </div>
 
-        <!-- Terminal mode -->
-        <div v-else class="console-term-viewport h-[560px] overflow-y-auto obs-scroll font-mono-num text-[11px] leading-6 p-3 space-y-0.5">
-          <div
-            v-for="ev in filteredEvents"
-            :key="ev.seq"
-            class="px-2 py-0.5 rounded flex flex-wrap items-center gap-x-2 cursor-pointer transition"
-            :class="[
-              selectedEvent?.seq === ev.seq ? 'console-row-selected text-cyan-100' : 'hover:bg-slate-800/45 text-slate-300',
-              ev.seq === newestSeq ? 'console-row-new' : '',
-            ]"
-            @click="selectedSeq = ev.seq"
-            @dblclick="openTorrentDetail(ev)"
-          >
-            <span class="text-slate-500 shrink-0">
-              {{ formatTimeMs(ev.updated_at > 1e12 ? ev.updated_at : ev.updated_at * 1000) }}
-            </span>
-            <span class="text-slate-600 shrink-0">#{{ ev.seq }}</span>
-            <span
-              class="shrink-0"
-              :class="ev.event_type === 'indexed' ? 'text-emerald-400' : 'text-amber-300'"
+        <!-- Terminal mode (Virtual List) -->
+        <div
+          v-else
+          ref="termScrollRef"
+          class="console-term-viewport h-[560px] overflow-y-auto obs-scroll font-mono-num text-[11px] px-3 py-2"
+          @scroll.passive="onTermScroll"
+        >
+          <template v-if="filteredEvents.length > 0">
+            <div v-if="termVirtual.topPad > 0" :style="{ height: `${termVirtual.topPad}px` }" aria-hidden="true"></div>
+            <div
+              v-for="ev in termVirtual.items"
+              :key="ev.seq"
+              class="h-[28px] px-2 rounded flex flex-nowrap items-center gap-x-2 overflow-hidden whitespace-nowrap cursor-pointer transition"
+              :class="[
+                selectedEvent?.seq === ev.seq ? 'console-row-selected text-cyan-100' : 'hover:bg-slate-800/45 text-slate-300',
+                ev.seq === newestSeq ? 'console-row-new' : '',
+              ]"
+              @click="selectedSeq = ev.seq"
+              @dblclick="openTorrentDetail(ev)"
             >
-              [{{ ev.event_type === "indexed" ? "NEW" : `HOT +${ev.hot_delta}` }}]
-            </span>
-            <span class="text-cyan-400 shrink-0">{{ ev.worker_id }}</span>
-            <span class="text-slate-300 shrink-0">
-              hash=<span class="text-cyan-300">{{ ev.info_hash.slice(0, 12) }}…</span>
-            </span>
-            <span class="text-slate-400 shrink-0">size={{ fmtBytes(ev.total_size) }}</span>
-            <span class="text-slate-400 shrink-0">files={{ fmtCount(ev.file_count) }}</span>
-            <span class="text-slate-500 shrink-0">{{ fmtDurMs(ev.latency_ms) }}</span>
-            <span class="text-slate-600 shrink-0">|</span>
-            <span class="text-slate-100 font-sans truncate max-w-[440px]">{{ ev.refine_name || ev.raw_name }}</span>
-            <span
-              v-if="ev.cleaned"
-              class="px-1 py-0 rounded bg-emerald-500/15 text-emerald-300 text-[10px] shrink-0"
-            >
-              已清洗
-            </span>
-          </div>
+              <span class="text-slate-500 shrink-0">
+                {{ formatTimeMs(ev.updated_at > 1e12 ? ev.updated_at : ev.updated_at * 1000) }}
+              </span>
+              <span class="text-slate-600 shrink-0">#{{ ev.seq }}</span>
+              <span class="shrink-0 text-emerald-400">[NEW]</span>
+              <span class="text-cyan-400 shrink-0">{{ ev.worker_id }}</span>
+              <span class="text-slate-300 shrink-0">
+                hash=<span class="text-cyan-300">{{ ev.info_hash.slice(0, 12) }}…</span>
+              </span>
+              <span class="text-slate-400 shrink-0">size={{ fmtBytes(ev.total_size) }}</span>
+              <span class="text-slate-400 shrink-0">files={{ fmtCount(ev.file_count) }}</span>
+              <span class="text-slate-500 shrink-0">{{ fmtDurMs(ev.latency_ms) }}</span>
+              <span class="text-slate-600 shrink-0">|</span>
+              <span class="text-slate-100 font-sans truncate min-w-0 flex-1">{{ ev.refine_name || ev.raw_name }}</span>
+              <span
+                v-if="ev.cleaned"
+                class="px-1 py-0 rounded bg-emerald-500/15 text-emerald-300 text-[10px] shrink-0"
+              >
+                已清洗
+              </span>
+            </div>
+            <div v-if="termVirtual.bottomPad > 0" :style="{ height: `${termVirtual.bottomPad}px` }" aria-hidden="true"></div>
+          </template>
 
-          <div v-if="filteredEvents.length === 0" class="py-24 text-center text-slate-500">
+          <div v-else class="py-24 text-center text-slate-500">
             Waiting for /api/v1/console/ingest-stream SSE frames...
           </div>
         </div>
@@ -838,14 +1027,9 @@ onUnmounted(() => {
               {{ formatTimeMs(selectedEvent.updated_at > 1e12 ? selectedEvent.updated_at : selectedEvent.updated_at * 1000) }}
             </span>
             <span
-              class="px-2 py-0.5 rounded font-mono-num text-[10px] border"
-              :class="
-                selectedEvent.event_type === 'hot_updated'
-                  ? 'bg-amber-500/15 text-amber-300 border-amber-500/30'
-                  : 'bg-emerald-500/15 text-emerald-300 border-emerald-500/30'
-              "
+              class="px-2 py-0.5 rounded font-mono-num text-[10px] border bg-emerald-500/15 text-emerald-300 border-emerald-500/30"
             >
-              {{ selectedEvent.event_type === "hot_updated" ? `HOT +${selectedEvent.hot_delta}` : "NEW 新入库" }}
+              NEW 新入库
             </span>
           </div>
           <span v-else class="font-mono-num text-[11px] text-slate-500">IDLE</span>
@@ -902,7 +1086,7 @@ onUnmounted(() => {
                 v-if="selectedEvent.cleaned"
                 class="px-1.5 py-0.5 rounded bg-emerald-500/15 text-emerald-300 text-[10px]"
               >
-                8 阶段清洗已生效
+                智能清洗已生效
               </span>
               <span
                 v-else

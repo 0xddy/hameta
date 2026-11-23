@@ -942,7 +942,7 @@ fn convert_custom_rules(
             matcher: RuleMatcher::FileConstraint {
                 extensions,
                 extra_regexes,
-                mode: FileConstraintMode::EveryMatched,
+                mode: FileConstraintMode::AtLeastOneMatched,
                 min_file_size: (item.min_file_size > 0).then_some(item.min_file_size),
                 max_file_size: (item.max_file_size > 0).then_some(item.max_file_size),
                 min_file_name_length: (item.min_name_length > 0).then_some(item.min_name_length),
