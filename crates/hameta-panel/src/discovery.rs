@@ -320,10 +320,8 @@ fn sanitize_http_base_url(raw: &str) -> Option<String> {
     let trimmed = raw.trim().trim_end_matches('/');
     let (scheme, rest) = if let Some(r) = trimmed.strip_prefix("http://") {
         ("http://", r)
-    } else if let Some(r) = trimmed.strip_prefix("https://") {
-        ("https://", r)
     } else {
-        return None;
+        ("https://", trimmed.strip_prefix("https://")?)
     };
     let authority = rest.split('/').next()?;
     let host_port = authority.rsplit('@').next()?;
