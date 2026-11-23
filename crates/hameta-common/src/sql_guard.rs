@@ -27,6 +27,71 @@ struct Token {
     paren_depth: usize,
 }
 
+/// 校验并规范化单条 Manticore SQL 控制台语句（放行 SELECT / SHOW / DESCRIBE / ALTER / INSERT / UPDATE / DELETE 等）：
+/// 1. 禁止空语句与分号分隔的多语句（单次执行单条 SQL，允许末尾带一个 `;`）。
+/// 2. 校验引号与 `/* ... */` 注释闭合。
+/// 3. 仅对 `SELECT` 语句检查 `LIMIT <= {max_limit}`，未显式指定顶层 `LIMIT` 时自动附加 `LIMIT {default_limit}`，防止浏览器渲染爆内存；
+///    其他语句（如 `ALTER TABLE`、`UPDATE`、`DELETE`、`SHOW`、`DESCRIBE`）原样放行。
+pub fn prepare_console_sql(
+    raw: &str,
+    default_limit: usize,
+    max_limit: usize,
+) -> Result<String, CommonError> {
+    if default_limit == 0 || default_limit > max_limit {
+        return Err(CommonError::InvalidSql(
+            "SQL 默认 LIMIT 参数配置无效".to_string(),
+        ));
+    }
+
+    let (tokens, ends_with_line_comment) = tokenize_sql(raw)?;
+    if tokens.is_empty() {
+        return Err(CommonError::InvalidSql("SQL 语句不能为空".to_string()));
+    }
+
+    let mut trimmed_end = raw.len();
+    let active_tokens: &[Token] = if let Some(last) = tokens.last()
+        && last.kind == TokenKind::Semicolon
+    {
+        trimmed_end = last.start;
+        &tokens[..tokens.len() - 1]
+    } else {
+        &tokens
+    };
+
+    if active_tokens.is_empty() {
+        return Err(CommonError::InvalidSql("SQL 语句不能为空".to_string()));
+    }
+
+    if active_tokens
+        .iter()
+        .any(|token| token.kind == TokenKind::Semicolon)
+    {
+        return Err(CommonError::InvalidSql(
+            "SQL 控制台每次仅允许执行单条语句，请勿使用分号拼接多条 SQL".to_string(),
+        ));
+    }
+
+    let leading_verb = match &active_tokens[0].kind {
+        TokenKind::Word(word) => word.as_str(),
+        _ => "",
+    };
+
+    let cleaned = raw[..trimmed_end].trim();
+    if leading_verb == "SELECT" {
+        let has_outer_limit = validate_limits(active_tokens, max_limit)?;
+        if !has_outer_limit {
+            let separator = if ends_with_line_comment && trimmed_end == raw.len() {
+                "\n"
+            } else {
+                " "
+            };
+            return Ok(format!("{cleaned}{separator}LIMIT {default_limit}"));
+        }
+    }
+
+    Ok(cleaned.to_string())
+}
+
 /// 校验并规范化只读 SQL 语句：
 /// 1. 仅放行单条 `SELECT` / `SHOW` / `DESCRIBE` / `DESC` / `EXPLAIN`。
 /// 2. 禁止分号分隔的多语句与写操作/DDL 关键字（字符串字面量与注释之外）。

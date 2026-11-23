@@ -255,3 +255,104 @@ export function downloadGeoIpMmdb(params?: {
     }),
   });
 }
+
+export interface SavedNofileConfig {
+  process_soft: number;
+  process_hard: number;
+  system_file_max: number | null;
+  system_nr_open: number | null;
+  updated_at: number;
+  updated_by: string;
+}
+
+export interface NofilePresetItem {
+  id: string;
+  label: string;
+  badge: string;
+  process_soft: number;
+  process_hard: number;
+  system_file_max: number;
+  system_nr_open: number;
+  description: string;
+}
+
+export interface WorkerNofileInfo {
+  id: string;
+  display_name: string;
+  role: "crawler" | "indexer";
+  pid: number;
+  soft_limit: number | null;
+  hard_limit: number | null;
+  open_fds: number | null;
+}
+
+export interface NofileStatusResponse {
+  platform: string;
+  supported: boolean;
+  system_supported: boolean;
+  is_root: boolean;
+  in_container: boolean;
+  can_write_sysctl: boolean;
+  can_write_limits_d: boolean;
+  panel_pid: number;
+  process_soft: number | null;
+  process_hard: number | null;
+  process_open_fds: number | null;
+  system_file_max: number | null;
+  system_nr_open: number | null;
+  system_allocated_fds: number | null;
+  sysctl_conf_path: string | null;
+  limits_conf_path: string | null;
+  sysctl_conf_exists: boolean;
+  limits_conf_exists: boolean;
+  saved_config: SavedNofileConfig | null;
+  running_workers: WorkerNofileInfo[];
+  recommended_presets: NofilePresetItem[];
+}
+
+export interface UpdateNofileRequest {
+  apply_process: boolean;
+  process_soft?: number | null;
+  process_hard?: number | null;
+  apply_to_workers: boolean;
+  persist_app_config: boolean;
+  apply_system: boolean;
+  system_file_max?: number | null;
+  system_nr_open?: number | null;
+  persist_system_files: boolean;
+}
+
+export interface WorkerNofileApplyResult {
+  id: string;
+  role: "crawler" | "indexer";
+  pid: number;
+  ok: boolean;
+  soft_limit: number | null;
+  hard_limit: number | null;
+  message: string;
+}
+
+export interface UpdateNofileResponse {
+  ok: boolean;
+  process_applied: boolean;
+  process_message: string;
+  system_applied: boolean;
+  system_message: string;
+  persisted_app_config: boolean;
+  persisted_files: string[];
+  warnings: string[];
+  manual_commands: string[];
+  worker_results: WorkerNofileApplyResult[];
+  status: NofileStatusResponse;
+}
+
+export function getNofileSettings(): Promise<NofileStatusResponse> {
+  return apiRequest<NofileStatusResponse>("/api/v1/settings/nofile");
+}
+
+export function updateNofileSettings(payload: UpdateNofileRequest): Promise<UpdateNofileResponse> {
+  return apiRequest<UpdateNofileResponse>("/api/v1/settings/nofile", {
+    method: "PUT",
+    body: JSON.stringify(payload),
+  });
+}

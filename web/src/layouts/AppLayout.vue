@@ -2,9 +2,10 @@
 import { computed, onMounted, onUnmounted, reactive, ref } from "vue";
 import { useRoute, useRouter } from "vue-router";
 import { ElMessage } from "element-plus";
-import { ChevronDown, KeyRound, LogOut, Menu, RefreshCw, Search, X } from "lucide-vue-next";
+import { ChevronDown, KeyRound, LogOut, Menu, RefreshCw, Search, SlidersHorizontal, X } from "lucide-vue-next";
 import { changePassword } from "@/api/auth";
 import { ApiError } from "@/api/client";
+import NofileLimitModal from "@/components/NofileLimitModal.vue";
 import ObsModal from "@/components/ui/ObsModal.vue";
 import { useAuthStore } from "@/stores/auth";
 import { useTelemetryStore } from "@/stores/telemetry";
@@ -427,15 +428,23 @@ onUnmounted(() => {
 
       <!-- 本机单机多进程微遥测 -->
       <div class="p-3 border-t border-slate-800/75 space-y-2.5 bg-[#090c12]">
-        <div class="flex items-center justify-between text-[11px]">
-          <span class="text-slate-500 font-mono-num">NOFILE LIMIT</span>
+        <button
+          type="button"
+          class="w-full flex items-center justify-between text-[11px] px-2 py-1.5 -mx-2 -my-1 rounded-lg hover:bg-slate-800/60 transition cursor-pointer group text-left"
+          title="点击管理操作系统与程序 File Limit (NOFILE)"
+          @click="telemetry.openNofileModal()"
+        >
+          <span class="text-slate-500 group-hover:text-slate-300 font-mono-num inline-flex items-center gap-1.5 transition">
+            <span>NOFILE LIMIT</span>
+            <SlidersHorizontal class="w-3 h-3 text-slate-600 group-hover:text-emerald-400 transition" />
+          </span>
           <span
-            class="font-mono-num text-emerald-400"
+            class="font-mono-num text-emerald-400 group-hover:text-emerald-300 transition"
             :title="snap?.kpi.system_soft_nofile != null ? fmtExact(snap.kpi.system_soft_nofile) : undefined"
           >
             {{ snap?.kpi.system_soft_nofile != null ? fmtCount(snap.kpi.system_soft_nofile) : "N/A" }}
           </span>
-        </div>
+        </button>
         <div class="space-y-1">
           <div class="flex items-center justify-between text-[11px]">
             <span class="text-slate-500">子进程总 RSS</span>
@@ -656,5 +665,11 @@ onUnmounted(() => {
         </button>
       </template>
     </ObsModal>
+
+    <!-- 文件描述符上限管理弹窗 -->
+    <NofileLimitModal
+      v-model="telemetry.nofileModalOpen"
+      @updated="telemetry.refreshSnapshot()"
+    />
   </div>
 </template>

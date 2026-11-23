@@ -7,12 +7,48 @@ use axum::http::HeaderMap;
 use chrono::{TimeZone, Utc};
 use hameta_common::{FileInfo, TorrentRecord, hash_to_id, normalize_info_hash};
 use hameta_indexer::ManticoreClient;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 use serde_json::{Value, json};
 use std::sync::Arc;
 
+fn serialize_i64_as_string<S>(value: &i64, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    serializer.serialize_str(&value.to_string())
+}
+
+fn deserialize_i64_vec_flexible<'de, D>(deserializer: D) -> Result<Vec<i64>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum IdItem {
+        Int(i64),
+        Str(String),
+    }
+
+    let raw = Vec::<IdItem>::deserialize(deserializer)?;
+    let mut out = Vec::with_capacity(raw.len());
+    for item in raw {
+        match item {
+            IdItem::Int(v) => out.push(v),
+            IdItem::Str(s) => {
+                let parsed = s
+                    .trim()
+                    .parse::<i64>()
+                    .map_err(|_| de::Error::custom(format!("无效的种子 ID: {s}")))?;
+                out.push(parsed);
+            }
+        }
+    }
+    Ok(out)
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct TorrentSummaryDto {
+    #[serde(serialize_with = "serialize_i64_as_string")]
     pub id: i64,
     pub info_hash: String,
     pub magnet_link: String,
@@ -27,6 +63,7 @@ pub struct TorrentSummaryDto {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct TorrentDetailDto {
+    #[serde(serialize_with = "serialize_i64_as_string")]
     pub id: i64,
     pub info_hash: String,
     pub magnet_link: String,
@@ -49,6 +86,8 @@ pub struct ListTorrentsQuery {
     pub max_hot: Option<i64>,
     pub min_files: Option<i64>,
     pub max_files: Option<i64>,
+    pub min_size: Option<u64>,
+    pub max_size: Option<u64>,
     pub since_ts: Option<i64>,
     pub until_ts: Option<i64>,
     pub empty_refine_only: Option<bool>,
@@ -64,6 +103,7 @@ pub struct ListTorrentsResponse {
     pub page: usize,
     pub page_size: usize,
     pub took_ms: u64,
+    pub has_total_size_column: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -95,6 +135,7 @@ pub struct DeleteTorrentQuery {
 
 #[derive(Debug, Deserialize)]
 pub struct BatchDeleteTorrentsRequest {
+    #[serde(deserialize_with = "deserialize_i64_vec_flexible")]
     pub ids: Vec<i64>,
     #[serde(default = "default_true")]
     pub keep_redis_indexed: bool,
@@ -122,6 +163,7 @@ pub fn build_manticore_search_body(
     query: &ListTorrentsQuery,
     page: usize,
     page_size: usize,
+    has_total_size: bool,
 ) -> Value {
     let mut must: Vec<Value> = Vec::new();
     let mut base_match: Option<Value> = None;
@@ -161,6 +203,23 @@ pub fn build_manticore_search_body(
         must.push(json!({ "range": { "file_count": Value::Object(r) } }));
     }
 
+    if has_total_size && (query.min_size.is_some() || query.max_size.is_some()) {
+        let mut r = serde_json::Map::new();
+        if let Some(v) = query.min_size {
+            r.insert(
+                "gte".to_string(),
+                json!(i64::try_from(v).unwrap_or(i64::MAX)),
+            );
+        }
+        if let Some(v) = query.max_size {
+            r.insert(
+                "lte".to_string(),
+                json!(i64::try_from(v).unwrap_or(i64::MAX)),
+            );
+        }
+        must.push(json!({ "range": { "total_size": Value::Object(r) } }));
+    }
+
     if query.since_ts.is_some() || query.until_ts.is_some() {
         let mut r = serde_json::Map::new();
         if let Some(v) = query.since_ts {
@@ -186,6 +245,7 @@ pub fn build_manticore_search_body(
         "created_at" => "created_at",
         "hot" => "hot",
         "file_count" => "file_count",
+        "total_size" if has_total_size => "total_size",
         _ => "updated_at",
     };
     let sort_dir = match query.sort_dir.as_deref().unwrap_or("desc") {
@@ -224,6 +284,51 @@ fn parse_files_from_source(src: &Value) -> Vec<FileInfo> {
     }
 }
 
+fn parse_stored_total_size(src: &Value) -> u64 {
+    match src.get("total_size") {
+        Some(Value::Number(n)) => n
+            .as_u64()
+            .or_else(|| n.as_i64().and_then(|v| u64::try_from(v).ok()))
+            .unwrap_or(0),
+        Some(Value::String(s)) => s.trim().parse::<u64>().unwrap_or(0),
+        _ => 0,
+    }
+}
+
+fn parse_hit_summary(hit: &Value) -> TorrentSummaryDto {
+    let id = parse_hit_id(&hit["_id"]);
+    let src = &hit["_source"];
+    let info_hash = src["info_hash"].as_str().unwrap_or_default().to_string();
+    let raw_name = src["raw_name"].as_str().unwrap_or_default().to_string();
+    let refine_name = src["refine_name"].as_str().unwrap_or_default().to_string();
+    let file_count = i32::try_from(src["file_count"].as_i64().unwrap_or(0)).unwrap_or(0);
+    let hot = i32::try_from(src["hot"].as_i64().unwrap_or(0)).unwrap_or(0);
+    let created_at = src["created_at"].as_i64().unwrap_or(0);
+    let updated_at = src["updated_at"].as_i64().unwrap_or(0);
+    // 兼容兜底：优先使用 Manticore 独立 total_size 列（免 JSON 解析），老记录为 0 时回退累加 file_info
+    let stored_size = parse_stored_total_size(src);
+    let total_size = if stored_size > 0 {
+        stored_size
+    } else {
+        parse_files_from_source(src)
+            .iter()
+            .fold(0_u64, |acc, f| acc.saturating_add(f.size))
+    };
+
+    TorrentSummaryDto {
+        id,
+        magnet_link: format!("magnet:?xt=urn:btih:{info_hash}"),
+        info_hash,
+        raw_name,
+        refine_name,
+        file_count,
+        total_size,
+        hot,
+        created_at,
+        updated_at,
+    }
+}
+
 fn parse_hit_detail(hit: &Value) -> TorrentDetailDto {
     let id = parse_hit_id(&hit["_id"]);
     let src = &hit["_source"];
@@ -235,9 +340,14 @@ fn parse_hit_detail(hit: &Value) -> TorrentDetailDto {
     let created_at = src["created_at"].as_i64().unwrap_or(0);
     let updated_at = src["updated_at"].as_i64().unwrap_or(0);
     let files = parse_files_from_source(src);
-    let total_size = files
-        .iter()
-        .fold(0_u64, |acc, f| acc.saturating_add(f.size));
+    let stored_size = parse_stored_total_size(src);
+    let total_size = if stored_size > 0 {
+        stored_size
+    } else {
+        files
+            .iter()
+            .fold(0_u64, |acc, f| acc.saturating_add(f.size))
+    };
 
     TorrentDetailDto {
         id,
@@ -333,8 +443,19 @@ pub async fn list_torrents_handler(
     let client = require_manticore(&state).await?;
     let page = query.page.unwrap_or(1).clamp(1, 1000);
     let page_size = query.page_size.unwrap_or(20).clamp(5, 100);
+    let has_total_size = client.supports_total_size().await;
 
-    let search_body = build_manticore_search_body(&query, page, page_size);
+    let wants_size_query = query.sort_by.as_deref() == Some("total_size")
+        || query.min_size.is_some()
+        || query.max_size.is_some();
+    if wants_size_query && !has_total_size {
+        return Err(ApiError::bad_request(
+            "TOTAL_SIZE_COLUMN_MISSING",
+            "当前 torrents 表尚未添加 total_size 列，请先在 SQL 终端执行: ALTER TABLE torrents ADD COLUMN total_size bigint;",
+        ));
+    }
+
+    let search_body = build_manticore_search_body(&query, page, page_size, has_total_size);
     let resp = client
         .search_json(&search_body)
         .await
@@ -351,22 +472,11 @@ pub async fn list_torrents_handler(
     let mut items = Vec::new();
     if let Some(hits) = resp["hits"]["hits"].as_array() {
         for hit in hits {
-            let detail = parse_hit_detail(hit);
-            if empty_only && !detail.refine_name.trim().is_empty() {
+            let summary = parse_hit_summary(hit);
+            if empty_only && !summary.refine_name.trim().is_empty() {
                 continue;
             }
-            items.push(TorrentSummaryDto {
-                id: detail.id,
-                info_hash: detail.info_hash,
-                magnet_link: detail.magnet_link,
-                raw_name: detail.raw_name,
-                refine_name: detail.refine_name,
-                file_count: detail.file_count,
-                total_size: detail.total_size,
-                hot: detail.hot,
-                created_at: detail.created_at,
-                updated_at: detail.updated_at,
-            });
+            items.push(summary);
         }
     }
 
@@ -377,6 +487,7 @@ pub async fn list_torrents_handler(
         page,
         page_size,
         took_ms,
+        has_total_size_column: has_total_size,
     }))
 }
 
@@ -555,7 +666,7 @@ pub async fn delete_torrent_handler(
 
     Ok(Json(json!({
         "ok": true,
-        "deleted_id": existing.id,
+        "deleted_id": existing.id.to_string(),
         "info_hash": existing.info_hash,
         "keep_redis_indexed": keep_redis
     })))
@@ -628,4 +739,105 @@ pub async fn batch_delete_torrents_handler(
         "redis_synced": hashes.len(),
         "keep_redis_indexed": req.keep_redis_indexed
     })))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn search_body_supports_total_size_sort_and_range_when_column_present() {
+        let query = ListTorrentsQuery {
+            q: None,
+            sort_by: Some("total_size".to_string()),
+            sort_dir: Some("desc".to_string()),
+            min_hot: None,
+            max_hot: None,
+            min_files: None,
+            max_files: None,
+            min_size: Some(1_073_741_824),
+            max_size: Some(10_737_418_240),
+            since_ts: None,
+            until_ts: None,
+            empty_refine_only: None,
+            page: Some(1),
+            page_size: Some(20),
+        };
+
+        let with_col = build_manticore_search_body(&query, 1, 20, true);
+        assert_eq!(with_col["sort"][0]["total_size"]["order"], "desc");
+        assert_eq!(
+            with_col["query"]["bool"]["must"][0]["range"]["total_size"]["gte"],
+            1_073_741_824_i64
+        );
+        assert_eq!(
+            with_col["query"]["bool"]["must"][0]["range"]["total_size"]["lte"],
+            10_737_418_240_i64
+        );
+
+        let without_col = build_manticore_search_body(&query, 1, 20, false);
+        assert_eq!(without_col["sort"][0]["updated_at"]["order"], "desc");
+        assert!(without_col["query"].get("match_all").is_some());
+    }
+
+    #[test]
+    fn hit_summary_uses_total_size_column_and_falls_back_to_file_info() {
+        let new_hit = json!({
+            "_id": 100,
+            "_source": {
+                "info_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "raw_name": "Movie.2026",
+                "refine_name": "Movie.2026",
+                "file_count": 2,
+                "total_size": 4_294_967_296_u64,
+                "file_info": "[]",
+                "hot": 5,
+                "created_at": 1700000000,
+                "updated_at": 1700000100
+            }
+        });
+        assert_eq!(parse_hit_summary(&new_hit).total_size, 4_294_967_296);
+
+        let legacy_hit = json!({
+            "_id": 101,
+            "_source": {
+                "info_hash": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                "raw_name": "Legacy.2025",
+                "refine_name": "Legacy.2025",
+                "file_count": 2,
+                "total_size": 0,
+                "file_info": r#"[{"path":"a.mkv","size":500},{"path":"b.srt","size":50}]"#,
+                "hot": 1,
+                "created_at": 1700000000,
+                "updated_at": 1700000100
+            }
+        });
+        assert_eq!(parse_hit_summary(&legacy_hit).total_size, 550);
+    }
+
+    #[test]
+    fn torrent_ids_serialize_and_deserialize_63bit_values_losslessly() {
+        let exact_id: i64 = 1_745_280_108_080_464_937;
+        let dto = TorrentSummaryDto {
+            id: exact_id,
+            info_hash: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+            magnet_link: "magnet:?xt=urn:btih:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+            raw_name: "Test".to_string(),
+            refine_name: "Test".to_string(),
+            file_count: 1,
+            total_size: 1024,
+            hot: 1,
+            created_at: 1700000000,
+            updated_at: 1700000000,
+        };
+        let serialized = serde_json::to_value(&dto).unwrap();
+        assert_eq!(serialized["id"], "1745280108080464937");
+
+        let batch: BatchDeleteTorrentsRequest = serde_json::from_value(json!({
+            "ids": ["1745280108080464937", 42],
+            "keep_redis_indexed": false
+        }))
+        .unwrap();
+        assert_eq!(batch.ids, vec![exact_id, 42]);
+    }
 }

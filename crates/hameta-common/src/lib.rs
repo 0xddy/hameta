@@ -32,7 +32,7 @@ pub use password::{generate_token, hash_password, hash_token, verify_password};
 pub use profiles::{
     CrawlProfileDefaults, CrawlProfileInfo, all_crawl_profiles, crawl_profile_defaults,
 };
-pub use sql_guard::{DEFAULT_SQL_LIMIT, MAX_SQL_LIMIT, validate_readonly_sql};
+pub use sql_guard::{DEFAULT_SQL_LIMIT, MAX_SQL_LIMIT, prepare_console_sql, validate_readonly_sql};
 
 #[cfg(test)]
 mod tests {
@@ -164,6 +164,33 @@ mod tests {
             )
             .is_ok()
         );
+    }
+
+    #[test]
+    fn console_sql_allows_alter_and_dml_while_enforcing_single_statement_and_select_limit() {
+        assert_eq!(
+            prepare_console_sql(
+                "  ALTER TABLE torrents ADD COLUMN total_size bigint;  ",
+                200,
+                1000
+            )
+            .unwrap(),
+            "ALTER TABLE torrents ADD COLUMN total_size bigint"
+        );
+        assert_eq!(
+            prepare_console_sql("DELETE FROM torrents WHERE id = 1;", 200, 1000).unwrap(),
+            "DELETE FROM torrents WHERE id = 1"
+        );
+        assert_eq!(
+            prepare_console_sql("SELECT * FROM torrents;", 200, 1000).unwrap(),
+            "SELECT * FROM torrents LIMIT 200"
+        );
+        assert!(prepare_console_sql("SELECT * FROM torrents LIMIT 5000", 200, 1000).is_err());
+        assert!(
+            prepare_console_sql("ALTER TABLE torrents ADD COLUMN x int; SELECT 1", 200, 1000)
+                .is_err()
+        );
+        assert!(prepare_console_sql("   ", 200, 1000).is_err());
     }
 
     #[test]

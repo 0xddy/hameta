@@ -73,7 +73,7 @@ const newestSeq = ref<number | null>(null);
 const selectedSeq = ref<number | null>(null);
 
 const drawerVisible = ref(false);
-const drawerTorrentId = ref<number | null>(null);
+const drawerTorrentId = ref<string | null>(null);
 const drawerFallbackEvent = ref<ConsoleIngestEvent | null>(null);
 
 // 非响应式批处理队列：250ms 合批刷新（最高 4 FPS 渲染），防止高频刷屏卡死主线程
@@ -493,7 +493,8 @@ function exportNdjson() {
 }
 
 function openTorrentDetail(ev: ConsoleIngestEvent) {
-  drawerTorrentId.value = ev.manticore_id > 0 ? ev.manticore_id : null;
+  const idStr = String(ev.manticore_id ?? "").trim();
+  drawerTorrentId.value = ev.info_hash || (idStr && idStr !== "0" ? idStr : null);
   drawerFallbackEvent.value = ev;
   drawerVisible.value = true;
 }

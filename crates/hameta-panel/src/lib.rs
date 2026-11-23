@@ -4,6 +4,7 @@ pub mod auth;
 pub mod discovery;
 pub mod ingest_hub;
 pub mod metrics_collector;
+pub mod nofile;
 pub mod server;
 pub mod services;
 pub mod supervisor;

@@ -418,7 +418,11 @@ async fn docker_live_setup_settings_and_crawler_to_manticore_pipeline() {
     )
     .await;
     assert_eq!(st, StatusCode::OK, "create torrent failed: {created1}");
-    let id1 = created1["id"].as_i64().unwrap();
+    let id1 = created1["id"]
+        .as_str()
+        .and_then(|s| s.parse::<i64>().ok())
+        .or_else(|| created1["id"].as_i64())
+        .unwrap();
     assert!(id1 > 0);
     assert_eq!(created1["file_count"], 2);
     assert_eq!(created1["total_size"], 2_147_549_184_u64);
@@ -534,7 +538,11 @@ async fn docker_live_setup_settings_and_crawler_to_manticore_pipeline() {
     )
     .await;
     assert_eq!(st, StatusCode::OK);
-    let id2 = created2["id"].as_i64().unwrap();
+    let id2 = created2["id"]
+        .as_str()
+        .and_then(|s| s.parse::<i64>().ok())
+        .or_else(|| created2["id"].as_i64())
+        .unwrap();
 
     let (st, del2, _) = send_json(
         &app,
@@ -570,7 +578,11 @@ async fn docker_live_setup_settings_and_crawler_to_manticore_pipeline() {
     )
     .await;
     assert_eq!(st, StatusCode::OK);
-    let id3 = c3["id"].as_i64().unwrap();
+    let id3 = c3["id"]
+        .as_str()
+        .and_then(|s| s.parse::<i64>().ok())
+        .or_else(|| c3["id"].as_i64())
+        .unwrap();
 
     let (st, c4, _) = send_json(
         &app,
@@ -587,7 +599,11 @@ async fn docker_live_setup_settings_and_crawler_to_manticore_pipeline() {
     )
     .await;
     assert_eq!(st, StatusCode::OK);
-    let id4 = c4["id"].as_i64().unwrap();
+    let id4 = c4["id"]
+        .as_str()
+        .and_then(|s| s.parse::<i64>().ok())
+        .or_else(|| c4["id"].as_i64())
+        .unwrap();
 
     let (st, batch_del, _) = send_json(
         &app,

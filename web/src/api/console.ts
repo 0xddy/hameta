@@ -12,7 +12,7 @@ export interface ConsoleIngestEvent {
   info_hash: string;
   event_type: IngestEventType;
   worker_id: string;
-  manticore_id: number;
+  manticore_id: string;
   batch_id: number;
   raw_name: string;
   refine_name: string;

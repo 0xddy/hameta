@@ -39,10 +39,12 @@ import ObsModal from "@/components/ui/ObsModal.vue";
 import ObsNumberInput from "@/components/ui/ObsNumberInput.vue";
 import ObsSelect from "@/components/ui/ObsSelect.vue";
 import { DHT_PROFILES, DHT_PROFILE_SELECT_OPTIONS, getDhtProfileLevelLabel } from "@/data/dhtProfiles";
+import { useTelemetryStore } from "@/stores/telemetry";
 import { fmtBytes, fmtCount, fmtExact, formatDateTime, fmtRate } from "@/utils/format";
 
 const route = useRoute();
 const router = useRouter();
+const telemetry = useTelemetryStore();
 
 const loading = ref(false);
 const workers = ref<WorkerSummaryItem[]>([]);
@@ -50,6 +52,12 @@ const roleFilter = ref<"all" | WorkerRole>("all");
 const actionBusyId = ref<string | null>(null);
 const profiles = ref<CrawlProfileInfo[]>([]);
 const systemSoftNofile = ref<number | null>(null);
+watch(
+  () => telemetry.snapshot?.kpi.system_soft_nofile,
+  (next) => {
+    if (next !== undefined) systemSoftNofile.value = next;
+  },
+);
 let pollTimer: number | null = null;
 
 // Create Worker Modal
@@ -695,13 +703,15 @@ onUnmounted(() => {
             <span class="h-1.5 w-1.5 rounded-full bg-emerald-400"></span>
             本机进程守护 · 异常自动拉起 · 本地安全通道
           </span>
-          <span
+          <button
             v-if="systemSoftNofile !== null"
-            class="px-2.5 py-1 rounded-lg bg-emerald-500/10 border border-emerald-500/25 text-emerald-300"
-            :title="fmtExact(systemSoftNofile)"
+            type="button"
+            class="px-2.5 py-1 rounded-lg bg-emerald-500/10 border border-emerald-500/25 text-emerald-300 hover:bg-emerald-500/20 hover:border-emerald-500/40 transition cursor-pointer"
+            :title="`当前 soft nofile: ${fmtExact(systemSoftNofile)}（点击调整）`"
+            @click="telemetry.openNofileModal()"
           >
-            soft nofile {{ fmtCount(systemSoftNofile) }}
-          </span>
+            soft nofile {{ fmtCount(systemSoftNofile) }} ✎
+          </button>
         </div>
 
         <div class="flex items-center gap-2">

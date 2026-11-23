@@ -91,6 +91,11 @@ pub fn api_v1_router() -> Router<Arc<PanelState>> {
             "/settings/geoip/download",
             post(settings::download_geoip_mmdb_handler),
         )
+        .route(
+            "/settings/nofile",
+            get(settings::get_nofile_settings_handler)
+                .put(settings::update_nofile_settings_handler),
+        )
         // Workers & DHT Profiles
         .route("/dht/profiles", get(workers::get_dht_profiles_handler))
         .route("/workers", get(workers::list_workers_handler))

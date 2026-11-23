@@ -21,8 +21,20 @@ const TEMPLATES: Array<{ label: string; sql: string }> = [
     sql: "SELECT id, info_hash, refine_name, raw_name, file_count, total_size, hot, updated_at FROM torrents ORDER BY updated_at DESC LIMIT 20;",
   },
   {
+    label: "按体积 Top 20",
+    sql: "SELECT id, info_hash, refine_name, file_count, total_size, hot, updated_at FROM torrents ORDER BY total_size DESC LIMIT 20;",
+  },
+  {
     label: "热度 Top 20",
-    sql: "SELECT id, info_hash, refine_name, file_count, total_size, hot FROM torrents ORDER BY hot DESC LIMIT 20;",
+    sql: "SELECT id, info_hash, refine_name, file_count, total_size, hot, updated_at FROM torrents ORDER BY hot DESC LIMIT 20;",
+  },
+  {
+    label: "添加 total_size 列",
+    sql: "ALTER TABLE torrents ADD COLUMN total_size bigint;",
+  },
+  {
+    label: "DESCRIBE torrents",
+    sql: "DESCRIBE torrents;",
   },
   {
     label: "SHOW TABLES",
@@ -31,10 +43,6 @@ const TEMPLATES: Array<{ label: string; sql: string }> = [
   {
     label: "SHOW TABLE torrents STATUS",
     sql: "SHOW TABLE torrents STATUS;",
-  },
-  {
-    label: "DESCRIBE torrents",
-    sql: "DESCRIBE torrents;",
   },
 ];
 
@@ -60,7 +68,7 @@ const columns = computed(() => {
 
 async function runQuery() {
   if (!sqlText.value.trim()) {
-    ElMessage.warning("请输入只读 SQL 查询语句");
+    ElMessage.warning("请输入 SQL 语句");
     return;
   }
   running.value = true;
@@ -88,9 +96,9 @@ function formatCell(v: unknown): string {
       <div class="flex flex-wrap items-center justify-between gap-2">
         <div class="flex items-center gap-2">
           <Terminal class="w-4 h-4 text-emerald-400" />
-          <h2 class="text-sm font-semibold text-white">Manticore 只读 SQL 终端</h2>
-          <span class="px-2 py-0.5 rounded-md bg-emerald-500/10 border border-emerald-500/25 text-[10px] font-mono text-emerald-300">
-            READ-ONLY SANDBOX
+          <h2 class="text-sm font-semibold text-white">Manticore SQL 终端</h2>
+          <span class="px-2 py-0.5 rounded-md bg-amber-500/10 border border-amber-500/30 text-[10px] font-mono text-amber-300">
+            FULL SQL · ADMIN
           </span>
         </div>
 
@@ -110,7 +118,7 @@ function formatCell(v: unknown): string {
       <textarea
         v-model="sqlText"
         rows="5"
-        placeholder="输入 SELECT / SHOW / DESCRIBE 语句（Ctrl + Enter 执行）"
+        placeholder="输入 Manticore SQL（支持 SELECT / SHOW / DESCRIBE / ALTER / INSERT / UPDATE / DELETE 等 · Ctrl + Enter 执行）"
         class="w-full rounded-lg bg-[#07090e] border border-slate-800 focus:border-cyan-500/60 focus:outline-none p-3 text-xs font-mono text-cyan-200 leading-relaxed obs-scroll"
         @keydown.ctrl.enter.prevent="runQuery"
         @keydown.meta.enter.prevent="runQuery"
@@ -118,7 +126,7 @@ function formatCell(v: unknown): string {
 
       <div class="flex flex-wrap items-center justify-between gap-2 text-xs">
         <span class="text-[11px] text-slate-400 font-mono">
-          只读沙箱已激活：放行 SELECT / SHOW / DESCRIBE / EXPLAIN · Ctrl+Enter 执行
+          已放行全部单条 Manticore SQL（含 ALTER / DDL / DML，SELECT 自动限制行数）· Ctrl+Enter 执行
         </span>
 
         <div class="flex items-center gap-2">
@@ -131,7 +139,7 @@ function formatCell(v: unknown): string {
           />
           <button type="button" class="obs-btn obs-btn-primary px-4! py-1.5! text-xs! inline-flex items-center gap-1.5" :disabled="running" @click="runQuery">
             <Play class="w-3.5 h-3.5" />
-            {{ running ? "执行中…" : "执行查询" }}
+            {{ running ? "执行中…" : "执行 SQL" }}
           </button>
         </div>
       </div>
@@ -207,7 +215,7 @@ function formatCell(v: unknown): string {
             </tr>
           </tbody>
         </table>
-        <div v-else class="py-12 text-center text-xs text-slate-500">查询成功，返回 0 行结果</div>
+        <div v-else class="py-12 text-center text-xs text-slate-500">执行成功（返回 0 行结果）</div>
       </div>
     </section>
   </div>

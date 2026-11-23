@@ -3,14 +3,21 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 use chrono::Utc;
 use hameta_common::{
-    ManticoreAuthMode, ManticoreServiceConfig, TABLE_TORRENTS, TorrentRecord, hash_to_id,
+    FileInfo, ManticoreAuthMode, ManticoreServiceConfig, TABLE_TORRENTS, TorrentRecord, hash_to_id,
 };
 use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderName, HeaderValue};
 use reqwest::{Client, ClientBuilder};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicI64, AtomicU8, Ordering};
 use std::time::Duration;
+
+const TOTAL_SIZE_UNKNOWN: u8 = 0;
+const TOTAL_SIZE_PRESENT: u8 = 1;
+const TOTAL_SIZE_MISSING: u8 = 2;
+const SCHEMA_REPROBE_INTERVAL_SECS: i64 = 15;
 
 const EXPECTED_TORRENTS_COLUMNS: &[&str] = &[
     "id",
@@ -35,9 +42,17 @@ pub struct ColumnSchemaInfo {
 pub struct SchemaCheckReport {
     pub table_exists: bool,
     pub compatible: bool,
+    #[serde(default)]
+    pub has_total_size: bool,
     pub columns: Vec<ColumnSchemaInfo>,
     pub missing_columns: Vec<String>,
     pub message: String,
+}
+
+#[derive(Debug, Default)]
+struct SchemaCapabilityCache {
+    total_size_state: AtomicU8,
+    checked_at_unix: AtomicI64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -53,6 +68,7 @@ pub struct TableStatusInfo {
 pub struct ManticoreClient {
     client: Client,
     base_url: String,
+    schema_cache: Arc<SchemaCapabilityCache>,
 }
 
 impl ManticoreClient {
@@ -104,11 +120,58 @@ impl ManticoreClient {
         }
 
         let client = builder.build().context("构建 Manticore HTTP 客户端失败")?;
-        Ok(Self { client, base_url })
+        Ok(Self {
+            client,
+            base_url,
+            schema_cache: Arc::new(SchemaCapabilityCache::default()),
+        })
     }
 
     pub fn base_url(&self) -> &str {
         &self.base_url
+    }
+
+    /// 清空表结构能力缓存（例如运维通过 SQL 控制台执行 `ALTER TABLE` 后调用）。
+    pub fn invalidate_schema_cache(&self) {
+        self.schema_cache
+            .total_size_state
+            .store(TOTAL_SIZE_UNKNOWN, Ordering::Relaxed);
+        self.schema_cache
+            .checked_at_unix
+            .store(0, Ordering::Relaxed);
+    }
+
+    /// 动态探测 `torrents` 表是否已包含 `total_size` 列：
+    /// - 已存在时直接走原子缓存（零额外请求）；
+    /// - 暂不存在时每 15 秒轻量重探一次，方便线上手动 `ALTER TABLE` 后免重启平滑启用。
+    pub async fn supports_total_size(&self) -> bool {
+        let state = self.schema_cache.total_size_state.load(Ordering::Relaxed);
+        if state == TOTAL_SIZE_PRESENT {
+            return true;
+        }
+        let now = Utc::now().timestamp();
+        let last = self.schema_cache.checked_at_unix.load(Ordering::Relaxed);
+        if state == TOTAL_SIZE_MISSING && now.saturating_sub(last) < SCHEMA_REPROBE_INTERVAL_SECS {
+            return false;
+        }
+
+        match self.describe_torrents().await {
+            Ok(report) if report.table_exists => {
+                let next = if report.has_total_size {
+                    TOTAL_SIZE_PRESENT
+                } else {
+                    TOTAL_SIZE_MISSING
+                };
+                self.schema_cache
+                    .total_size_state
+                    .store(next, Ordering::Relaxed);
+                self.schema_cache
+                    .checked_at_unix
+                    .store(now, Ordering::Relaxed);
+                report.has_total_size
+            }
+            _ => state == TOTAL_SIZE_PRESENT,
+        }
     }
 
     /// 只读检查 `torrents` 表是否存在及其字段是否满足锁定契约。
@@ -134,6 +197,7 @@ impl ManticoreClient {
                 return Ok(SchemaCheckReport {
                     table_exists: false,
                     compatible: false,
+                    has_total_size: false,
                     columns: Vec::new(),
                     missing_columns: EXPECTED_TORRENTS_COLUMNS
                         .iter()
@@ -149,17 +213,32 @@ impl ManticoreClient {
             ));
         }
 
-        parse_describe_response(&text)
+        let report = parse_describe_response(&text)?;
+        if report.table_exists {
+            let next = if report.has_total_size {
+                TOTAL_SIZE_PRESENT
+            } else {
+                TOTAL_SIZE_MISSING
+            };
+            self.schema_cache
+                .total_size_state
+                .store(next, Ordering::Relaxed);
+            self.schema_cache
+                .checked_at_unix
+                .store(Utc::now().timestamp(), Ordering::Relaxed);
+        }
+        Ok(report)
     }
 
     /// 仅在空库首次初始化时由运维人员显式触发，不可在 Worker 启动路径自动调用。
     pub async fn create_torrents_table_if_missing(&self) -> Result<()> {
         let create_sql = format!(
-            "CREATE TABLE IF NOT EXISTS {TABLE_TORRENTS} (info_hash string, raw_name text, refine_name text, file_count int, file_info json, hot int, created_at timestamp, updated_at timestamp) engine='columnar' ngram_len='1' ngram_chars='cjk'"
+            "CREATE TABLE IF NOT EXISTS {TABLE_TORRENTS} (info_hash string, raw_name text, refine_name text, file_count int, total_size bigint, file_info json, hot int, created_at timestamp, updated_at timestamp) engine='columnar' ngram_len='1' ngram_chars='cjk'"
         );
         self.execute_raw_sql(&create_sql)
             .await
             .with_context(|| format!("显式创建 {TABLE_TORRENTS} 表失败"))?;
+        self.invalidate_schema_cache();
         Ok(())
     }
 
@@ -271,37 +350,26 @@ impl ManticoreClient {
             return Ok(0);
         }
 
-        let mut bulk_body = String::with_capacity(records_by_id.len() * 256);
-        let mut write_count = 0_u64;
+        let include_total_size = self.supports_total_size().await;
+        let (bulk_body, write_count) = build_insert_bulk_body(&records_by_id, include_total_size);
 
-        for (id, record) in records_by_id {
-            let file_info_json =
-                serde_json::to_string(&record.file_info).unwrap_or_else(|_| "[]".to_string());
-            let action = json!({
-                "replace": {
-                    "index": TABLE_TORRENTS,
-                    "id": id,
-                    "doc": {
-                        "info_hash": record.info_hash,
-                        "raw_name": record.raw_name,
-                        "refine_name": record.refine_name.as_deref().unwrap_or(""),
-                        "file_count": record.file_count,
-                        "file_info": file_info_json,
-                        "hot": record.hot,
-                        "created_at": record.created_at.timestamp(),
-                        "updated_at": record.updated_at.timestamp(),
-                    }
-                }
-            });
-            bulk_body.push_str(&action.to_string());
-            bulk_body.push('\n');
-            write_count += 1;
+        match self.execute_bulk(&bulk_body, Some(write_count)).await {
+            Ok(()) => Ok(usize::try_from(write_count).unwrap_or(usize::MAX)),
+            Err(err) if include_total_size && is_unknown_total_size_error(&err.to_string()) => {
+                self.schema_cache
+                    .total_size_state
+                    .store(TOTAL_SIZE_MISSING, Ordering::Relaxed);
+                self.schema_cache
+                    .checked_at_unix
+                    .store(Utc::now().timestamp(), Ordering::Relaxed);
+                let (fallback_body, fallback_count) = build_insert_bulk_body(&records_by_id, false);
+                self.execute_bulk(&fallback_body, Some(fallback_count))
+                    .await
+                    .context("Manticore 批量 replace 降级重试执行失败")?;
+                Ok(usize::try_from(fallback_count).unwrap_or(usize::MAX))
+            }
+            Err(err) => Err(err).context("Manticore 批量 replace 执行失败"),
         }
-
-        self.execute_bulk(&bulk_body, Some(write_count))
-            .await
-            .context("Manticore 批量 replace 执行失败")?;
-        Ok(usize::try_from(write_count).unwrap_or(usize::MAX))
     }
 
     pub async fn batch_update_hot(&self, updates: &HashMap<String, i32>) -> Result<usize> {
@@ -324,22 +392,28 @@ impl ManticoreClient {
             return Ok(0);
         }
 
+        let include_total_size = self.supports_total_size().await;
         let mut existing_docs: HashMap<i64, ExistingHotDoc> = HashMap::new();
         let search_url = format!("{}/search", self.base_url);
+
+        let mut source_fields = vec![
+            "info_hash",
+            "raw_name",
+            "refine_name",
+            "file_count",
+            "file_info",
+            "hot",
+            "created_at",
+        ];
+        if include_total_size {
+            source_fields.push("total_size");
+        }
 
         for chunk in valid_ids.chunks(500) {
             let search_body = json!({
                 "index": TABLE_TORRENTS,
                 "query": { "in": { "id": chunk } },
-                "_source": [
-                    "info_hash",
-                    "raw_name",
-                    "refine_name",
-                    "file_count",
-                    "file_info",
-                    "hot",
-                    "created_at"
-                ],
+                "_source": source_fields,
                 "limit": chunk.len()
             });
             let resp = self
@@ -358,6 +432,14 @@ impl ManticoreClient {
                             continue;
                         }
                         let src = &hit["_source"];
+                        let file_info = normalize_file_info_value(src.get("file_info"));
+                        let stored_total_size =
+                            src.get("total_size").and_then(parse_i64_field).unwrap_or(0);
+                        let total_size = if stored_total_size > 0 {
+                            stored_total_size
+                        } else {
+                            i64::try_from(sum_file_info_json(&file_info)).unwrap_or(i64::MAX)
+                        };
                         existing_docs.insert(
                             id,
                             ExistingHotDoc {
@@ -372,7 +454,8 @@ impl ManticoreClient {
                                     .to_string(),
                                 file_count: i32::try_from(src["file_count"].as_i64().unwrap_or(0))
                                     .unwrap_or(0),
-                                file_info: normalize_file_info_value(src.get("file_info")),
+                                total_size,
+                                file_info,
                                 hot: i32::try_from(src["hot"].as_i64().unwrap_or(0)).unwrap_or(0),
                                 created_at: parse_i64_field(&src["created_at"]).unwrap_or(now_ts),
                             },
@@ -404,20 +487,24 @@ impl ManticoreClient {
                     doc.info_hash.as_str()
                 };
                 let new_hot = doc.hot.saturating_add(*increment);
+                let mut doc_map = serde_json::Map::new();
+                doc_map.insert("info_hash".to_string(), json!(info_hash));
+                doc_map.insert("raw_name".to_string(), json!(doc.raw_name));
+                doc_map.insert("refine_name".to_string(), json!(doc.refine_name));
+                doc_map.insert("file_count".to_string(), json!(doc.file_count));
+                if include_total_size {
+                    doc_map.insert("total_size".to_string(), json!(doc.total_size));
+                }
+                doc_map.insert("file_info".to_string(), json!(doc.file_info));
+                doc_map.insert("hot".to_string(), json!(new_hot));
+                doc_map.insert("created_at".to_string(), json!(doc.created_at));
+                doc_map.insert("updated_at".to_string(), json!(now_ts));
+
                 let action = json!({
                     "replace": {
                         "index": TABLE_TORRENTS,
                         "id": id,
-                        "doc": {
-                            "info_hash": info_hash,
-                            "raw_name": doc.raw_name,
-                            "refine_name": doc.refine_name,
-                            "file_count": doc.file_count,
-                            "file_info": doc.file_info,
-                            "hot": new_hot,
-                            "created_at": doc.created_at,
-                            "updated_at": now_ts
-                        }
+                        "doc": Value::Object(doc_map)
                     }
                 });
                 lines.push(action.to_string());
@@ -575,6 +662,7 @@ pub fn parse_describe_response(text: &str) -> Result<SchemaCheckReport> {
             return Ok(SchemaCheckReport {
                 table_exists: false,
                 compatible: false,
+                has_total_size: false,
                 columns: Vec::new(),
                 missing_columns: EXPECTED_TORRENTS_COLUMNS
                     .iter()
@@ -629,6 +717,7 @@ pub fn parse_describe_response(text: &str) -> Result<SchemaCheckReport> {
         .map(|col| (*col).to_string())
         .collect();
 
+    let has_total_size = present_names.contains("total_size");
     let compatible = missing_columns.is_empty();
     let message = if compatible {
         format!("{TABLE_TORRENTS} 表结构校验通过（共 {} 列）", columns.len())
@@ -642,6 +731,7 @@ pub fn parse_describe_response(text: &str) -> Result<SchemaCheckReport> {
     Ok(SchemaCheckReport {
         table_exists: true,
         compatible,
+        has_total_size,
         columns,
         missing_columns,
         message,
@@ -794,9 +884,80 @@ struct ExistingHotDoc {
     raw_name: String,
     refine_name: String,
     file_count: i32,
+    total_size: i64,
     file_info: String,
     hot: i32,
     created_at: i64,
+}
+
+fn build_insert_bulk_body(
+    records_by_id: &[(i64, &TorrentRecord)],
+    include_total_size: bool,
+) -> (String, u64) {
+    let mut bulk_body = String::with_capacity(records_by_id.len() * 256);
+    let mut write_count = 0_u64;
+
+    for (id, record) in records_by_id {
+        let file_info_json =
+            serde_json::to_string(&record.file_info).unwrap_or_else(|_| "[]".to_string());
+        let mut doc_map = serde_json::Map::new();
+        doc_map.insert("info_hash".to_string(), json!(record.info_hash));
+        doc_map.insert("raw_name".to_string(), json!(record.raw_name));
+        doc_map.insert(
+            "refine_name".to_string(),
+            json!(record.refine_name.as_deref().unwrap_or("")),
+        );
+        doc_map.insert("file_count".to_string(), json!(record.file_count));
+        if include_total_size {
+            let total_size =
+                i64::try_from(sum_file_info_slice(&record.file_info)).unwrap_or(i64::MAX);
+            doc_map.insert("total_size".to_string(), json!(total_size));
+        }
+        doc_map.insert("file_info".to_string(), json!(file_info_json));
+        doc_map.insert("hot".to_string(), json!(record.hot));
+        doc_map.insert(
+            "created_at".to_string(),
+            json!(record.created_at.timestamp()),
+        );
+        doc_map.insert(
+            "updated_at".to_string(),
+            json!(record.updated_at.timestamp()),
+        );
+
+        let action = json!({
+            "replace": {
+                "index": TABLE_TORRENTS,
+                "id": id,
+                "doc": Value::Object(doc_map)
+            }
+        });
+        bulk_body.push_str(&action.to_string());
+        bulk_body.push('\n');
+        write_count += 1;
+    }
+
+    (bulk_body, write_count)
+}
+
+fn is_unknown_total_size_error(err_text: &str) -> bool {
+    let lower = err_text.to_ascii_lowercase();
+    lower.contains("total_size")
+        && (lower.contains("unknown")
+            || lower.contains("no such")
+            || lower.contains("not found")
+            || lower.contains("unexpected"))
+}
+
+pub fn sum_file_info_slice(files: &[FileInfo]) -> u64 {
+    files
+        .iter()
+        .fold(0_u64, |acc, f| acc.saturating_add(f.size))
+}
+
+pub fn sum_file_info_json(raw: &str) -> u64 {
+    serde_json::from_str::<Vec<FileInfo>>(raw)
+        .map(|files| sum_file_info_slice(&files))
+        .unwrap_or(0)
 }
 
 fn parse_hit_id(val: &Value) -> i64 {
@@ -877,7 +1038,36 @@ mod tests {
         let report = parse_describe_response(&ok_json).unwrap();
         assert!(report.table_exists);
         assert!(report.compatible);
+        assert!(!report.has_total_size);
         assert!(report.missing_columns.is_empty());
+
+        let with_total_size_json = json!([{
+            "data": [
+                {"Field": "id", "Type": "bigint", "Properties": ""},
+                {"Field": "info_hash", "Type": "string", "Properties": ""},
+                {"Field": "raw_name", "Type": "text", "Properties": "indexed stored"},
+                {"Field": "refine_name", "Type": "text", "Properties": "indexed stored"},
+                {"Field": "file_count", "Type": "uint", "Properties": ""},
+                {"Field": "total_size", "Type": "bigint", "Properties": ""},
+                {"Field": "file_info", "Type": "json", "Properties": ""},
+                {"Field": "hot", "Type": "uint", "Properties": ""},
+                {"Field": "created_at", "Type": "timestamp", "Properties": ""},
+                {"Field": "updated_at", "Type": "timestamp", "Properties": ""}
+            ],
+            "total": 10,
+            "error": ""
+        }])
+        .to_string();
+        let report_with_sz = parse_describe_response(&with_total_size_json).unwrap();
+        assert!(report_with_sz.table_exists);
+        assert!(report_with_sz.compatible);
+        assert!(report_with_sz.has_total_size);
+        assert!(report_with_sz.missing_columns.is_empty());
+
+        assert_eq!(
+            sum_file_info_json(r#"[{"path":"a.mkv","size":100},{"path":"b.mkv","size":250}]"#),
+            350
+        );
 
         let incomplete_json = json!([{
             "data": [{"Field": "id", "Type": "bigint"}],

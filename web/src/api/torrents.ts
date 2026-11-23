@@ -6,7 +6,7 @@ export interface TorrentFileInfo {
 }
 
 export interface TorrentSummary {
-  id: number;
+  id: string;
   info_hash: string;
   magnet_link: string;
   raw_name: string;
@@ -24,12 +24,14 @@ export interface TorrentDetail extends TorrentSummary {
 
 export interface ListTorrentsQuery {
   q?: string;
-  sort_by?: "updated_at" | "created_at" | "hot" | "file_count";
+  sort_by?: "updated_at" | "created_at" | "hot" | "file_count" | "total_size";
   sort_dir?: "desc" | "asc";
   min_hot?: number;
   max_hot?: number;
   min_files?: number;
   max_files?: number;
+  min_size?: number;
+  max_size?: number;
   since_ts?: number;
   until_ts?: number;
   empty_refine_only?: boolean;
@@ -44,6 +46,7 @@ export interface ListTorrentsResponse {
   page: number;
   page_size: number;
   took_ms: number;
+  has_total_size_column?: boolean;
 }
 
 export interface CreateTorrentPayload {
@@ -64,7 +67,7 @@ export interface UpdateTorrentPayload {
 
 export interface DeleteTorrentResponse {
   ok: boolean;
-  deleted_id: number;
+  deleted_id: string;
   info_hash: string;
   keep_redis_indexed: boolean;
 }
@@ -92,6 +95,12 @@ export function listTorrents(query: ListTorrentsQuery): Promise<ListTorrentsResp
   }
   if (query.max_files !== undefined && !Number.isNaN(query.max_files)) {
     params.set("max_files", String(query.max_files));
+  }
+  if (query.min_size !== undefined && !Number.isNaN(query.min_size)) {
+    params.set("min_size", String(query.min_size));
+  }
+  if (query.max_size !== undefined && !Number.isNaN(query.max_size)) {
+    params.set("max_size", String(query.max_size));
   }
   if (query.since_ts !== undefined) params.set("since_ts", String(query.since_ts));
   if (query.until_ts !== undefined) params.set("until_ts", String(query.until_ts));
@@ -134,11 +143,11 @@ export function deleteTorrent(
 }
 
 export function batchDeleteTorrents(
-  ids: number[],
+  ids: Array<string | number>,
   keepRedisIndexed = true,
 ): Promise<BatchDeleteResponse> {
   return apiRequest<BatchDeleteResponse>("/api/v1/torrents/batch-delete", {
     method: "POST",
-    body: JSON.stringify({ ids, keep_redis_indexed: keepRedisIndexed }),
+    body: JSON.stringify({ ids: ids.map(String), keep_redis_indexed: keepRedisIndexed }),
   });
 }

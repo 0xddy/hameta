@@ -168,17 +168,24 @@ pub fn current_process_rss_bytes() -> u64 {
     }
 }
 
-/// 查询当前进程软文件描述符上限 (`RLIMIT_NOFILE`)，非 Linux 平台返回 `None`。
+/// 查询当前进程软文件描述符上限 (`RLIMIT_NOFILE`)，非 Unix 平台返回 `None`。
 pub fn current_soft_open_file_limit() -> Option<usize> {
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     {
-        let limits = std::fs::read_to_string("/proc/self/limits").ok()?;
-        limits.lines().find_map(|line| {
-            let rest = line.strip_prefix("Max open files")?;
-            rest.split_whitespace().next()?.parse().ok()
-        })
+        let mut limit = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: `limit` 已初始化并可安全传给 POSIX `getrlimit`。
+        if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } != 0 {
+            return None;
+        }
+        if limit.rlim_cur == libc::RLIM_INFINITY {
+            return None;
+        }
+        usize::try_from(limit.rlim_cur).ok()
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(unix))]
     {
         None
     }
@@ -253,11 +260,43 @@ pub enum IngestEventType {
     HotUpdated,
 }
 
+mod serde_i64_as_string {
+    use serde::{Deserialize, Deserializer, Serializer, de};
+
+    pub fn serialize<S>(value: &i64, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&value.to_string())
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<i64, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum IntOrStr {
+            Int(i64),
+            Str(String),
+        }
+
+        match IntOrStr::deserialize(deserializer)? {
+            IntOrStr::Int(v) => Ok(v),
+            IntOrStr::Str(s) => s
+                .trim()
+                .parse::<i64>()
+                .map_err(|_| de::Error::custom(format!("无效的 64 位整数 ID: {s}"))),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IngestEventItem {
     pub info_hash: String,
     pub event_type: IngestEventType,
     pub worker_id: String,
+    #[serde(with = "serde_i64_as_string")]
     pub manticore_id: i64,
     pub batch_id: u64,
     pub raw_name: String,

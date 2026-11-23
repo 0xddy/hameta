@@ -122,6 +122,8 @@ pub async fn run_panel(config: PanelConfig) -> anyhow::Result<()> {
         .await
         .with_context(|| format!("打开 SQLite 数据库失败: {}", db_path.display()))?;
 
+    crate::nofile::apply_saved_nofile_on_startup(&db).await;
+
     let services = Arc::new(ServiceRuntimePool::default());
     services.init_from_db(&db).await;
 

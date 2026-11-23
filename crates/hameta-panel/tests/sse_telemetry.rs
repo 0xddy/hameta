@@ -500,6 +500,7 @@ async fn sse_and_geoip_endpoints_require_authentication() {
         "/api/v1/globe/snapshot",
         "/api/v1/globe/stream",
         "/api/v1/settings/geoip",
+        "/api/v1/settings/nofile",
     ] {
         let resp = app
             .clone()
@@ -509,6 +510,97 @@ async fn sse_and_geoip_endpoints_require_authentication() {
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "uri={uri}");
     }
 
+    state.supervisor.shutdown_all().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn nofile_settings_get_validate_and_persist_work_end_to_end() {
+    let (app, state, cookie, dir) = setup_panel(false, false).await;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let srv_cancel = CancellationToken::new();
+    let srv_tok = srv_cancel.clone();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app)
+            .with_graceful_shutdown(async move { srv_tok.cancelled().await })
+            .await;
+    });
+
+    let client = reqwest::Client::new();
+
+    // 1) GET /api/v1/settings/nofile 返回当前平台信息、推荐档位与实时限制
+    let get_resp = client
+        .get(format!("http://{addr}/api/v1/settings/nofile"))
+        .header(COOKIE, &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(get_resp.status(), StatusCode::OK);
+    let st_json: Value = get_resp.json().await.unwrap();
+    assert_eq!(st_json["platform"], std::env::consts::OS);
+    assert!(
+        st_json["recommended_presets"]
+            .as_array()
+            .is_some_and(|arr| arr.len() >= 4)
+    );
+
+    // 2) 非法参数（soft > hard）必须被 400 拒绝
+    let bad_resp = client
+        .put(format!("http://{addr}/api/v1/settings/nofile"))
+        .header(COOKIE, &cookie)
+        .json(&json!({
+            "apply_process": true,
+            "process_soft": 524288,
+            "process_hard": 65536,
+            "apply_to_workers": false,
+            "persist_app_config": true,
+            "apply_system": false
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(bad_resp.status(), StatusCode::BAD_REQUEST);
+
+    // 3) 合法参数：在 Unix 上沿用当前 hard 避免破坏测试进程硬上限，在 Windows 上校验持久化保存与友好提示
+    let cur_hard = st_json["process_hard"].as_u64().unwrap_or(262_144);
+    let cur_soft = st_json["process_soft"]
+        .as_u64()
+        .unwrap_or(262_144)
+        .min(cur_hard)
+        .max(1_024);
+    let put_resp = client
+        .put(format!("http://{addr}/api/v1/settings/nofile"))
+        .header(COOKIE, &cookie)
+        .json(&json!({
+            "apply_process": true,
+            "process_soft": cur_soft,
+            "process_hard": cur_hard,
+            "apply_to_workers": true,
+            "persist_app_config": true,
+            "apply_system": false,
+            "persist_system_files": false
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(put_resp.status(), StatusCode::OK);
+    let put_json: Value = put_resp.json().await.unwrap();
+    assert_eq!(put_json["persisted_app_config"], true);
+    assert_eq!(
+        put_json["status"]["saved_config"]["process_soft"],
+        json!(cur_soft)
+    );
+    assert_eq!(
+        put_json["status"]["saved_config"]["process_hard"],
+        json!(cur_hard)
+    );
+    if cfg!(unix) {
+        assert_eq!(put_json["process_applied"], true);
+    }
+
+    srv_cancel.cancel();
     state.supervisor.shutdown_all().await;
     let _ = std::fs::remove_dir_all(&dir);
 }

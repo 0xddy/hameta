@@ -459,21 +459,16 @@ async fn m8_worker_diagnostics_exposes_crawler_observability_and_profile_default
 }
 
 #[tokio::test]
-async fn m8_sql_console_blocks_writes_multi_statement_and_excessive_limit() {
+async fn m8_sql_console_allows_ddl_and_blocks_multi_statement_and_excessive_limit() {
     let h = setup_test_panel().await;
 
-    let forbidden = [
-        "DELETE FROM torrents WHERE id = 1",
-        "DROP TABLE torrents",
-        "INSERT INTO torrents VALUES (1)",
-        "UPDATE torrents SET hot = 9",
-        "ALTER TABLE torrents ADD COLUMN x int",
+    let invalid = [
         "SELECT * FROM torrents; SELECT 1",
         "SELECT * FROM torrents LIMIT 5000",
         "   ",
     ];
 
-    for sql in forbidden {
+    for sql in invalid {
         let (st, body) = json_req(
             &h.app,
             "POST",
@@ -489,6 +484,20 @@ async fn m8_sql_console_blocks_writes_multi_statement_and_excessive_limit() {
         );
         assert_eq!(body["code"], "INVALID_CONFIG", "body={body}");
     }
+
+    // ALTER / DDL / DML 不再被只读校验拦截（应放行至 Manticore 执行层）
+    let (st, body) = json_req(
+        &h.app,
+        "POST",
+        "/api/v1/sql/query",
+        &h.cookie,
+        Some(json!({ "sql": "ALTER TABLE torrents ADD COLUMN total_size bigint;" })),
+    )
+    .await;
+    assert_ne!(
+        body["code"], "INVALID_CONFIG",
+        "ALTER TABLE 不应再被只读校验拦截: status={st}, body={body}"
+    );
 
     h.state.supervisor.shutdown_all().await;
     let _ = std::fs::remove_dir_all(&h.dir);

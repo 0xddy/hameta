@@ -363,16 +363,21 @@ onUnmounted(() => {
             <path :d="qpsSpark.line" fill="none" stroke="#10b981" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" />
           </svg>
         </div>
-        <div class="pt-2.5 border-t border-slate-800/80 flex flex-wrap items-center justify-between gap-2 text-[11px] font-mono-num">
-          <span class="text-slate-500">RLIMIT_NOFILE</span>
+        <button
+          type="button"
+          class="w-full pt-2.5 border-t border-slate-800/80 flex flex-wrap items-center justify-between gap-2 text-[11px] font-mono-num cursor-pointer group text-left hover:text-emerald-300 transition"
+          title="点击调整系统与程序 File Limit (NOFILE)"
+          @click="telemetry.openNofileModal()"
+        >
+          <span class="text-slate-500 group-hover:text-slate-300 transition">RLIMIT_NOFILE ✎</span>
           <span
-            class="text-slate-300"
+            class="text-slate-300 group-hover:text-emerald-300 transition"
             :title="kpi?.system_soft_nofile != null ? fmtExact(kpi.system_soft_nofile) : undefined"
           >
             {{ kpi?.system_soft_nofile != null ? fmtCount(kpi.system_soft_nofile) : "N/A" }}
             <span v-if="kpi?.system_soft_nofile != null" class="text-emerald-400">OK</span>
           </span>
-        </div>
+        </button>
       </div>
 
       <!-- 2. Manticore 入库速率 -->

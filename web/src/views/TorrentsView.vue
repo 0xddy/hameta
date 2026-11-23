@@ -41,22 +41,26 @@ const items = ref<TorrentSummary[]>([]);
 const total = ref(0);
 const totalRelation = ref("eq");
 const tookMs = ref(0);
+const hasTotalSizeColumn = ref(true);
 
 const q = ref("");
-const sortBy = ref<"updated_at" | "created_at" | "hot" | "file_count">("updated_at");
+const sortBy = ref<"updated_at" | "created_at" | "hot" | "file_count" | "total_size">("updated_at");
 const sortDir = ref<"desc" | "asc">("desc");
 const minHotText = ref("");
 const maxHotText = ref("");
 const minFilesText = ref("");
+const minSizeText = ref("");
+const maxSizeText = ref("");
+const sizeUnit = ref<"MB" | "GB">("GB");
 const emptyRefineOnly = ref(false);
 const page = ref(1);
 const pageSize = ref(20);
 
-const selectedIds = ref<Set<number>>(new Set());
+const selectedIds = ref<Set<string>>(new Set());
 
 // Detail drawer
 const detailVisible = ref(false);
-const detailId = ref<number | null>(null);
+const detailId = ref<string | null>(null);
 const detailTab = ref<"files" | "edit">("files");
 
 // Create Modal
@@ -88,8 +92,14 @@ const deleteSubmitting = ref(false);
 const SORT_OPTIONS = [
   { label: "更新时间", value: "updated_at" },
   { label: "入库时间", value: "created_at" },
+  { label: "总体积", value: "total_size" },
   { label: "热度", value: "hot" },
   { label: "文件数", value: "file_count" },
+];
+
+const SIZE_UNIT_OPTIONS = [
+  { label: "MB", value: "MB" },
+  { label: "GB", value: "GB" },
 ];
 
 const SORT_DIR_OPTIONS = [
@@ -110,12 +120,23 @@ function parseOptionalInt(raw: string): number | undefined {
   return Number.isFinite(n) && n >= 0 ? Math.floor(n) : undefined;
 }
 
+function parseOptionalSizeBytes(raw: string): number | undefined {
+  const s = raw.trim();
+  if (!s) return undefined;
+  const n = Number(s);
+  if (!Number.isFinite(n) || n < 0) return undefined;
+  const mul = sizeUnit.value === "GB" ? 1024 * 1024 * 1024 : 1024 * 1024;
+  return Math.floor(n * mul);
+}
+
 const hasActiveFilters = computed(
   () =>
     q.value.trim() !== "" ||
     minHotText.value.trim() !== "" ||
     maxHotText.value.trim() !== "" ||
     minFilesText.value.trim() !== "" ||
+    minSizeText.value.trim() !== "" ||
+    maxSizeText.value.trim() !== "" ||
     emptyRefineOnly.value,
 );
 
@@ -128,7 +149,7 @@ const allPageSelected = computed(() => {
 
 const selectedCount = computed(() => selectedIds.value.size);
 
-function toggleRowSelect(id: number) {
+function toggleRowSelect(id: string) {
   const next = new Set(selectedIds.value);
   if (next.has(id)) next.delete(id);
   else next.add(id);
@@ -156,6 +177,8 @@ async function fetchList(preserveSelection = false) {
       min_hot: parseOptionalInt(minHotText.value),
       max_hot: parseOptionalInt(maxHotText.value),
       min_files: parseOptionalInt(minFilesText.value),
+      min_size: parseOptionalSizeBytes(minSizeText.value),
+      max_size: parseOptionalSizeBytes(maxSizeText.value),
       empty_refine_only: emptyRefineOnly.value || undefined,
       page: page.value,
       page_size: pageSize.value,
@@ -165,6 +188,9 @@ async function fetchList(preserveSelection = false) {
     total.value = res.total;
     totalRelation.value = res.total_relation;
     tookMs.value = res.took_ms;
+    if (res.has_total_size_column !== undefined) {
+      hasTotalSizeColumn.value = res.has_total_size_column;
+    }
   } catch (e) {
     ElMessage.error(e instanceof Error ? e.message : "查询种子列表失败");
   } finally {
@@ -184,6 +210,8 @@ function resetFilters() {
   minHotText.value = "";
   maxHotText.value = "";
   minFilesText.value = "";
+  minSizeText.value = "";
+  maxSizeText.value = "";
   emptyRefineOnly.value = false;
   page.value = 1;
   void fetchList();
@@ -406,6 +434,33 @@ onMounted(() => {
             @keyup.enter="triggerSearch"
           />
           <span class="text-slate-700">|</span>
+          <span>体积</span>
+          <input
+            v-model="minSizeText"
+            type="text"
+            inputmode="decimal"
+            placeholder="最小"
+            class="obs-input w-16! rounded px-2! py-1! text-[11px]!"
+            @keyup.enter="triggerSearch"
+          />
+          <span class="text-slate-600">-</span>
+          <input
+            v-model="maxSizeText"
+            type="text"
+            inputmode="decimal"
+            placeholder="最大"
+            class="obs-input w-16! rounded px-2! py-1! text-[11px]!"
+            @keyup.enter="triggerSearch"
+          />
+          <ObsSelect
+            v-model="sizeUnit"
+            :options="SIZE_UNIT_OPTIONS"
+            mono
+            class="w-16"
+            trigger-class="px-2! py-1! text-[11px]!"
+            @change="(minSizeText.trim() || maxSizeText.trim()) && triggerSearch()"
+          />
+          <span class="text-slate-700">|</span>
           <label class="inline-flex items-center gap-1.5 cursor-pointer text-slate-300 select-none">
             <input v-model="emptyRefineOnly" type="checkbox" class="obs-checkbox" @change="triggerSearch" />
             <span>空清洗标题</span>
@@ -423,9 +478,20 @@ onMounted(() => {
           </button>
         </div>
 
-        <span class="text-slate-400 font-mono-num">
-          命中 {{ totalRelation === "gte" ? "≥ " : "" }}{{ fmtExact(total) }} 条 · {{ tookMs }}ms
-        </span>
+        <div class="flex items-center gap-2.5">
+          <button
+            v-if="!hasTotalSizeColumn"
+            type="button"
+            class="px-2 py-0.5 rounded bg-amber-500/10 border border-amber-500/30 text-[10px] text-amber-300 hover:bg-amber-500/20 transition cursor-pointer"
+            title="前往 SQL 终端执行 ALTER TABLE torrents ADD COLUMN total_size bigint; 以开启体积排序/筛选"
+            @click="router.push('/sql')"
+          >
+            未启用 total_size 列 · 去 SQL 添加
+          </button>
+          <span class="text-slate-400 font-mono-num">
+            命中 {{ totalRelation === "gte" ? "≥ " : "" }}{{ fmtExact(total) }} 条 · {{ tookMs }}ms
+          </span>
+        </div>
       </div>
     </section>
 

@@ -52,7 +52,7 @@ interface FlatTreeRow {
 const props = withDefaults(
   defineProps<{
     modelValue: boolean;
-    torrentId: number | null;
+    torrentId: string | number | null;
     fallbackEvent?: ConsoleIngestEvent | null;
     allowDelete?: boolean;
     initialTab?: "files" | "edit";
@@ -119,7 +119,7 @@ function syncEditForm(d: TorrentDetail) {
 function buildFallbackDetail(ev: ConsoleIngestEvent): TorrentDetail {
   const updatedSec = ev.updated_at ? Math.floor(ev.updated_at / 1000) || ev.updated_at : Math.floor(Date.now() / 1000);
   return {
-    id: ev.manticore_id,
+    id: String(ev.manticore_id ?? "0"),
     info_hash: ev.info_hash,
     magnet_link: `magnet:?xt=urn:btih:${ev.info_hash}`,
     raw_name: ev.raw_name,
@@ -133,6 +133,12 @@ function buildFallbackDetail(ev: ConsoleIngestEvent): TorrentDetail {
   };
 }
 
+function hasValidTorrentId(val: string | number | null | undefined): boolean {
+  if (val === null || val === undefined) return false;
+  const s = String(val).trim();
+  return s.length > 0 && s !== "0";
+}
+
 async function loadDetail() {
   loadError.value = "";
   usingFallback.value = false;
@@ -140,11 +146,12 @@ async function loadDetail() {
   fileSearch.value = "";
   flatPage.value = 1;
 
-  const id = props.torrentId;
-  if (id !== null && id > 0) {
+  const rawId = props.torrentId;
+  const queryKey = hasValidTorrentId(rawId) ? String(rawId).trim() : "";
+  if (queryKey) {
     loading.value = true;
     try {
-      const res = await getTorrentDetail(id);
+      const res = await getTorrentDetail(queryKey);
       detail.value = res;
       syncEditForm(res);
       initExpandedTree(res.files);
@@ -367,14 +374,14 @@ async function handleCopy(text: string, label: string) {
 }
 
 async function submitEdit() {
-  if (!detail.value || detail.value.id <= 0) return;
+  if (!detail.value || !hasValidTorrentId(detail.value.id)) return;
   const cleanedFiles = editForm.value.files
     .map((f) => ({ path: f.path.trim(), size: Math.max(0, Number(f.size) || 0) }))
     .filter((f) => f.path.length > 0);
 
   editSubmitting.value = true;
   try {
-    const updated = await updateTorrent(detail.value.id, {
+    const updated = await updateTorrent(detail.value.info_hash || detail.value.id, {
       raw_name: editForm.value.raw_name.trim(),
       refine_name: editForm.value.refine_name.trim(),
       hot: Math.max(0, Math.round(editForm.value.hot || 0)),
@@ -400,7 +407,7 @@ async function submitEdit() {
       <div class="min-w-0 pr-4">
         <div class="flex flex-wrap items-center gap-2">
           <span class="px-2 py-0.5 rounded bg-emerald-500/15 border border-emerald-500/30 text-[11px] font-mono text-emerald-300">
-            {{ detail && detail.id > 0 ? `ID #${detail.id}` : "SSE PREVIEW" }}
+            {{ detail && hasValidTorrentId(detail.id) ? `ID #${detail.id}` : "SSE PREVIEW" }}
           </span>
           <span v-if="usingFallback" class="px-2 py-0.5 rounded bg-amber-500/15 border border-amber-500/30 text-[11px] text-amber-300">
             实时事件前 12 条文件摘要
@@ -462,7 +469,7 @@ async function submitEdit() {
         </div>
 
         <button
-          v-if="allowDelete && detail.id > 0"
+          v-if="allowDelete && hasValidTorrentId(detail.id)"
           type="button"
           class="obs-btn obs-btn-danger px-2.5 py-1.5 text-xs inline-flex items-center gap-1.5"
           @click="emit('requestDelete', detail)"
@@ -518,7 +525,7 @@ async function submitEdit() {
             文件结构 ({{ detail.files.length }})
           </button>
           <button
-            v-if="!usingFallback && detail.id > 0"
+            v-if="!usingFallback && hasValidTorrentId(detail.id)"
             type="button"
             class="px-3 py-2 text-xs font-medium border-b-2 transition inline-flex items-center gap-1.5"
             :class="

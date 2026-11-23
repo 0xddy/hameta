@@ -30,7 +30,7 @@ services:
       context: .
       dockerfile: Dockerfile
       additional_contexts:
-        dht-crawler: ../Rust磁力爬虫/dht-crawler
+        dht-crawler: ${DHT_CRAWLER_CONTEXT:-https://github.com/0xddy/dht-crawler.git#master}
     ports:
       - "8080:8080"
       - "12313:12313/udp"

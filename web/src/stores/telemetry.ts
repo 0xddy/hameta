@@ -12,6 +12,11 @@ export const useTelemetryStore = defineStore("telemetry", () => {
   const loading = ref(false);
   const filterHasDraft = ref(false);
   const consoleBadge = ref<ConsoleBadgeMode>("SSE");
+  const nofileModalOpen = ref(false);
+
+  function openNofileModal() {
+    nofileModalOpen.value = true;
+  }
 
   let eventSource: EventSource | null = null;
   let reconnectTimer: number | null = null;
@@ -124,6 +129,8 @@ export const useTelemetryStore = defineStore("telemetry", () => {
     loading,
     filterHasDraft,
     consoleBadge,
+    nofileModalOpen,
+    openNofileModal,
     hasCriticalAlert,
     runningWorkerCount,
     totalWorkerCount,

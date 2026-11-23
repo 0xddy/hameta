@@ -1212,6 +1212,62 @@ pub async fn download_geoip_mmdb_handler(
     }))
 }
 
+pub async fn get_nofile_settings_handler(
+    State(state): State<Arc<PanelState>>,
+    _auth: AuthUser,
+) -> Json<crate::nofile::NofileStatusResponse> {
+    Json(crate::nofile::collect_nofile_status(&state.db, &state.supervisor).await)
+}
+
+pub async fn update_nofile_settings_handler(
+    State(state): State<Arc<PanelState>>,
+    auth: AuthUser,
+    headers: HeaderMap,
+    Json(req): Json<crate::nofile::UpdateNofileRequest>,
+) -> Result<Json<crate::nofile::UpdateNofileResponse>, ApiError> {
+    let resp = crate::nofile::execute_nofile_update(
+        &state.db,
+        &state.supervisor,
+        &req,
+        &auth.user.username,
+    )
+    .await
+    .map_err(|msg| ApiError::bad_request("INVALID_NOFILE", msg))?;
+
+    let _ = state.metrics.sample_once().await;
+
+    let detail = serde_json::json!({
+        "apply_process": req.apply_process,
+        "process_soft": req.process_soft,
+        "process_hard": req.process_hard,
+        "apply_to_workers": req.apply_to_workers,
+        "persist_app_config": req.persist_app_config,
+        "apply_system": req.apply_system,
+        "system_file_max": req.system_file_max,
+        "system_nr_open": req.system_nr_open,
+        "persist_system_files": req.persist_system_files,
+        "ok": resp.ok,
+        "process_applied": resp.process_applied,
+        "system_applied": resp.system_applied,
+        "persisted_files": resp.persisted_files,
+        "worker_updated": resp.worker_results.iter().filter(|w| w.ok).count(),
+        "worker_total": resp.worker_results.len(),
+    })
+    .to_string();
+    let _ = state
+        .db
+        .record_audit(
+            &auth.user.username,
+            "settings.nofile.update",
+            "nofile",
+            &detail,
+            &extract_client_ip(&headers),
+        )
+        .await;
+
+    Ok(Json(resp))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
