@@ -151,3 +151,107 @@ export function batchDeleteTorrents(
     body: JSON.stringify({ ids: ids.map(String), keep_redis_indexed: keepRedisIndexed }),
   });
 }
+
+export type TorrentTaskKind = "sync_total_size" | "reclean_titles";
+export type RecleanScope = "all" | "empty_or_unchanged";
+export type TorrentTaskStatus = "running" | "paused" | "completed" | "cancelled" | "failed";
+
+export interface TorrentTaskParams {
+  batch_size: number;
+  batch_delay_ms: number;
+  max_docs: number | null;
+  dry_run: boolean;
+  only_missing: boolean;
+  clean_scope: RecleanScope;
+  skip_empty_result: boolean;
+  rule_version: number | null;
+}
+
+export interface TaskSampleDiff {
+  id: string;
+  info_hash: string;
+  label: string;
+  before: string;
+  after: string;
+}
+
+export interface TorrentTaskItem {
+  id: number;
+  kind: TorrentTaskKind;
+  status: TorrentTaskStatus;
+  params: TorrentTaskParams;
+  cursor_id: string;
+  estimated_total: number;
+  scanned_count: number;
+  updated_count: number;
+  skipped_count: number;
+  error_count: number;
+  batches_done: number;
+  rate_per_sec: number;
+  progress_percent: number;
+  eta_secs: number | null;
+  last_error: string;
+  sample_diffs: TaskSampleDiff[];
+  created_by: string;
+  created_at: number;
+  started_at: number | null;
+  updated_at: number;
+  finished_at: number | null;
+}
+
+export interface TorrentTasksOverview {
+  has_total_size_column: boolean;
+  published_rule_version: number | null;
+  active_task: TorrentTaskItem | null;
+  tasks: TorrentTaskItem[];
+}
+
+export interface CreateTorrentTaskPayload {
+  kind: TorrentTaskKind;
+  batch_size?: number;
+  batch_delay_ms?: number;
+  max_docs?: number | null;
+  dry_run?: boolean;
+  only_missing?: boolean;
+  clean_scope?: RecleanScope;
+  skip_empty_result?: boolean;
+}
+
+export function listTorrentTasks(limit = 30): Promise<TorrentTasksOverview> {
+  return apiRequest<TorrentTasksOverview>(`/api/v1/torrents/tasks?limit=${limit}`);
+}
+
+export function getTorrentTask(id: number): Promise<TorrentTaskItem> {
+  return apiRequest<TorrentTaskItem>(`/api/v1/torrents/tasks/${id}`);
+}
+
+export function createTorrentTask(payload: CreateTorrentTaskPayload): Promise<TorrentTaskItem> {
+  return apiRequest<TorrentTaskItem>("/api/v1/torrents/tasks", {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+}
+
+export function pauseTorrentTask(id: number): Promise<TorrentTaskItem> {
+  return apiRequest<TorrentTaskItem>(`/api/v1/torrents/tasks/${id}/pause`, {
+    method: "POST",
+  });
+}
+
+export function resumeTorrentTask(id: number): Promise<TorrentTaskItem> {
+  return apiRequest<TorrentTaskItem>(`/api/v1/torrents/tasks/${id}/resume`, {
+    method: "POST",
+  });
+}
+
+export function cancelTorrentTask(id: number): Promise<TorrentTaskItem> {
+  return apiRequest<TorrentTaskItem>(`/api/v1/torrents/tasks/${id}/cancel`, {
+    method: "POST",
+  });
+}
+
+export function deleteTorrentTask(id: number): Promise<{ ok: boolean; deleted: boolean }> {
+  return apiRequest<{ ok: boolean; deleted: boolean }>(`/api/v1/torrents/tasks/${id}`, {
+    method: "DELETE",
+  });
+}

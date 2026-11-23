@@ -10,10 +10,16 @@ use serde_json::{Value, json};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+const DEFAULT_QUERY_TIMEOUT_SECS: u64 = 60;
+const DEFAULT_HEAVY_DDL_TIMEOUT_SECS: u64 = 600;
+const MIN_SQL_TIMEOUT_SECS: u64 = 5;
+const MAX_SQL_TIMEOUT_SECS: u64 = 1_800;
+
 #[derive(Debug, Deserialize)]
 pub struct SqlQueryRequest {
     pub sql: String,
     pub max_rows: Option<usize>,
+    pub timeout_secs: Option<u64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -27,6 +33,50 @@ pub struct SqlQueryResponse {
     pub took_ms: u64,
 }
 
+fn sql_first_keyword(sql: &str) -> String {
+    sql.split_whitespace()
+        .next()
+        .unwrap_or_default()
+        .to_ascii_uppercase()
+}
+
+fn is_heavy_ddl_keyword(keyword: &str) -> bool {
+    matches!(
+        keyword,
+        "ALTER"
+            | "OPTIMIZE"
+            | "FLUSH"
+            | "TRUNCATE"
+            | "RELOAD"
+            | "CREATE"
+            | "DROP"
+            | "ATTACH"
+            | "IMPORT"
+            | "FREEZE"
+            | "UNFREEZE"
+    )
+}
+
+fn is_schema_mutating_keyword(keyword: &str) -> bool {
+    matches!(keyword, "ALTER" | "CREATE" | "DROP")
+}
+
+fn resolve_sql_timeout_secs(first_keyword: &str, requested: Option<u64>) -> u64 {
+    match requested {
+        Some(secs) => secs.clamp(MIN_SQL_TIMEOUT_SECS, MAX_SQL_TIMEOUT_SECS),
+        None if is_heavy_ddl_keyword(first_keyword) => DEFAULT_HEAVY_DDL_TIMEOUT_SECS,
+        None => DEFAULT_QUERY_TIMEOUT_SECS,
+    }
+}
+
+fn error_is_timeout(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        cause
+            .downcast_ref::<reqwest::Error>()
+            .is_some_and(reqwest::Error::is_timeout)
+    }) || err.to_string().to_ascii_lowercase().contains("timed out")
+}
+
 pub async fn execute_readonly_sql_handler(
     State(state): State<Arc<PanelState>>,
     auth: AuthUser,
@@ -38,6 +88,8 @@ pub async fn execute_readonly_sql_handler(
         .unwrap_or(DEFAULT_SQL_LIMIT)
         .clamp(1, MAX_SQL_LIMIT);
     let safe_sql = prepare_console_sql(&req.sql, default_limit, MAX_SQL_LIMIT)?;
+    let first_word = sql_first_keyword(&safe_sql);
+    let timeout_secs = resolve_sql_timeout_secs(&first_word, req.timeout_secs);
 
     let Some((_, client)) = state.services.manticore_client().await else {
         return Err(ApiError::bad_request(
@@ -47,19 +99,39 @@ pub async fn execute_readonly_sql_handler(
     };
 
     let started = Instant::now();
-    let results = client
-        .execute_raw_sql_with_timeout(&safe_sql, Duration::from_secs(30))
+    let results = match client
+        .execute_raw_sql_with_timeout(&safe_sql, Duration::from_secs(timeout_secs))
         .await
-        .map_err(|e| ApiError::bad_request("MANTICORE_SQL_ERROR", e.to_string()))?;
+    {
+        Ok(res) => res,
+        Err(err) => {
+            // 即使超时断开，Manticore 后台仍可能完成 DDL，预先失效表结构缓存以免后续漏检新列
+            if is_schema_mutating_keyword(&first_word) {
+                client.invalidate_schema_cache();
+            }
+            if error_is_timeout(&err) {
+                let elapsed_secs = started.elapsed().as_secs();
+                let msg = if is_heavy_ddl_keyword(&first_word) {
+                    format!(
+                        "等待 Manticore 响应超时（已等待 {elapsed_secs}s，超时上限 {timeout_secs}s）。注意：{first_word} 等耗时操作在 Manticore 服务端通常仍在后台继续执行并最终成功，请勿重复提交，稍后执行 DESCRIBE torrents; 或 SHOW THREADS; 确认结果。"
+                    )
+                } else {
+                    format!(
+                        "Manticore SQL 查询等待响应超时（已等待 {elapsed_secs}s，超时上限 {timeout_secs}s），可调大超时上限或缩小查询范围后重试。"
+                    )
+                };
+                return Err(ApiError::gateway_timeout("MANTICORE_SQL_TIMEOUT", msg));
+            }
+            return Err(ApiError::bad_request(
+                "MANTICORE_SQL_ERROR",
+                format!("{err:#}"),
+            ));
+        }
+    };
     let took_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(0);
 
     // 若执行了结构变更（ALTER / CREATE / DROP），立即刷新 Manticore 表结构缓存（如 total_size 列检测）
-    let first_word = safe_sql
-        .split_whitespace()
-        .next()
-        .unwrap_or_default()
-        .to_ascii_uppercase();
-    if matches!(first_word.as_str(), "ALTER" | "CREATE" | "DROP") {
+    if is_schema_mutating_keyword(&first_word) {
         client.invalidate_schema_cache();
     }
 
@@ -154,5 +226,35 @@ fn stringify_unsafe_js_integers(val: &mut Value) {
             }
         }
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolve_sql_timeout_grants_extended_window_for_ddl_and_clamps_custom() {
+        assert_eq!(
+            resolve_sql_timeout_secs("ALTER", None),
+            DEFAULT_HEAVY_DDL_TIMEOUT_SECS
+        );
+        assert_eq!(
+            resolve_sql_timeout_secs("OPTIMIZE", None),
+            DEFAULT_HEAVY_DDL_TIMEOUT_SECS
+        );
+        assert_eq!(
+            resolve_sql_timeout_secs("SELECT", None),
+            DEFAULT_QUERY_TIMEOUT_SECS
+        );
+        assert_eq!(
+            resolve_sql_timeout_secs("SELECT", Some(1)),
+            MIN_SQL_TIMEOUT_SECS
+        );
+        assert_eq!(
+            resolve_sql_timeout_secs("ALTER", Some(9999)),
+            MAX_SQL_TIMEOUT_SECS
+        );
+        assert_eq!(resolve_sql_timeout_secs("ALTER", Some(300)), 300);
     }
 }

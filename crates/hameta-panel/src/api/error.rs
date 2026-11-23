@@ -29,6 +29,15 @@ impl ApiError {
         }
     }
 
+    pub fn gateway_timeout(code: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::GATEWAY_TIMEOUT,
+            code,
+            message: message.into(),
+            detail: None,
+        }
+    }
+
     pub fn unauthorized(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::UNAUTHORIZED,

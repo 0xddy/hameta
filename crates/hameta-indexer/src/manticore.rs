@@ -63,6 +63,20 @@ pub struct TableStatusInfo {
     pub raw_rows: BTreeMap<String, String>,
 }
 
+#[derive(Debug, Clone)]
+pub struct MaintenanceTorrentDoc {
+    pub id: i64,
+    pub info_hash: String,
+    pub raw_name: String,
+    pub refine_name: String,
+    pub file_count: i32,
+    pub total_size: i64,
+    pub file_info: String,
+    pub hot: i32,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
 /// Manticore HTTP 客户端（严格保护存量 `torrents` 表结构，严禁自动 `ALTER`/`DROP`/`CREATE`）。
 #[derive(Clone)]
 pub struct ManticoreClient {
@@ -524,6 +538,85 @@ impl ManticoreClient {
         }
 
         Ok(updated_count)
+    }
+
+    /// 精确统计 `torrents` 满足条件的总行数（用于千万级异步维护任务的进度条与 ETA，不受 `/search` `max_matches` 上限截断）。
+    pub async fn count_torrents(&self, only_zero_total_size: bool) -> Result<u64> {
+        let sql = if only_zero_total_size {
+            format!("SELECT COUNT(*) AS cnt FROM {TABLE_TORRENTS} WHERE total_size = 0")
+        } else {
+            format!("SELECT COUNT(*) AS cnt FROM {TABLE_TORRENTS}")
+        };
+        let results = self
+            .execute_raw_sql_with_timeout(&sql, Duration::from_secs(60))
+            .await
+            .context("统计 Manticore torrents 行数失败")?;
+        let count = results
+            .first()
+            .and_then(|v| v.get("data"))
+            .and_then(Value::as_array)
+            .and_then(|rows| rows.first())
+            .and_then(|row| {
+                row.get("cnt")
+                    .or_else(|| row.get("count(*)"))
+                    .or_else(|| row.as_object().and_then(|m| m.values().next()))
+            })
+            .and_then(|v| {
+                v.as_u64()
+                    .or_else(|| v.as_str().and_then(|s| s.trim().parse::<u64>().ok()))
+            })
+            .unwrap_or(0);
+        Ok(count)
+    }
+
+    /// 异步维护任务专用批量整行 `replace`：原样保留主键 `id`、`file_info` JSON、`created_at` 与 `updated_at`，零多余序列化开销。
+    pub async fn batch_replace_maintenance_docs(
+        &self,
+        docs: &[MaintenanceTorrentDoc],
+        include_total_size: bool,
+    ) -> Result<usize> {
+        if docs.is_empty() {
+            return Ok(0);
+        }
+        let mut written_total = 0_usize;
+        for chunk in docs.chunks(500) {
+            let mut body = String::with_capacity(chunk.len() * 256);
+            let mut count = 0_u64;
+            for doc in chunk {
+                if doc.id <= 0 {
+                    continue;
+                }
+                let mut doc_map = serde_json::Map::new();
+                doc_map.insert("info_hash".to_string(), json!(doc.info_hash));
+                doc_map.insert("raw_name".to_string(), json!(doc.raw_name));
+                doc_map.insert("refine_name".to_string(), json!(doc.refine_name));
+                doc_map.insert("file_count".to_string(), json!(doc.file_count));
+                if include_total_size {
+                    doc_map.insert("total_size".to_string(), json!(doc.total_size));
+                }
+                doc_map.insert("file_info".to_string(), json!(doc.file_info));
+                doc_map.insert("hot".to_string(), json!(doc.hot));
+                doc_map.insert("created_at".to_string(), json!(doc.created_at));
+                doc_map.insert("updated_at".to_string(), json!(doc.updated_at));
+                let action = json!({
+                    "replace": {
+                        "index": TABLE_TORRENTS,
+                        "id": doc.id,
+                        "doc": Value::Object(doc_map)
+                    }
+                });
+                body.push_str(&action.to_string());
+                body.push('\n');
+                count += 1;
+            }
+            if count > 0 {
+                self.execute_bulk(&body, Some(count))
+                    .await
+                    .context("Manticore 批量维护 replace 执行失败")?;
+                written_total += usize::try_from(count).unwrap_or(usize::MAX);
+            }
+        }
+        Ok(written_total)
     }
 
     /// 按 63-bit 整型主键批量删除 `torrents` 记录（每批最多 200 条）。

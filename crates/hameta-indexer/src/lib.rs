@@ -8,8 +8,8 @@ pub mod streams;
 
 pub use ipc::{IndexerIpcState, IngestEventReporter, build_indexer_ipc_router};
 pub use manticore::{
-    ColumnSchemaInfo, ManticoreClient, SchemaCheckReport, TableStatusInfo, validate_bulk_response,
-    validate_sql_response,
+    ColumnSchemaInfo, MaintenanceTorrentDoc, ManticoreClient, SchemaCheckReport, TableStatusInfo,
+    normalize_file_info_value, sum_file_info_json, validate_bulk_response, validate_sql_response,
 };
 pub use runner::run_indexer_worker;
 pub use stats::{IndexerAppMetrics, IndexerAppStats, IndexerSnapshot};

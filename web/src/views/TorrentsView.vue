@@ -1,27 +1,38 @@
 <script setup lang="ts">
-import { computed, nextTick, onMounted, ref, watch } from "vue";
+import { computed, nextTick, onMounted, onUnmounted, ref, watch } from "vue";
 import { useRoute, useRouter } from "vue-router";
 import { ElMessage } from "element-plus";
 import {
   ChevronLeft,
   ChevronRight,
   Database,
+  Layers,
+  Pause,
+  Play,
   Plus,
   RefreshCw,
   Search,
+  Square,
   Trash2,
 } from "lucide-vue-next";
 import {
   batchDeleteTorrents,
+  cancelTorrentTask,
   createTorrent,
   deleteTorrent,
+  listTorrentTasks,
   listTorrents,
+  pauseTorrentTask,
+  resumeTorrentTask,
   type ListTorrentsQuery,
   type TorrentDetail,
   type TorrentFileInfo,
   type TorrentSummary,
+  type TorrentTaskItem,
+  type TorrentTasksOverview,
 } from "@/api/torrents";
 import TorrentDetailDrawer from "@/components/TorrentDetailDrawer.vue";
+import TorrentTasksDrawer from "@/components/TorrentTasksDrawer.vue";
 import ObsModal from "@/components/ui/ObsModal.vue";
 import ObsNumberInput from "@/components/ui/ObsNumberInput.vue";
 import ObsSelect from "@/components/ui/ObsSelect.vue";
@@ -62,6 +73,13 @@ const selectedIds = ref<Set<string>>(new Set());
 const detailVisible = ref(false);
 const detailId = ref<string | null>(null);
 const detailTab = ref<"files" | "edit">("files");
+
+// Async maintenance tasks drawer & live banner
+const tasksDrawerVisible = ref(false);
+const activeTask = ref<TorrentTaskItem | null>(null);
+const taskActionBusy = ref(false);
+let activeTaskTimer: ReturnType<typeof setInterval> | null = null;
+let lastTrackedRunningId: number | null = null;
 
 // Create Modal
 const createVisible = ref(false);
@@ -324,6 +342,132 @@ function focusSearchInputIfRequested() {
   }
 }
 
+function taskKindLabel(kind: TorrentTaskItem["kind"]): string {
+  return kind === "sync_total_size" ? "同步文件大小" : "清洗标题";
+}
+
+function formatTaskEta(secs: number | null): string {
+  if (secs == null || !Number.isFinite(secs) || secs < 0) return "估算中";
+  if (secs < 60) return `${Math.ceil(secs)}s`;
+  if (secs < 3600) {
+    const m = Math.floor(secs / 60);
+    const s = Math.floor(secs % 60);
+    return `${m}m ${s}s`;
+  }
+  const h = Math.floor(secs / 3600);
+  const m = Math.floor((secs % 3600) / 60);
+  return `${h}h ${m}m`;
+}
+
+function stopActiveTaskPolling() {
+  if (activeTaskTimer) {
+    clearInterval(activeTaskTimer);
+    activeTaskTimer = null;
+  }
+}
+
+function updateActiveTaskPolling() {
+  const shouldPoll = activeTask.value?.status === "running" && !tasksDrawerVisible.value;
+  if (shouldPoll && !activeTaskTimer) {
+    activeTaskTimer = setInterval(() => {
+      void fetchActiveTask();
+    }, 3000);
+  } else if (!shouldPoll) {
+    stopActiveTaskPolling();
+  }
+}
+
+function syncActiveTaskFromOverview(overview: TorrentTasksOverview) {
+  const prevRunningId = lastTrackedRunningId;
+  const current =
+    overview.active_task ??
+    overview.tasks.find((t) => t.status === "paused") ??
+    null;
+
+  activeTask.value = current;
+
+  if (overview.active_task?.status === "running") {
+    lastTrackedRunningId = overview.active_task.id;
+  } else if (prevRunningId !== null) {
+    const finished = overview.tasks.find((t) => t.id === prevRunningId);
+    if (finished && finished.status !== "running") {
+      lastTrackedRunningId = null;
+      if (finished.status === "completed") {
+        ElMessage.success(
+          `异步任务 #${finished.id}（${taskKindLabel(finished.kind)}）已完成，更新 ${fmtExact(finished.updated_count)} 条`,
+        );
+        void fetchList(true);
+      } else if (finished.status === "failed") {
+        ElMessage.error(`异步任务 #${finished.id} 异常中止`);
+      }
+    }
+  }
+
+  updateActiveTaskPolling();
+}
+
+async function fetchActiveTask() {
+  try {
+    const overview = await listTorrentTasks(10);
+    syncActiveTaskFromOverview(overview);
+  } catch {
+    // Silent: avoid spamming toasts during background poll
+  }
+}
+
+function onTasksChanged(overview: TorrentTasksOverview) {
+  syncActiveTaskFromOverview(overview);
+}
+
+async function handleBannerPause() {
+  if (!activeTask.value || taskActionBusy.value) return;
+  taskActionBusy.value = true;
+  try {
+    await pauseTorrentTask(activeTask.value.id);
+    ElMessage.success(`已发送暂停指令 (#${activeTask.value.id})`);
+    await fetchActiveTask();
+  } catch (e) {
+    ElMessage.error(e instanceof Error ? e.message : "暂停任务失败");
+  } finally {
+    taskActionBusy.value = false;
+  }
+}
+
+async function handleBannerResume() {
+  if (!activeTask.value || taskActionBusy.value) return;
+  taskActionBusy.value = true;
+  try {
+    await resumeTorrentTask(activeTask.value.id);
+    ElMessage.success(`已继续执行任务 #${activeTask.value.id}`);
+    await fetchActiveTask();
+  } catch (e) {
+    ElMessage.error(e instanceof Error ? e.message : "恢复任务失败");
+  } finally {
+    taskActionBusy.value = false;
+  }
+}
+
+async function handleBannerCancel() {
+  if (!activeTask.value || taskActionBusy.value) return;
+  taskActionBusy.value = true;
+  try {
+    await cancelTorrentTask(activeTask.value.id);
+    ElMessage.success(`已取消任务 #${activeTask.value.id}`);
+    await fetchActiveTask();
+  } catch (e) {
+    ElMessage.error(e instanceof Error ? e.message : "取消任务失败");
+  } finally {
+    taskActionBusy.value = false;
+  }
+}
+
+watch(tasksDrawerVisible, (visible) => {
+  updateActiveTaskPolling();
+  if (!visible) {
+    void fetchActiveTask();
+  }
+});
+
 watch(
   () => route.query.focus,
   () => {
@@ -337,7 +481,12 @@ watch([page, pageSize], () => {
 
 onMounted(() => {
   void fetchList();
+  void fetchActiveTask();
   focusSearchInputIfRequested();
+});
+
+onUnmounted(() => {
+  stopActiveTaskPolling();
 });
 </script>
 
@@ -393,6 +542,36 @@ onMounted(() => {
           <button type="button" class="obs-btn obs-btn-ghost px-2.5! py-1.5! text-xs! inline-flex items-center gap-1" @click="fetchList()">
             <RefreshCw class="w-3.5 h-3.5" :class="loading ? 'animate-spin text-emerald-400' : ''" />
             刷新
+          </button>
+
+          <button
+            type="button"
+            class="obs-btn px-3! py-1.5! text-xs! inline-flex items-center gap-1.5"
+            :class="
+              activeTask?.status === 'running'
+                ? 'bg-emerald-500/15 border border-emerald-500/40 text-emerald-300 hover:bg-emerald-500/25'
+                : activeTask?.status === 'paused'
+                  ? 'bg-amber-500/15 border border-amber-500/40 text-amber-300 hover:bg-amber-500/25'
+                  : 'obs-btn-ghost'
+            "
+            @click="tasksDrawerVisible = true"
+          >
+            <Layers class="w-3.5 h-3.5" />
+            <span>异步任务</span>
+            <span
+              v-if="activeTask?.status === 'running'"
+              class="inline-flex items-center gap-1 ml-0.5 text-[10px] font-mono text-emerald-300"
+            >
+              <span class="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" />
+              {{ Math.min(100, Math.max(0, activeTask.progress_percent)).toFixed(0) }}%
+            </span>
+            <span
+              v-else-if="activeTask?.status === 'paused'"
+              class="inline-flex items-center gap-1 ml-0.5 text-[10px] font-mono text-amber-300"
+            >
+              <span class="w-1.5 h-1.5 rounded-full bg-amber-400" />
+              已暂停
+            </span>
           </button>
 
           <button type="button" class="obs-btn obs-btn-primary px-3! py-1.5! text-xs! inline-flex items-center gap-1" @click="openCreateModal">
@@ -492,6 +671,112 @@ onMounted(() => {
             命中 {{ totalRelation === "gte" ? "≥ " : "" }}{{ fmtExact(total) }} 条 · {{ tookMs }}ms
           </span>
         </div>
+      </div>
+    </section>
+
+    <!-- Active Async Task Inline Progress Banner -->
+    <section
+      v-if="activeTask && (activeTask.status === 'running' || activeTask.status === 'paused')"
+      class="obs-card rounded-xl px-4 py-3 space-y-2 border"
+      :class="
+        activeTask.status === 'running'
+          ? 'border-emerald-500/35 bg-emerald-500/[0.04]'
+          : 'border-amber-500/35 bg-amber-500/[0.04]'
+      "
+    >
+      <div class="flex flex-wrap items-center justify-between gap-2 text-xs">
+        <div class="flex flex-wrap items-center gap-2">
+          <span
+            class="w-2 h-2 rounded-full shrink-0"
+            :class="activeTask.status === 'running' ? 'bg-emerald-400 animate-pulse' : 'bg-amber-400'"
+          />
+          <span class="font-medium text-slate-100">
+            {{ taskKindLabel(activeTask.kind) }}
+          </span>
+          <span class="font-mono text-[11px] text-slate-500">#{{ activeTask.id }}</span>
+          <span
+            class="px-1.5 py-0.5 rounded text-[10px] font-mono border"
+            :class="
+              activeTask.status === 'running'
+                ? 'bg-emerald-500/15 border-emerald-500/35 text-emerald-300'
+                : 'bg-amber-500/15 border-amber-500/35 text-amber-300'
+            "
+          >
+            {{ activeTask.status === "running" ? "分批处理中" : "已暂停（可断点续跑）" }}
+          </span>
+          <span
+            v-if="activeTask.params.dry_run"
+            class="px-1.5 py-0.5 rounded text-[10px] font-mono bg-sky-500/15 border border-sky-500/35 text-sky-300"
+          >
+            演练预览
+          </span>
+          <span class="text-[11px] font-mono text-slate-400">
+            已扫描 {{ fmtExact(activeTask.scanned_count) }}
+            <template v-if="activeTask.estimated_total > 0">
+              / {{ fmtExact(activeTask.estimated_total) }}
+            </template>
+            · 更新 <span class="text-emerald-300">{{ fmtExact(activeTask.updated_count) }}</span>
+            <template v-if="activeTask.error_count > 0">
+              · 错误 <span class="text-rose-300">{{ fmtExact(activeTask.error_count) }}</span>
+            </template>
+            <template v-if="activeTask.status === 'running'">
+              · {{ activeTask.rate_per_sec.toFixed(0) }} 条/s · 预计剩余 {{ formatTaskEta(activeTask.eta_secs) }}
+            </template>
+          </span>
+        </div>
+
+        <div class="flex items-center gap-1.5">
+          <button
+            v-if="activeTask.status === 'running'"
+            type="button"
+            class="obs-btn obs-btn-ghost px-2.5! py-1! text-[11px]! inline-flex items-center gap-1"
+            :disabled="taskActionBusy"
+            @click="handleBannerPause"
+          >
+            <Pause class="w-3 h-3 text-amber-300" />
+            暂停
+          </button>
+          <button
+            v-else
+            type="button"
+            class="obs-btn obs-btn-primary px-2.5! py-1! text-[11px]! inline-flex items-center gap-1"
+            :disabled="taskActionBusy"
+            @click="handleBannerResume"
+          >
+            <Play class="w-3 h-3" />
+            继续
+          </button>
+          <button
+            type="button"
+            class="obs-btn obs-btn-danger px-2.5! py-1! text-[11px]! inline-flex items-center gap-1"
+            :disabled="taskActionBusy"
+            @click="handleBannerCancel"
+          >
+            <Square class="w-3 h-3" />
+            取消
+          </button>
+          <button
+            type="button"
+            class="obs-btn obs-btn-ghost px-2.5! py-1! text-[11px]! inline-flex items-center gap-1"
+            @click="tasksDrawerVisible = true"
+          >
+            <Layers class="w-3 h-3 text-slate-300" />
+            管理详情
+          </button>
+        </div>
+      </div>
+
+      <div class="flex items-center gap-3">
+        <div class="flex-1 h-1.5 rounded-full bg-slate-800/90 overflow-hidden">
+          <div
+            class="h-full rounded-full transition-all duration-300"
+            :class="activeTask.status === 'running' ? 'bg-emerald-400' : 'bg-amber-400'"
+            :style="{ width: `${Math.min(100, Math.max(0, activeTask.progress_percent))}%` }"
+          />
+        </div>
+        <span class="text-[11px] font-mono font-semibold text-slate-300 w-12 text-right">
+          {{ Math.min(100, Math.max(0, activeTask.progress_percent)).toFixed(1) }}%
+        </span>
       </div>
     </section>
 
@@ -766,5 +1051,8 @@ onMounted(() => {
         </button>
       </template>
     </ObsModal>
+
+    <!-- Async Maintenance Tasks Drawer -->
+    <TorrentTasksDrawer v-model="tasksDrawerVisible" @changed="onTasksChanged" />
   </div>
 </template>

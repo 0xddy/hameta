@@ -67,6 +67,7 @@ async fn docker_live_setup_settings_and_crawler_to_manticore_pipeline() {
     let supervisor = Supervisor::new(db.clone(), dir.clone()).await.unwrap();
     let services = Arc::new(ServiceRuntimePool::default());
     let metrics = MetricsCollector::new(db.clone(), supervisor.clone(), services.clone());
+    let torrent_tasks = hameta_panel::TorrentTaskManager::new(db.clone(), services.clone());
     let state = Arc::new(PanelState {
         db: db.clone(),
         config: PanelConfig {
@@ -77,6 +78,7 @@ async fn docker_live_setup_settings_and_crawler_to_manticore_pipeline() {
         supervisor: supervisor.clone(),
         services,
         metrics,
+        torrent_tasks,
         login_limiter: Arc::new(LoginRateLimiter::default()),
         setup_lock: Arc::new(Mutex::new(())),
     });

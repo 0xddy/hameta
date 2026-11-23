@@ -230,6 +230,7 @@ async fn setup_initialized_panel() -> TestHarness {
         .await
         .unwrap();
     let metrics = MetricsCollector::new(db.clone(), supervisor.clone(), services.clone());
+    let torrent_tasks = hameta_panel::TorrentTaskManager::new(db.clone(), services.clone());
 
     let state = Arc::new(PanelState {
         config: PanelConfig {
@@ -241,6 +242,7 @@ async fn setup_initialized_panel() -> TestHarness {
         services,
         supervisor,
         metrics,
+        torrent_tasks,
         login_limiter: Arc::new(LoginRateLimiter::default()),
         setup_lock: Arc::new(Mutex::new(())),
     });

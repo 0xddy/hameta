@@ -10,10 +10,21 @@ export interface SqlQueryResponse {
   took_ms: number;
 }
 
-export function executeReadonlySql(sql: string, maxRows = 200): Promise<SqlQueryResponse> {
+export function executeReadonlySql(
+  sql: string,
+  maxRows = 200,
+  timeoutSecs?: number,
+): Promise<SqlQueryResponse> {
+  const payload: { sql: string; max_rows: number; timeout_secs?: number } = {
+    sql,
+    max_rows: maxRows,
+  };
+  if (typeof timeoutSecs === "number" && timeoutSecs > 0) {
+    payload.timeout_secs = timeoutSecs;
+  }
   return apiRequest<SqlQueryResponse>("/api/v1/sql/query", {
     method: "POST",
-    body: JSON.stringify({ sql, max_rows: maxRows }),
+    body: JSON.stringify(payload),
   });
 }
 

@@ -4,6 +4,7 @@ use crate::auth::LoginRateLimiter;
 use crate::metrics_collector::MetricsCollector;
 use crate::services::ServiceRuntimePool;
 use crate::supervisor::Supervisor;
+use crate::torrent_tasks::TorrentTaskManager;
 use anyhow::Context;
 use axum::extract::State;
 use axum::http::StatusCode;
@@ -43,6 +44,7 @@ pub struct PanelState {
     pub supervisor: Arc<Supervisor>,
     pub services: Arc<ServiceRuntimePool>,
     pub metrics: Arc<MetricsCollector>,
+    pub torrent_tasks: Arc<TorrentTaskManager>,
     pub login_limiter: Arc<LoginRateLimiter>,
     pub setup_lock: Arc<Mutex<()>>,
 }
@@ -137,6 +139,9 @@ pub async fn run_panel(config: PanelConfig) -> anyhow::Result<()> {
     let collector_cancel = tokio_util::sync::CancellationToken::new();
     metrics.spawn_background_loop(collector_cancel.clone());
 
+    let torrent_tasks = TorrentTaskManager::new(db.clone(), services.clone());
+    torrent_tasks.recover_stale_tasks_on_startup().await;
+
     let addr: SocketAddr = config
         .bind_addr
         .parse()
@@ -153,6 +158,7 @@ pub async fn run_panel(config: PanelConfig) -> anyhow::Result<()> {
         supervisor: supervisor.clone(),
         services,
         metrics,
+        torrent_tasks: torrent_tasks.clone(),
         login_limiter: Arc::new(LoginRateLimiter::default()),
         setup_lock: Arc::new(Mutex::new(())),
     });
@@ -169,6 +175,7 @@ pub async fn run_panel(config: PanelConfig) -> anyhow::Result<()> {
         .context("Web 服务运行异常退出");
 
     collector_cancel.cancel();
+    torrent_tasks.pause_active_on_shutdown().await;
     supervisor.shutdown_all().await;
     serve_result
 }

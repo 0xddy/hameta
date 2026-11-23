@@ -1,6 +1,7 @@
 use crate::api::error::{ApiError, extract_client_ip};
 use crate::auth::AuthUser;
 use crate::server::PanelState;
+use crate::torrent_tasks::{CreateTorrentTaskRequest, TorrentTaskDto, TorrentTasksOverviewDto};
 use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::HeaderMap;
@@ -739,6 +740,169 @@ pub async fn batch_delete_torrents_handler(
         "redis_synced": hashes.len(),
         "keep_redis_indexed": req.keep_redis_indexed
     })))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ListTorrentTasksQuery {
+    pub limit: Option<i64>,
+}
+
+pub async fn list_torrent_tasks_handler(
+    State(state): State<Arc<PanelState>>,
+    _auth: AuthUser,
+    Query(query): Query<ListTorrentTasksQuery>,
+) -> Result<Json<TorrentTasksOverviewDto>, ApiError> {
+    let limit = query.limit.unwrap_or(30).clamp(1, 100);
+    let overview = state
+        .torrent_tasks
+        .overview(limit)
+        .await
+        .map_err(|msg| ApiError::internal("加载磁力维护任务失败").with_detail(msg))?;
+    Ok(Json(overview))
+}
+
+pub async fn get_torrent_task_handler(
+    State(state): State<Arc<PanelState>>,
+    _auth: AuthUser,
+    Path(id): Path<i64>,
+) -> Result<Json<TorrentTaskDto>, ApiError> {
+    let task = state
+        .torrent_tasks
+        .get_task(id)
+        .await
+        .map_err(|msg| ApiError::internal("查询磁力维护任务失败").with_detail(msg))?
+        .ok_or_else(|| ApiError::not_found(format!("未找到任务 #{id}")))?;
+    Ok(Json(task))
+}
+
+pub async fn create_torrent_task_handler(
+    State(state): State<Arc<PanelState>>,
+    auth: AuthUser,
+    headers: HeaderMap,
+    Json(req): Json<CreateTorrentTaskRequest>,
+) -> Result<Json<TorrentTaskDto>, ApiError> {
+    let kind_str = req.kind.as_str();
+    let dry_run = req.dry_run;
+    let task = state
+        .torrent_tasks
+        .start_new_task(req, &auth.user.username)
+        .await
+        .map_err(|msg| ApiError::bad_request("TORRENT_TASK_START_FAILED", msg))?;
+
+    let _ = state
+        .db
+        .record_audit(
+            &auth.user.username,
+            "torrent_task.create",
+            &format!("task:{}", task.id),
+            &json!({
+                "task_id": task.id,
+                "kind": kind_str,
+                "dry_run": dry_run,
+                "estimated_total": task.estimated_total,
+            })
+            .to_string(),
+            &extract_client_ip(&headers),
+        )
+        .await;
+
+    Ok(Json(task))
+}
+
+pub async fn pause_torrent_task_handler(
+    State(state): State<Arc<PanelState>>,
+    auth: AuthUser,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+) -> Result<Json<TorrentTaskDto>, ApiError> {
+    let task = state
+        .torrent_tasks
+        .pause_task(id)
+        .await
+        .map_err(|msg| ApiError::bad_request("TORRENT_TASK_PAUSE_FAILED", msg))?;
+    let _ = state
+        .db
+        .record_audit(
+            &auth.user.username,
+            "torrent_task.pause",
+            &format!("task:{id}"),
+            &json!({ "cursor_id": task.cursor_id, "scanned": task.scanned_count }).to_string(),
+            &extract_client_ip(&headers),
+        )
+        .await;
+    Ok(Json(task))
+}
+
+pub async fn resume_torrent_task_handler(
+    State(state): State<Arc<PanelState>>,
+    auth: AuthUser,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+) -> Result<Json<TorrentTaskDto>, ApiError> {
+    let task = state
+        .torrent_tasks
+        .resume_task(id)
+        .await
+        .map_err(|msg| ApiError::bad_request("TORRENT_TASK_RESUME_FAILED", msg))?;
+    let _ = state
+        .db
+        .record_audit(
+            &auth.user.username,
+            "torrent_task.resume",
+            &format!("task:{id}"),
+            &json!({ "cursor_id": task.cursor_id }).to_string(),
+            &extract_client_ip(&headers),
+        )
+        .await;
+    Ok(Json(task))
+}
+
+pub async fn cancel_torrent_task_handler(
+    State(state): State<Arc<PanelState>>,
+    auth: AuthUser,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+) -> Result<Json<TorrentTaskDto>, ApiError> {
+    let task = state
+        .torrent_tasks
+        .cancel_task(id)
+        .await
+        .map_err(|msg| ApiError::bad_request("TORRENT_TASK_CANCEL_FAILED", msg))?;
+    let _ = state
+        .db
+        .record_audit(
+            &auth.user.username,
+            "torrent_task.cancel",
+            &format!("task:{id}"),
+            &json!({ "cursor_id": task.cursor_id, "scanned": task.scanned_count }).to_string(),
+            &extract_client_ip(&headers),
+        )
+        .await;
+    Ok(Json(task))
+}
+
+pub async fn delete_torrent_task_handler(
+    State(state): State<Arc<PanelState>>,
+    auth: AuthUser,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+) -> Result<Json<Value>, ApiError> {
+    let deleted = state
+        .torrent_tasks
+        .delete_task(id)
+        .await
+        .map_err(|msg| ApiError::bad_request("TORRENT_TASK_DELETE_FAILED", msg))?;
+    let _ = state
+        .db
+        .record_audit(
+            &auth.user.username,
+            "torrent_task.delete",
+            &format!("task:{id}"),
+            &json!({ "deleted": deleted }).to_string(),
+            &extract_client_ip(&headers),
+        )
+        .await;
+    Ok(Json(json!({ "ok": true, "deleted": deleted })))
 }
 
 #[cfg(test)]

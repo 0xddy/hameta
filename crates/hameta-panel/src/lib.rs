@@ -8,6 +8,7 @@ pub mod nofile;
 pub mod server;
 pub mod services;
 pub mod supervisor;
+pub mod torrent_tasks;
 
 pub use auth::LoginRateLimiter;
 pub use ingest_hub::{ConsoleIngestEvent, IngestHub, IngestHubStats};
@@ -24,6 +25,7 @@ pub use supervisor::{
     CrawlerGeoIpReloadResult, IndexerReloadResult, META_GEOIP_CONFIG_KEY, Supervisor,
     WorkerStatusView, load_geoip_config,
 };
+pub use torrent_tasks::TorrentTaskManager;
 
 #[cfg(test)]
 mod tests {
@@ -43,6 +45,7 @@ mod tests {
         let supervisor = Supervisor::new(db.clone(), data_dir.clone()).await.unwrap();
         let services = Arc::new(ServiceRuntimePool::default());
         let metrics = MetricsCollector::new(db.clone(), supervisor.clone(), services.clone());
+        let torrent_tasks = TorrentTaskManager::new(db.clone(), services.clone());
         let state = Arc::new(PanelState {
             db,
             config: PanelConfig {
@@ -53,6 +56,7 @@ mod tests {
             supervisor,
             services,
             metrics,
+            torrent_tasks,
             login_limiter: Arc::new(LoginRateLimiter::default()),
             setup_lock: Arc::new(Mutex::new(())),
         });

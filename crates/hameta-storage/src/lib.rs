@@ -8,6 +8,7 @@ pub use repos::admin::{AdminSessionRow, AdminUserRow};
 pub use repos::audit::AuditLogRow;
 pub use repos::filter::FilterRuleVersionRow;
 pub use repos::service_config::ServiceConfigRow;
+pub use repos::torrent_task::{TorrentTaskProgressUpdate, TorrentTaskRow};
 pub use repos::worker::{WorkerConfigVersionRow, WorkerInstanceRow};
 
 #[cfg(test)]
@@ -39,7 +40,38 @@ mod tests {
         .fetch_one(db.pool())
         .await
         .unwrap();
-        assert_eq!(table_count, 10);
+        assert_eq!(table_count, 11);
+
+        // 校验 torrent_tasks 持久化、进度更新与重启断点暂停恢复
+        let created = db
+            .create_torrent_task("sync_total_size", r#"{"batch_size":500}"#, 1000, "admin")
+            .await
+            .unwrap();
+        assert_eq!(created.status, "running");
+        assert!(db.find_running_torrent_task().await.unwrap().is_some());
+        db.update_torrent_task_progress(
+            created.id,
+            &TorrentTaskProgressUpdate {
+                cursor_id: 987654321,
+                estimated_total: Some(1200),
+                scanned_count: 500,
+                updated_count: 420,
+                skipped_count: 80,
+                error_count: 0,
+                batches_done: 1,
+                rate_per_sec: 1250.5,
+                last_error: String::new(),
+                sample_diffs_json: "[]".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(db.pause_stale_running_torrent_tasks().await.unwrap(), 1);
+        let paused = db.get_torrent_task(created.id).await.unwrap().unwrap();
+        assert_eq!(paused.status, "paused");
+        assert_eq!(paused.cursor_id, 987654321);
+        assert_eq!(paused.updated_count, 420);
+        assert!(db.delete_torrent_task(created.id).await.unwrap());
 
         drop(db);
         let _ = std::fs::remove_dir_all(&dir);

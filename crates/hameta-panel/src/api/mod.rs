@@ -193,12 +193,37 @@ pub fn api_v1_router() -> Router<Arc<PanelState>> {
             "/filter/playground/sample",
             post(filter::playground_sample_handler),
         )
-        // Torrent Explorer
+        // Torrent Explorer & Async Maintenance Tasks
         .route("/torrents", get(torrents::list_torrents_handler))
         .route("/torrents", post(torrents::create_torrent_handler))
         .route(
             "/torrents/batch-delete",
             post(torrents::batch_delete_torrents_handler),
+        )
+        .route("/torrents/tasks", get(torrents::list_torrent_tasks_handler))
+        .route(
+            "/torrents/tasks",
+            post(torrents::create_torrent_task_handler),
+        )
+        .route(
+            "/torrents/tasks/{id}",
+            get(torrents::get_torrent_task_handler),
+        )
+        .route(
+            "/torrents/tasks/{id}/pause",
+            post(torrents::pause_torrent_task_handler),
+        )
+        .route(
+            "/torrents/tasks/{id}/resume",
+            post(torrents::resume_torrent_task_handler),
+        )
+        .route(
+            "/torrents/tasks/{id}/cancel",
+            post(torrents::cancel_torrent_task_handler),
+        )
+        .route(
+            "/torrents/tasks/{id}",
+            delete(torrents::delete_torrent_task_handler),
         )
         .route("/torrents/{id}", get(torrents::get_torrent_detail_handler))
         .route("/torrents/{id}", patch(torrents::update_torrent_handler))

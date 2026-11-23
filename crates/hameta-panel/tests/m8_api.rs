@@ -335,6 +335,7 @@ async fn setup_test_panel() -> TestHarness {
         .await
         .unwrap();
     let metrics = MetricsCollector::new(db.clone(), supervisor.clone(), services.clone());
+    let torrent_tasks = hameta_panel::TorrentTaskManager::new(db.clone(), services.clone());
 
     let state = Arc::new(PanelState {
         config: PanelConfig {
@@ -346,6 +347,7 @@ async fn setup_test_panel() -> TestHarness {
         services,
         supervisor,
         metrics,
+        torrent_tasks,
         login_limiter: Arc::new(LoginRateLimiter::default()),
         setup_lock: Arc::new(Mutex::new(())),
     });
@@ -555,6 +557,329 @@ async fn m8_redis_routes_enforce_stream_whitelist_and_hash_validation() {
     assert_eq!(st, StatusCode::BAD_REQUEST);
     assert_eq!(err_del["code"], "INVALID_CONFIG");
 
+    h.state.supervisor.shutdown_all().await;
+    let _ = std::fs::remove_dir_all(&h.dir);
+}
+
+#[tokio::test]
+async fn m8_torrent_async_tasks_backfill_total_size_and_reclean_titles_end_to_end() {
+    let h = setup_test_panel().await;
+
+    // 启动内存 Mock Manticore 服务，模拟 3 条存量记录（含 63 位 ID、0 体积与脏广告标题）
+    #[derive(Clone)]
+    struct MockDoc {
+        id: i64,
+        info_hash: String,
+        raw_name: String,
+        refine_name: String,
+        file_count: i32,
+        total_size: i64,
+        file_info: String,
+        hot: i32,
+        created_at: i64,
+        updated_at: i64,
+    }
+
+    let docs = Arc::new(std::sync::Mutex::new(vec![
+        MockDoc {
+            id: 1_745_280_108_080_464_101,
+            info_hash: "1111111111111111111111111111111111111111".to_string(),
+            raw_name: "www.ad99.com - 流浪地球2 收藏不迷路 4K".to_string(),
+            refine_name: "www.ad99.com - 流浪地球2 收藏不迷路 4K".to_string(),
+            file_count: 2,
+            total_size: 0,
+            file_info:
+                r#"[{"path":"movie.mkv","size":3000000000},{"path":"sub.srt","size":12345}]"#
+                    .to_string(),
+            hot: 5,
+            created_at: 1_700_000_001,
+            updated_at: 1_700_000_001,
+        },
+        MockDoc {
+            id: 1_745_280_108_080_464_202,
+            info_hash: "2222222222222222222222222222222222222222".to_string(),
+            raw_name: "Ubuntu.24.04.LTS".to_string(),
+            refine_name: "Ubuntu.24.04.LTS".to_string(),
+            file_count: 1,
+            total_size: 2_000_000,
+            file_info: r#"[{"path":"ubuntu.bin","size":2000000}]"#.to_string(),
+            hot: 2,
+            created_at: 1_700_000_002,
+            updated_at: 1_700_000_002,
+        },
+        MockDoc {
+            id: 1_745_280_108_080_464_303,
+            info_hash: "3333333333333333333333333333333333333333".to_string(),
+            raw_name: "【最新地址发布页】阿凡达2.2022.1080p".to_string(),
+            refine_name: "".to_string(),
+            file_count: 1,
+            total_size: 0,
+            file_info: r#"[{"path":"avatar2.mkv","size":500000000}]"#.to_string(),
+            hot: 1,
+            created_at: 1_700_000_003,
+            updated_at: 1_700_000_003,
+        },
+    ]));
+
+    let sql_docs = docs.clone();
+    let search_docs = docs.clone();
+    let bulk_docs = docs.clone();
+
+    let mock_manticore = AxumRouter::new()
+        .route(
+            "/sql",
+            post(move |body: String| {
+                let store = sql_docs.clone();
+                async move {
+                    let upper = body.to_ascii_uppercase();
+                    if upper.contains("DESCRIBE") {
+                        Json(json!([{
+                            "data": [
+                                {"Field": "id", "Type": "bigint", "Properties": ""},
+                                {"Field": "info_hash", "Type": "string", "Properties": ""},
+                                {"Field": "raw_name", "Type": "text", "Properties": ""},
+                                {"Field": "refine_name", "Type": "text", "Properties": ""},
+                                {"Field": "file_count", "Type": "uint", "Properties": ""},
+                                {"Field": "total_size", "Type": "bigint", "Properties": ""},
+                                {"Field": "file_info", "Type": "json", "Properties": ""},
+                                {"Field": "hot", "Type": "uint", "Properties": ""},
+                                {"Field": "created_at", "Type": "timestamp", "Properties": ""},
+                                {"Field": "updated_at", "Type": "timestamp", "Properties": ""}
+                            ],
+                            "error": ""
+                        }]))
+                    } else {
+                        let guard = store.lock().unwrap();
+                        let cnt = if upper.contains("TOTAL_SIZE") {
+                            guard.iter().filter(|d| d.total_size == 0).count()
+                        } else {
+                            guard.len()
+                        };
+                        Json(json!([{
+                            "data": [{ "cnt": cnt }],
+                            "error": ""
+                        }]))
+                    }
+                }
+            }),
+        )
+        .route(
+            "/search",
+            post(move |Json(req): Json<Value>| {
+                let store = search_docs.clone();
+                async move {
+                    let limit = req["limit"].as_u64().unwrap_or(500) as usize;
+                    let q = &req["query"];
+                    let (gt_id, only_zero) = if let Some(must) = q["bool"]["must"].as_array() {
+                        let mut gt = 0_i64;
+                        let mut zero = false;
+                        for clause in must {
+                            if let Some(v) = clause["range"]["id"]["gt"].as_i64() {
+                                gt = v;
+                            }
+                            if clause["equals"]["total_size"].as_i64() == Some(0) {
+                                zero = true;
+                            }
+                        }
+                        (gt, zero)
+                    } else {
+                        (q["range"]["id"]["gt"].as_i64().unwrap_or(0), false)
+                    };
+
+                    let guard = store.lock().unwrap();
+                    let mut matched: Vec<&MockDoc> = guard
+                        .iter()
+                        .filter(|d| d.id > gt_id && (!only_zero || d.total_size == 0))
+                        .collect();
+                    matched.sort_by_key(|d| d.id);
+                    let hits: Vec<Value> = matched
+                        .into_iter()
+                        .take(limit)
+                        .map(|d| {
+                            json!({
+                                "_id": d.id,
+                                "_source": {
+                                    "info_hash": d.info_hash,
+                                    "raw_name": d.raw_name,
+                                    "refine_name": d.refine_name,
+                                    "file_count": d.file_count,
+                                    "total_size": d.total_size,
+                                    "file_info": d.file_info,
+                                    "hot": d.hot,
+                                    "created_at": d.created_at,
+                                    "updated_at": d.updated_at,
+                                }
+                            })
+                        })
+                        .collect();
+                    Json(json!({ "hits": { "total": hits.len(), "hits": hits } }))
+                }
+            }),
+        )
+        .route(
+            "/bulk",
+            post(move |body: String| {
+                let store = bulk_docs.clone();
+                async move {
+                    let mut guard = store.lock().unwrap();
+                    let mut updated = 0_u64;
+                    for line in body.lines().filter(|l| !l.trim().is_empty()) {
+                        let val: Value = serde_json::from_str(line).unwrap();
+                        let rep = &val["replace"];
+                        let id = rep["id"].as_i64().unwrap();
+                        let doc = &rep["doc"];
+                        if let Some(target) = guard.iter_mut().find(|d| d.id == id) {
+                            if let Some(s) = doc["refine_name"].as_str() {
+                                target.refine_name = s.to_string();
+                            }
+                            if let Some(sz) = doc["total_size"].as_i64() {
+                                target.total_size = sz;
+                            }
+                            updated += 1;
+                        }
+                    }
+                    Json(json!({
+                        "items": [{ "bulk": { "table": "torrents", "created": 0, "updated": updated, "deleted": 0, "status": 200 } }],
+                        "current_line": updated + 1,
+                        "skipped_lines": 0,
+                        "errors": false,
+                        "error": ""
+                    }))
+                }
+            }),
+        );
+
+    let mc_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mc_addr = mc_listener.local_addr().unwrap();
+    let mc_task = tokio::spawn(async move {
+        let _ = axum::serve(mc_listener, mock_manticore).await;
+    });
+
+    h.state
+        .services
+        .reload_manticore(&ManticoreServiceConfig {
+            url: format!("http://{mc_addr}"),
+            ..ManticoreServiceConfig::default()
+        })
+        .await
+        .unwrap();
+
+    // 1) 启动「同步文件大小」任务（仅回填 total_size = 0 的 2 条旧记录）
+    let (st, task1) = json_req(
+        &h.app,
+        "POST",
+        "/api/v1/torrents/tasks",
+        &h.cookie,
+        Some(json!({
+            "kind": "sync_total_size",
+            "batch_size": 50,
+            "batch_delay_ms": 0,
+            "only_missing": true,
+            "dry_run": false
+        })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "start sync_total_size failed: {task1}");
+    let t1_id = task1["id"].as_i64().unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut final_t1 = task1;
+    while Instant::now() < deadline {
+        let (st, cur) = json_req(
+            &h.app,
+            "GET",
+            &format!("/api/v1/torrents/tasks/{t1_id}"),
+            &h.cookie,
+            None,
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+        final_t1 = cur;
+        if final_t1["status"] == "completed" {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(30)).await;
+    }
+    assert_eq!(final_t1["status"], "completed", "t1={final_t1}");
+    assert_eq!(final_t1["scanned_count"], 2);
+    assert_eq!(final_t1["updated_count"], 2);
+    assert_eq!(final_t1["cursor_id"], "1745280108080464303");
+    assert_eq!(final_t1["sample_diffs"].as_array().unwrap().len(), 2);
+
+    {
+        let guard = docs.lock().unwrap();
+        assert_eq!(guard[0].total_size, 3_000_012_345);
+        assert_eq!(guard[1].total_size, 2_000_000);
+        assert_eq!(guard[2].total_size, 500_000_000);
+    }
+
+    // 2) 启动「清洗标题」任务（全量重洗，2 条脏标题应被洗净并写回，1 条干净标题跳过）
+    let (st, task2) = json_req(
+        &h.app,
+        "POST",
+        "/api/v1/torrents/tasks",
+        &h.cookie,
+        Some(json!({
+            "kind": "reclean_titles",
+            "batch_size": 50,
+            "batch_delay_ms": 0,
+            "clean_scope": "all",
+            "skip_empty_result": true,
+            "dry_run": false
+        })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "start reclean_titles failed: {task2}");
+    let t2_id = task2["id"].as_i64().unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut final_t2 = task2;
+    while Instant::now() < deadline {
+        let (st, cur) = json_req(
+            &h.app,
+            "GET",
+            &format!("/api/v1/torrents/tasks/{t2_id}"),
+            &h.cookie,
+            None,
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+        final_t2 = cur;
+        if final_t2["status"] == "completed" {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(30)).await;
+    }
+    assert_eq!(final_t2["status"], "completed", "t2={final_t2}");
+    assert_eq!(final_t2["scanned_count"], 3);
+    assert_eq!(final_t2["updated_count"], 2);
+    assert_eq!(final_t2["skipped_count"], 1);
+
+    {
+        let guard = docs.lock().unwrap();
+        assert_eq!(guard[0].refine_name, "流浪地球2 4K");
+        assert_eq!(guard[1].refine_name, "Ubuntu.24.04.LTS");
+        assert_eq!(guard[2].refine_name, "阿凡达2.2022.1080p");
+    }
+
+    // 3) 列出任务概览 + 删除历史记录
+    let (st, ov) = json_req(&h.app, "GET", "/api/v1/torrents/tasks", &h.cookie, None).await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(ov["has_total_size_column"], true);
+    assert_eq!(ov["tasks"].as_array().unwrap().len(), 2);
+
+    let (st, del) = json_req(
+        &h.app,
+        "DELETE",
+        &format!("/api/v1/torrents/tasks/{t1_id}"),
+        &h.cookie,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(del["deleted"], true);
+
+    mc_task.abort();
     h.state.supervisor.shutdown_all().await;
     let _ = std::fs::remove_dir_all(&h.dir);
 }
