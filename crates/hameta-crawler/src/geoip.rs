@@ -376,11 +376,10 @@ impl GeoIpEngine {
         } else {
             0.0
         };
-        let avg_lookup_ns = if counters.lookup_count > 0 {
-            counters.lookup_ns_total / counters.lookup_count
-        } else {
-            0
-        };
+        let avg_lookup_ns = counters
+            .lookup_ns_total
+            .checked_div(counters.lookup_count)
+            .unwrap_or(0);
 
         let mut countries = BTreeMap::new();
         for (iso_bytes, totals) in &counters.countries {

@@ -1110,13 +1110,8 @@ pub async fn playground_sample_handler(
                 if let Ok(status) = client.table_status().await {
                     let docs = usize::try_from(status.indexed_documents.unwrap_or(0)).unwrap_or(0);
                     let window = docs.min(1000).saturating_sub(fetch_limit);
-                    if window > 0 {
-                        let seed =
-                            usize::try_from(Utc::now().timestamp_subsec_nanos()).unwrap_or(0);
-                        seed % window
-                    } else {
-                        0
-                    }
+                    let seed = usize::try_from(Utc::now().timestamp_subsec_nanos()).unwrap_or(0);
+                    seed.checked_rem(window).unwrap_or(0)
                 } else {
                     0
                 }

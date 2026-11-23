@@ -1441,7 +1441,7 @@ fn build_globe_geoip_status(
             geo_cfg.adaptive_sample_threshold_pps
         },
         cache_hit_ratio,
-        avg_lookup_ns: if ns_count > 0 { ns_sum / ns_count } else { 0 },
+        avg_lookup_ns: ns_sum.checked_div(ns_count).unwrap_or(0),
         samples_dropped_pps,
         unknown_pps,
     }
