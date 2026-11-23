@@ -5,6 +5,7 @@ use crate::metrics_collector::MetricsCollector;
 use crate::services::ServiceRuntimePool;
 use crate::supervisor::Supervisor;
 use crate::torrent_tasks::TorrentTaskManager;
+use crate::tuning_advisor::TuningAdvisor;
 use anyhow::Context;
 use axum::extract::State;
 use axum::http::StatusCode;
@@ -45,6 +46,7 @@ pub struct PanelState {
     pub services: Arc<ServiceRuntimePool>,
     pub metrics: Arc<MetricsCollector>,
     pub torrent_tasks: Arc<TorrentTaskManager>,
+    pub tuning_advisor: Arc<TuningAdvisor>,
     pub login_limiter: Arc<LoginRateLimiter>,
     pub setup_lock: Arc<Mutex<()>>,
 }
@@ -142,6 +144,9 @@ pub async fn run_panel(config: PanelConfig) -> anyhow::Result<()> {
     let torrent_tasks = TorrentTaskManager::new(db.clone(), services.clone());
     torrent_tasks.recover_stale_tasks_on_startup().await;
 
+    let tuning_advisor = TuningAdvisor::new(db.clone(), supervisor.clone());
+    tuning_advisor.spawn_background_loop(collector_cancel.clone());
+
     let addr: SocketAddr = config
         .bind_addr
         .parse()
@@ -159,6 +164,7 @@ pub async fn run_panel(config: PanelConfig) -> anyhow::Result<()> {
         services,
         metrics,
         torrent_tasks: torrent_tasks.clone(),
+        tuning_advisor,
         login_limiter: Arc::new(LoginRateLimiter::default()),
         setup_lock: Arc::new(Mutex::new(())),
     });

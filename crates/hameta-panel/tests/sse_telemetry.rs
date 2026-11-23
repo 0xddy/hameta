@@ -372,6 +372,7 @@ async fn setup_panel(
     let services = Arc::new(ServiceRuntimePool::default());
     let metrics = MetricsCollector::new(db.clone(), supervisor.clone(), services.clone());
     let torrent_tasks = hameta_panel::TorrentTaskManager::new(db.clone(), services.clone());
+    let tuning_advisor = hameta_panel::TuningAdvisor::new(db.clone(), supervisor.clone());
     let state = Arc::new(PanelState {
         db,
         config: PanelConfig {
@@ -383,6 +384,7 @@ async fn setup_panel(
         services,
         metrics,
         torrent_tasks,
+        tuning_advisor,
         login_limiter: Arc::new(LoginRateLimiter::default()),
         setup_lock: Arc::new(Mutex::new(())),
     });

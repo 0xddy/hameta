@@ -6,6 +6,7 @@ import {
   Cpu,
   HardDrive,
   RefreshCw,
+  Sparkles,
   Stethoscope,
 } from "lucide-vue-next";
 import {
@@ -15,7 +16,9 @@ import {
   type IndexerSnapshot,
   type WorkerDiagnosticsResponse,
 } from "@/api/diagnostics";
+import { listTuningSessions, type TuningSessionStatus } from "@/api/tuning";
 import { listWorkers, type WorkerSummaryItem } from "@/api/workers";
+import TuningAdvisorDrawer from "@/components/TuningAdvisorDrawer.vue";
 import ObsHistogram, { type HistogramBarItem } from "@/components/ui/ObsHistogram.vue";
 import ObsHorizontalBars, { type HorizontalBarItem } from "@/components/ui/ObsHorizontalBars.vue";
 import ObsSelect from "@/components/ui/ObsSelect.vue";
@@ -37,6 +40,8 @@ const diag = ref<WorkerDiagnosticsResponse | null>(null);
 const loading = ref(false);
 const loadError = ref("");
 const autoPoll = ref(true);
+const advisorOpen = ref(false);
+const activeTuningSession = ref<TuningSessionStatus | null>(null);
 let pollTimer: number | null = null;
 
 const workerOptions = computed(() =>
@@ -180,12 +185,26 @@ async function loadWorkerCatalogAndSelect() {
   }
 }
 
+async function fetchTuningBadge() {
+  if (!selectedId.value) {
+    activeTuningSession.value = null;
+    return;
+  }
+  try {
+    const list = await listTuningSessions();
+    activeTuningSession.value = list.find((s) => s.worker_id === selectedId.value) ?? null;
+  } catch {
+    // non-fatal badge poll
+  }
+}
+
 async function fetchDiag(silent = false) {
   if (!selectedId.value) return;
   if (!silent) loading.value = true;
   loadError.value = "";
   try {
     diag.value = await getWorkerDiagnostics(selectedId.value);
+    void fetchTuningBadge();
   } catch (e) {
     loadError.value = e instanceof Error ? e.message : "加载诊断数据失败";
   } finally {
@@ -283,6 +302,27 @@ onUnmounted(() => {
         >
           {{ autoPoll ? "● 3s 自动采样中" : "○ 自动采样已暂停" }}
         </button>
+        <button
+          v-if="diag?.role === 'crawler' && selectedId"
+          type="button"
+          class="obs-btn-primary px-2.5 py-1.5 rounded-lg text-xs inline-flex items-center gap-1.5 cursor-pointer"
+          @click="advisorOpen = true"
+        >
+          <Sparkles class="w-3.5 h-3.5" />
+          <span>智能优化顾问</span>
+          <span
+            v-if="activeTuningSession?.state === 'collecting'"
+            class="px-1.5 py-0.5 rounded bg-black/25 font-mono-num text-[10px]"
+          >
+            {{ Math.round(activeTuningSession.progress_pct) }}%
+          </span>
+          <span
+            v-else-if="activeTuningSession?.state === 'completed'"
+            class="px-1.5 py-0.5 rounded bg-black/25 font-mono-num text-[10px]"
+          >
+            报告就绪
+          </span>
+        </button>
         <RouterLink
           v-if="selectedId"
           :to="`/workers?tune=${encodeURIComponent(selectedId)}`"
@@ -323,6 +363,28 @@ onUnmounted(() => {
 
     <!-- CRAWLER DIAGNOSTICS -->
     <template v-else-if="crawlerSnap">
+      <div
+        v-if="activeTuningSession && activeTuningSession.state === 'collecting'"
+        class="obs-card rounded-xl px-4 py-2.5 border-cyan-500/35 bg-cyan-950/20 flex flex-wrap items-center justify-between gap-3 text-xs"
+      >
+        <div class="flex items-center gap-2 text-cyan-200">
+          <span class="h-2 w-2 rounded-full bg-cyan-400 animate-pulse"></span>
+          <span>
+            1 小时智能参数优化任务采集中：已采
+            <strong class="font-mono-num text-cyan-100">{{ fmtDurSecs(activeTuningSession.elapsed_secs) }}</strong>
+            / {{ fmtDurSecs(activeTuningSession.target_duration_secs) }}
+            （{{ activeTuningSession.sample_count }} 样本 · {{ Math.round(activeTuningSession.progress_pct) }}%）
+          </span>
+        </div>
+        <button
+          type="button"
+          class="text-cyan-300 hover:underline font-medium cursor-pointer"
+          @click="advisorOpen = true"
+        >
+          查看实时诊断与调优建议 →
+        </button>
+      </div>
+
       <!-- 4 Top KPIs -->
       <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
         <div class="obs-card rounded-xl p-4 space-y-1.5 min-w-0">
@@ -602,5 +664,14 @@ onUnmounted(() => {
         </div>
       </div>
     </template>
+
+    <TuningAdvisorDrawer
+      v-if="selectedId && diag?.role === 'crawler'"
+      v-model="advisorOpen"
+      :worker-id="selectedId"
+      :worker-name="diag?.display_name"
+      @applied="fetchDiag(true)"
+      @session-changed="fetchTuningBadge()"
+    />
   </div>
 </template>

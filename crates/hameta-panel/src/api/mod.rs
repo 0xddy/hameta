@@ -9,6 +9,7 @@ pub mod settings;
 pub mod setup;
 pub mod sql_console;
 pub mod torrents;
+pub mod tuning;
 pub mod workers;
 
 use crate::server::PanelState;
@@ -130,6 +131,31 @@ pub fn api_v1_router() -> Router<Arc<PanelState>> {
         .route(
             "/workers/{id}/diagnostics",
             get(workers::get_worker_diagnostics_handler),
+        )
+        // Intelligent Runtime Tuning Advisor (In-Memory 1h Collector)
+        .route(
+            "/tuning/sessions",
+            get(tuning::list_tuning_sessions_handler),
+        )
+        .route(
+            "/workers/{id}/tuning/status",
+            get(tuning::get_worker_tuning_status_handler),
+        )
+        .route(
+            "/workers/{id}/tuning/start",
+            post(tuning::start_worker_tuning_handler),
+        )
+        .route(
+            "/workers/{id}/tuning/finish",
+            post(tuning::finish_worker_tuning_handler),
+        )
+        .route(
+            "/workers/{id}/tuning/cancel",
+            post(tuning::cancel_worker_tuning_handler),
+        )
+        .route(
+            "/workers/{id}/tuning/apply",
+            post(tuning::apply_worker_tuning_handler),
         )
         // Redis Streams Monitor & Hash Inspector
         .route(

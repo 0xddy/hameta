@@ -8,7 +8,10 @@ import {
   History,
   Plus,
   RefreshCw,
+  Sparkles,
 } from "lucide-vue-next";
+import { listTuningSessions, type TuningSessionStatus } from "@/api/tuning";
+import TuningAdvisorDrawer from "@/components/TuningAdvisorDrawer.vue";
 import {
   createWorker,
   defaultCrawlerConfig,
@@ -52,6 +55,9 @@ const roleFilter = ref<"all" | WorkerRole>("all");
 const actionBusyId = ref<string | null>(null);
 const profiles = ref<CrawlProfileInfo[]>([]);
 const systemSoftNofile = ref<number | null>(null);
+const tuningSessionsMap = ref<Record<string, TuningSessionStatus>>({});
+const advisorOpen = ref(false);
+const advisorTarget = ref<WorkerSummaryItem | null>(null);
 watch(
   () => telemetry.snapshot?.kpi.system_soft_nofile,
   (next) => {
@@ -328,10 +334,27 @@ function runtimeBadge(state: WorkerRuntimeState): { text: string; cls: string; d
   }
 }
 
+async function fetchTuningSessions() {
+  try {
+    const list = await listTuningSessions();
+    const map: Record<string, TuningSessionStatus> = {};
+    for (const item of list) map[item.worker_id] = item;
+    tuningSessionsMap.value = map;
+  } catch {
+    // non-fatal
+  }
+}
+
+function openTuningAdvisor(w: WorkerSummaryItem) {
+  advisorTarget.value = w;
+  advisorOpen.value = true;
+}
+
 async function fetchWorkers(silent = false) {
   if (!silent) loading.value = true;
   try {
     workers.value = await listWorkers();
+    void fetchTuningSessions();
   } catch (e) {
     if (!silent) ElMessage.error(e instanceof Error ? e.message : "读取 Worker 列表失败");
   } finally {
@@ -842,6 +865,34 @@ onUnmounted(() => {
             >
               诊断
             </RouterLink>
+            <button
+              v-if="w.role === 'crawler'"
+              type="button"
+              class="obs-btn-ghost px-2.5 py-1.5 rounded-lg text-xs inline-flex items-center gap-1 cursor-pointer"
+              :class="
+                tuningSessionsMap[w.id]?.state === 'collecting'
+                  ? 'text-cyan-300 border-cyan-500/35!'
+                  : tuningSessionsMap[w.id]?.state === 'completed'
+                    ? 'text-emerald-300 border-emerald-500/35!'
+                    : 'text-indigo-300'
+              "
+              @click="openTuningAdvisor(w)"
+            >
+              <Sparkles class="w-3 h-3" />
+              <span>智能优化</span>
+              <span
+                v-if="tuningSessionsMap[w.id]?.state === 'collecting'"
+                class="font-mono-num text-[10px] text-cyan-200"
+              >
+                {{ Math.round(tuningSessionsMap[w.id].progress_pct) }}%
+              </span>
+              <span
+                v-else-if="tuningSessionsMap[w.id]?.state === 'completed'"
+                class="font-mono-num text-[10px] text-emerald-300"
+              >
+                ✓
+              </span>
+            </button>
             <button
               type="button"
               class="obs-btn-primary px-3 py-1.5 rounded-lg text-xs cursor-pointer"
@@ -1816,5 +1867,14 @@ onUnmounted(() => {
         <button v-else type="button" class="obs-btn obs-btn-ghost px-3.5 py-1.5 text-xs" @click="tuneVisible = false">关闭</button>
       </template>
     </ObsDrawer>
+
+    <TuningAdvisorDrawer
+      v-if="advisorTarget"
+      v-model="advisorOpen"
+      :worker-id="advisorTarget.id"
+      :worker-name="advisorTarget.display_name"
+      @applied="fetchWorkers(true)"
+      @session-changed="fetchTuningSessions()"
+    />
   </div>
 </template>
